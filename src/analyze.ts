@@ -1,4 +1,6 @@
+import type { Config } from "./config.ts";
 import { fmtTokens } from "./format.ts";
+import type { Hint } from "./hints.ts";
 
 export const CATEGORIES = [
 	"system",
@@ -31,6 +33,18 @@ export interface Row {
 	tokens: number;
 	label: string;
 	preview: string;
+	/** Full content. Only rows built for inspection carry it. */
+	text?: string;
+}
+
+/** A request that read little of the previous request from the cache, so the provider billed that part again. */
+export interface CacheMiss {
+	/** Tokens of the previous request that were not read from the cache. */
+	tokens: number;
+	/** Estimated extra cost: those tokens at the rate paid, less the cache read rate. */
+	cost: number;
+	/** Time since the previous request. */
+	idleMs: number;
 }
 
 export interface RequestRec {
@@ -45,6 +59,7 @@ export interface RequestRec {
 	context: number;
 	cost: number;
 	stop: string;
+	miss?: CacheMiss;
 	/** Entry the request's context ends at. The composition can be rebuilt from the branch up to it. */
 	parentId?: string | null;
 	/** Composition snapshot with its items; only for requests made in this run of pi. */
@@ -83,6 +98,19 @@ export interface ToolRec {
 	errors: number;
 	callTokens: number;
 	resultTokens: number;
+	/** Direct calls made while the recorded declarations did not include the tool. */
+	undeclared: number;
+	/** Direct calls made before pi-context recorded any declarations. */
+	unchecked: number;
+}
+
+export interface ModelRec {
+	model: string;
+	requests: number;
+	/** Input and cache tokens of the requests. */
+	sent: number;
+	output: number;
+	cost: number;
 }
 
 export interface SkillRec {
@@ -150,6 +178,7 @@ export interface Analysis {
 	commands: CommandRec[];
 	tools: ToolRec[];
 	skills: SkillRec[];
+	models: ModelRec[];
 	/** Subagents that finished on this branch, from the records pi-subagents saves. */
 	agents: AgentRec[];
 	userInputs: number;
@@ -169,6 +198,10 @@ export interface ViewData {
 	model?: string;
 	/** Names of the tools declared to the model now. */
 	declared: string[];
+	/** Scales the estimates of the current context to the provider-reported size; 1 when that size is unknown. */
+	factor: number;
+	hints: Hint[];
+	config: Config;
 	/** Finished and live subagents, newest first. */
 	agents: AgentRec[];
 	running: boolean;
@@ -182,7 +215,7 @@ const IMAGE_CHARS = 4800;
 
 export const estimate = (chars: number) => Math.ceil(chars / CHARS_PER_TOKEN);
 
-function contentChars(content: unknown): number {
+export function contentChars(content: unknown): number {
 	if (typeof content === "string") return content.length;
 	if (!Array.isArray(content)) return 0;
 	let chars = 0;
@@ -190,18 +223,18 @@ function contentChars(content: unknown): number {
 	return chars;
 }
 
-function contentText(content: unknown): string {
+export function contentText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content.map((block) => (block?.type === "image" ? "[image]" : (block?.text ?? ""))).join(" ");
 }
 
-function argPath(args: any): string | undefined {
+export function argPath(args: any): string | undefined {
 	const path = args?.path ?? args?.file_path ?? args?.filePath;
 	return typeof path === "string" ? path : undefined;
 }
 
-const isSkillRead = (call: any) => /read/i.test(call.name) && /(^|\/)SKILL\.md$/.test(argPath(call.arguments) ?? "");
+export const isSkillRead = (call: any) => /read/i.test(call.name) && /(^|\/)SKILL\.md$/.test(argPath(call.arguments) ?? "");
 
 /**
  * Tool declarations in a provider request payload: name to size in characters.
@@ -249,17 +282,31 @@ export function schemasOf(messages: any[], declared?: Record<string, number>, hi
 	return schemas;
 }
 
-/** Whether the model called the tool directly although the tool is not declared to it. */
-export const undeclared = (tool: ToolRec, declared: string[]) => tool.calls > 0 && !declared.includes(tool.name);
+/**
+ * Direct calls to the tool that the model made while the tool was not declared to it.
+ * Calls made before pi-context recorded declarations are judged by `declared`, the tools declared now.
+ */
+export const undeclared = (tool: ToolRec, declared: string[]) => tool.undeclared + (declared.includes(tool.name) ? 0 : tool.unchecked);
 
-/** Splits the messages of one request into categorized rows with estimated token counts. See {@link schemasOf}. */
-export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = []): Row[] {
+/** Factor that scales estimates so that they add up to the provider-reported figure; 1 when that figure is unknown. */
+export const scaleOf = (estimated: number, reported?: number | null) => (estimated > 0 && reported ? reported / estimated : 1);
+
+export const sumTokens = (rows: Row[]) => rows.reduce((total, row) => total + row.tokens, 0);
+
+/**
+ * Splits the messages of one request into categorized rows with estimated token counts. See {@link schemasOf}.
+ * With `full`, each row also carries its whole content.
+ */
+export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = [], full = false): Row[] {
 	const rows: Row[] = [];
-	const push = (cat: Category, chars: number, label: string, text: string) => {
-		if (chars > 0) rows.push({ cat, tokens: estimate(chars), label, preview: text.replace(/\s+/g, " ").trim().slice(0, 160) });
+	const push = (cat: Category, chars: number, label: string, text: string, content = text) => {
+		if (chars <= 0) return;
+		const row: Row = { cat, tokens: estimate(chars), label, preview: text.slice(0, 640).replace(/\s+/g, " ").trim().slice(0, 160) };
+		if (full) row.text = content;
+		rows.push(row);
 	};
 	// System messages replay in order: later ones append text, and replace or remove sections.
-	const sections = new Map<string, number>();
+	const sections = new Map<string, string>();
 	const skillCalls = new Set<string>();
 	let systemChars = 0;
 	let systemText = "";
@@ -270,7 +317,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				systemChars += contentChars(m.content);
 				systemText += contentText(m.content);
 				for (const [name, text] of Object.entries(m.sections ?? {})) {
-					if (typeof text === "string") sections.set(name, text.length);
+					if (typeof text === "string") sections.set(name, text);
 					else sections.delete(name);
 				}
 				if (headAt < 0) headAt = rows.length;
@@ -306,7 +353,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				break;
 			case "bashExecution":
 				if (!m.excludeFromContext) {
-					push("injected", (m.command?.length ?? 0) + (m.output?.length ?? 0), "bash", m.command ?? "");
+					push("injected", (m.command?.length ?? 0) + (m.output?.length ?? 0), "bash", m.command ?? "", `${m.command ?? ""}\n${m.output ?? ""}`);
 				}
 				break;
 			case "custom":
@@ -318,11 +365,29 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				break;
 		}
 	}
-	const sum = (sizes: Map<string, number>) => [...sizes.values()].reduce((total, size) => total + size, 0);
 	const schemas = schemasOf(messages, declared, hidden);
+	const sectionChars = [...sections.values()].reduce((total, text) => total + text.length, 0);
+	const schemaChars = [...schemas.values()].reduce((total, size) => total + size, 0);
 	const tail = rows.splice(Math.max(0, headAt));
-	push("system", systemChars + sum(sections), "system", systemText || [...sections.keys()].join(", "));
-	push("tools", sum(schemas), `${schemas.size} tool schemas`, [...schemas.keys()].join(", "));
+	push(
+		"system",
+		systemChars + sectionChars,
+		"system",
+		systemText || [...sections.keys()].join(", "),
+		full ? [systemText, ...[...sections].map(([name, text]) => `[${name}]\n${text}`)].filter(Boolean).join("\n\n") : "",
+	);
+	push(
+		"tools",
+		schemaChars,
+		`${schemas.size} tool schemas`,
+		[...schemas.keys()].join(", "),
+		full
+			? [...schemas]
+					.sort((x, y) => y[1] - x[1])
+					.map(([name, chars]) => `≈${fmtTokens(estimate(chars)).padStart(6)}  ${name}`)
+					.join("\n")
+			: "",
+	);
 	rows.push(...tail);
 	return rows;
 }
@@ -365,6 +430,9 @@ function addUsage(totals: Totals, usage: any): void {
 	totals.cost += usage?.cost?.total ?? 0;
 }
 
+/** Providers do not cache prompts shorter than about this. */
+const MIN_CACHED_TOKENS = 1024;
+
 const ANCHOR_KEYS = ["anchor", "remove_from", "replace_from", "source_from"];
 const hasAnchor = (args: any) => ANCHOR_KEYS.some((key) => typeof args?.[key] === "string");
 
@@ -377,6 +445,7 @@ export function analyze(entries: any[]): Analysis {
 		commands: [],
 		tools: [],
 		skills: [],
+		models: [],
 		agents: [],
 		userInputs: 0,
 		toolCalls: 0,
@@ -394,20 +463,35 @@ export function analyze(entries: any[]): Analysis {
 	// A turn record follows the messages it describes, so read the records first.
 	const turns = new Map<number, TurnData>();
 	const paths = new Map<string, string>();
+	const declarations: { time: number; names: Set<string> }[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== TURN_ENTRY || !entry.data) continue;
 		const turn: TurnData = entry.data;
 		turns.set(turn.time, turn);
 		for (const [id, path] of Object.entries(turn.paths ?? {})) paths.set(id, path);
+		if (turn.declared) declarations.push({ time: turn.time, names: new Set(Object.keys(turn.declared)) });
 		analysis.timing.activeMs += turn.activeMs ?? 0;
 		analysis.timing.modelMs += turn.ms ?? 0;
 		analysis.timing.toolMs += turn.toolMs ?? 0;
 	}
+	declarations.sort((x, y) => x.time - y.time);
+	/** Whether the request made at `time` declared the tool. Undefined before the first recorded declarations. */
+	const declaredThen = (name: string, time: number) => declarations.findLast((record) => record.time <= time)?.names.has(name);
 	const tool = (name: string) => {
 		let rec = tools.get(name);
-		if (!rec) tools.set(name, (rec = { name, calls: 0, nested: 0, errors: 0, callTokens: 0, resultTokens: 0 }));
+		if (!rec) {
+			rec = { name, calls: 0, nested: 0, errors: 0, callTokens: 0, resultTokens: 0, undeclared: 0, unchecked: 0 };
+			tools.set(name, rec);
+		}
 		return rec;
 	};
+	const models = new Map<string, ModelRec>();
+	/** Cost per cache-read token, by model. */
+	const readRates = new Map<string, number>();
+	/** Models that have used the prompt cache on this branch. */
+	const caching = new Set<string>();
+	/** The last request whose context a later request can read from the cache. */
+	let cached: RequestRec | undefined;
 	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string) => {
 		analysis.toolCalls++;
 		const rec = tool(call.name);
@@ -417,6 +501,9 @@ export function analyze(entries: any[]): Analysis {
 		} else {
 			rec.calls++;
 			rec.callTokens += estimate(call.name.length + JSON.stringify(call.arguments ?? {}).length);
+			const known = declaredThen(call.name, time);
+			if (known === false) rec.undeclared++;
+			else if (known === undefined) rec.unchecked++;
 		}
 		const path = argPath(call.arguments) ?? paths.get(call.id);
 		const op = fileOp(call.name);
@@ -442,6 +529,8 @@ export function analyze(entries: any[]): Analysis {
 		const event = (kind: string, detail: string) => analysis.events.push({ time: entryTime, kind, detail });
 		if (entry.type === "compaction") {
 			event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
+			// The compacted context is new to the cache; the next request is not a miss.
+			cached = undefined;
 			addUsage(analysis.totals, entry.usage);
 		} else if (entry.type === "model_change") event("model", `${entry.provider}/${entry.modelId}`);
 		else if (entry.type === "thinking_level_change") event("thinking", String(entry.thinkingLevel));
@@ -481,7 +570,7 @@ export function analyze(entries: any[]): Analysis {
 			const usage = m.usage ?? {};
 			const turn = turns.get(time);
 			addUsage(analysis.totals, usage);
-			analysis.requests.push({
+			const request: RequestRec = {
 				n: analysis.requests.length + 1,
 				time,
 				model: m.model ?? "",
@@ -495,7 +584,35 @@ export function analyze(entries: any[]): Analysis {
 				parentId: entry.parentId,
 				sums: turn?.sums,
 				ms: turn?.ms,
-			});
+			};
+			analysis.requests.push(request);
+			const model = models.get(request.model) ?? { model: request.model, requests: 0, sent: 0, output: 0, cost: 0 };
+			model.requests++;
+			model.sent += request.context;
+			model.output += request.output;
+			model.cost += request.cost;
+			models.set(request.model, model);
+			if (request.cacheRead > 0 && usage.cost?.cacheRead > 0) readRates.set(request.model, usage.cost.cacheRead / request.cacheRead);
+			if (request.cacheRead + request.cacheWrite > 0) caching.add(request.model);
+			if (request.context > 0) {
+				if (
+					cached &&
+					cached.model === request.model &&
+					caching.has(request.model) &&
+					cached.context >= MIN_CACHED_TOKENS &&
+					request.cacheRead < cached.context / 2
+				) {
+					const tokens = cached.context - request.cacheRead;
+					const paidTokens = request.input + request.cacheWrite;
+					const rate = paidTokens > 0 ? ((usage.cost?.input ?? 0) + (usage.cost?.cacheWrite ?? 0)) / paidTokens : 0;
+					request.miss = {
+						tokens,
+						cost: tokens * Math.max(0, rate - (readRates.get(request.model) ?? 0)),
+						idleMs: time - cached.time,
+					};
+				}
+				cached = request;
+			}
 			for (const call of Array.isArray(m.content) ? m.content : []) {
 				if (call?.type === "toolCall") recordCall(call, time);
 			}
@@ -504,6 +621,23 @@ export function analyze(entries: any[]): Analysis {
 	analysis.files = [...files.values()];
 	analysis.tools = [...tools.values()];
 	analysis.skills = [...skills.values()];
+	analysis.models = [...models.values()];
 	analysis.agents = [...agents.values()];
 	return analysis;
+}
+/** Prompt cache use over the requests of the branch. */
+export function cacheStats(analysis: Analysis): { rate: number; misses: number; tokens: number; cost: number } {
+	let sent = 0;
+	let read = 0;
+	const stats = { rate: 0, misses: 0, tokens: 0, cost: 0 };
+	for (const request of analysis.requests) {
+		sent += request.context;
+		read += request.cacheRead;
+		if (!request.miss) continue;
+		stats.misses++;
+		stats.tokens += request.miss.tokens;
+		stats.cost += request.miss.cost;
+	}
+	stats.rate = sent > 0 ? read / sent : 0;
+	return stats;
 }

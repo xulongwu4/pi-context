@@ -1,6 +1,13 @@
 import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { buildSessionProjection, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import {
+	buildSessionProjection,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	getAgentDir,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	type AgentRec,
@@ -15,8 +22,10 @@ import {
 	recordedDeclarations,
 	type Row,
 	rowsOf,
+	scaleOf,
 	schemasOf,
 	sumByCategory,
+	sumTokens,
 	TURN_ENTRY,
 	type TurnData,
 	type ViewData,
@@ -24,9 +33,10 @@ import {
 import { applyAffixes, DEFAULT_WARN_PERCENT, loadConfig, saveConfig } from "./config.ts";
 import { exportMarkdown } from "./export.ts";
 import { fmtPercent, fmtTokens } from "./format.ts";
-import { aggregate, type Insights, parseEntries, scan, summarize } from "./insights.ts";
-import { ContextOverlay } from "./overlay.ts";
-import { report } from "./report.ts";
+import { hintsOf } from "./hints.ts";
+import { aggregate, parseEntries, type SessionSummary, scan, summarize } from "./insights.ts";
+import { ContextOverlay, type OverlayHost, type Setting, type SettingRequest, type Tab } from "./overlay.ts";
+import { report, SECTIONS } from "./report.ts";
 
 const MAX_SNAPSHOTS = 200;
 const INSIGHTS_DAYS = 30;
@@ -64,8 +74,8 @@ export default function (pi: ExtensionAPI) {
 	let unsubscribe: (() => void)[] = [];
 
 	/** Rows of the messages, with the system prompt and tool schemas added when the messages do not carry them. */
-	function rowsFor(messages: any[], ctx: ExtensionContext): Row[] {
-		const rows = rowsOf(messages, declared, hidden);
+	function rowsFor(messages: any[], ctx: ExtensionContext, full = false): Row[] {
+		const rows = rowsOf(messages, declared, hidden, full);
 		const hasSystem = rows.some((row) => row.cat === "system");
 		const hasTools = rows.some((row) => row.cat === "tools");
 		if (hasSystem && hasTools) return rows;
@@ -77,14 +87,14 @@ export default function (pi: ExtensionAPI) {
 					.filter((tool) => active.has(tool.name))
 					.map(({ name, description, parameters }) => ({ name, description, parameters }));
 		const head = { role: "system", content: hasSystem ? "" : ctx.getSystemPrompt(), toolsAdded };
-		return [...rowsOf([head], hasTools ? {} : declared, hidden), ...rows];
+		return [...rowsOf([head], hasTools ? {} : declared, hidden, full), ...rows];
 	}
 
 	const currentRows = (ctx: ExtensionContext) => rowsFor(ctx.sessionManager.buildSessionProjection().messages, ctx);
 
 	/** Names of the tools declared to the model now. */
-	function declaredNames(ctx: ExtensionContext): string[] {
-		const schemas = schemasOf(ctx.sessionManager.buildSessionProjection().messages, declared, hidden);
+	function declaredNames(messages: any[]): string[] {
+		const schemas = schemasOf(messages, declared, hidden);
 		// A session without a recorded system message says nothing about tools; the active ones are declared.
 		return schemas.size > 0 ? [...schemas.keys()] : pi.getActiveTools().filter((name) => !hidden.includes(name));
 	}
@@ -134,25 +144,65 @@ export default function (pi: ExtensionAPI) {
 				// The file is gone; the size stays unknown.
 			}
 		}
+		const messages = ctx.sessionManager.buildSessionProjection().messages;
+		const current = rowsFor(messages, ctx, true);
+		const usage = ctx.getContextUsage();
 		return {
 			analysis,
-			current: currentRows(ctx),
-			usage: ctx.getContextUsage(),
+			current,
+			usage,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-			declared: declaredNames(ctx),
+			declared: declaredNames(messages),
+			factor: scaleOf(sumTokens(current), usage?.tokens),
+			hints: hintsOf(messages),
+			config: loadConfig(configPath),
 			agents: agentsOf(analysis),
 			running,
 			parentSession: ctx.sessionManager.getHeader()?.parentSession,
 			reconstruct: (request) =>
-				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx) : [],
+				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
 		};
 	}
 
-	async function loadInsights(ctx: ExtensionContext, onProgress?: (done: number, total: number) => void): Promise<Insights> {
+	/** Summaries of the sessions of all projects that changed in the last `days` days. */
+	function loadSummaries(ctx: ExtensionContext, days: number, onProgress?: (done: number, total: number) => void): Promise<SessionSummary[]> {
 		const dir = ctx.sessionManager.getSessionDir();
 		const root = dir ? dirname(dir) : join(getAgentDir(), "sessions");
-		const now = Date.now();
-		return aggregate(await scan(root, cachePath, now - INSIGHTS_DAYS * DAY, onProgress), now, INSIGHTS_DAYS);
+		return scan(root, cachePath, Date.now() - days * DAY, onProgress);
+	}
+
+	/** Sets the system prompt prefix or suffix. Without `text`, the user edits it. Empty text disables it. */
+	async function setAffix(ctx: ExtensionCommandContext, sub: "prefix" | "suffix", text?: string): Promise<void> {
+		const key = sub === "prefix" ? "systemPromptPrefix" : "systemPromptSuffix";
+		const config = loadConfig(configPath);
+		text ??= await ctx.ui.editor(`System prompt ${sub} (empty = disabled)`, config[key] ?? "");
+		if (text === undefined) return;
+		config[key] = text.trim() || undefined;
+		saveConfig(configPath, config);
+		ctx.ui.notify(config[key] ? `System prompt ${sub} saved. It applies from the next turn.` : `System prompt ${sub} disabled.`, "info");
+	}
+
+	/** Sets the context warning. Without `value`, the default applies again. */
+	function setWarn(ctx: ExtensionContext, value?: string): void {
+		const percent = value === undefined ? undefined : Number(value);
+		if (percent !== undefined && !(value?.trim() && percent >= 0 && percent <= 100)) {
+			ctx.ui.notify("Give a percentage from 0 to 100. 0 disables the warning.", "error");
+			return;
+		}
+		const config = loadConfig(configPath);
+		config.warnPercent = percent;
+		saveConfig(configPath, config);
+		ctx.ui.notify(percent === 0 ? "Context warning disabled." : `Context warning set to ${percent ?? DEFAULT_WARN_PERCENT}%.`, "info");
+		warned = false;
+		updateStatus(ctx);
+	}
+
+	/** Makes the change the user asked for in the Settings tab. */
+	async function changeSetting(ctx: ExtensionCommandContext, { setting, clear }: SettingRequest): Promise<void> {
+		if (setting !== "warn") return setAffix(ctx, setting, clear ? "" : undefined);
+		const current = loadConfig(configPath).warnPercent ?? DEFAULT_WARN_PERCENT;
+		const value = clear ? undefined : await ctx.ui.input("Context warning, in percent of the window (0 = disabled)", String(current));
+		if (clear || value !== undefined) setWarn(ctx, value);
 	}
 
 	/** Updates the footer, and warns once each time context use rises to the configured percentage. */
@@ -327,40 +377,17 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			hidden = ctx.getSystemPromptOptions().hiddenTools ?? [];
 			const [, sub, rest = ""] = /^(prefix|suffix|warn|export)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
-			if (sub === "prefix" || sub === "suffix") {
-				const key = sub === "prefix" ? "systemPromptPrefix" : "systemPromptSuffix";
-				const config = loadConfig(configPath);
-				const text = rest || (await ctx.ui.editor(`System prompt ${sub} (empty = disabled)`, config[key] ?? ""));
-				if (text === undefined) return;
-				config[key] = text.trim() || undefined;
-				saveConfig(configPath, config);
-				ctx.ui.notify(
-					config[key] ? `System prompt ${sub} saved. It applies from the next turn.` : `System prompt ${sub} disabled.`,
-					"info",
-				);
-				return;
-			}
+			if (sub === "prefix" || sub === "suffix") return setAffix(ctx, sub, rest || undefined);
 			if (sub === "warn") {
-				const config = loadConfig(configPath);
-				if (!rest) {
-					ctx.ui.notify(`Context warning at ${config.warnPercent ?? DEFAULT_WARN_PERCENT}% (0 = disabled). Set it with /context warn <percent>.`, "info");
-					return;
-				}
-				const percent = Number(rest);
-				if (!(percent >= 0 && percent <= 100)) {
-					ctx.ui.notify("Give a percentage from 0 to 100. 0 disables the warning.", "error");
-					return;
-				}
-				config.warnPercent = percent;
-				saveConfig(configPath, config);
-				ctx.ui.notify(percent ? `Context warning set to ${percent}%.` : "Context warning disabled.", "info");
-				warned = false;
-				updateStatus(ctx);
+				if (rest) return setWarn(ctx, rest);
+				const percent = loadConfig(configPath).warnPercent ?? DEFAULT_WARN_PERCENT;
+				ctx.ui.notify(`Context warning at ${percent}% (0 = disabled). Set it with /context warn <percent>.`, "info");
 				return;
 			}
 			if (sub === "export") {
 				const file = resolve(ctx.cwd, rest || `pi-context-${ctx.sessionManager.getSessionId().slice(0, 8)}.md`);
-				writeFileSync(file, exportMarkdown(collect(ctx), await loadInsights(ctx)));
+				const insights = aggregate(await loadSummaries(ctx, INSIGHTS_DAYS), Date.now(), INSIGHTS_DAYS);
+				writeFileSync(file, exportMarkdown(collect(ctx), insights));
 				ctx.ui.notify(`Context report written to ${file}`, "info");
 				return;
 			}
@@ -368,18 +395,24 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(report(collect(ctx)), "info");
 				return;
 			}
-			await ctx.ui.custom<void>(
-				(tui, theme, _keybindings, done) =>
-					new ContextOverlay(
-						tui,
-						theme,
-						collect(ctx),
-						() => collect(ctx),
-						(onProgress) => loadInsights(ctx, onProgress),
-						() => done(),
-					),
-				{ overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } },
-			);
+			const host: OverlayHost = {
+				collect: () => collect(ctx),
+				isLive: () => running || [...liveAgents.values()].some((agent) => agent.status === "running"),
+				loadSummaries: (days, onProgress) => loadSummaries(ctx, days, onProgress),
+				cwd: ctx.cwd,
+				configPath,
+			};
+			// Editing a setting needs the editor, so the overlay closes for it and opens again on the Settings tab.
+			let tab: Tab | undefined;
+			for (;;) {
+				const request = await ctx.ui.custom<SettingRequest | undefined>(
+					(tui, theme, _keybindings, done) => new ContextOverlay(tui, theme, { ...host, tab }, done),
+					{ overlay: true, overlayOptions: { anchor: "center", width: "90%", maxHeight: "90%" } },
+				);
+				if (!request) return;
+				await changeSetting(ctx, request);
+				tab = "Settings";
+			}
 		},
 	});
 
@@ -387,11 +420,18 @@ export default function (pi: ExtensionAPI) {
 		name: "context_insight",
 		label: "Context Insight",
 		description:
-			"Report your own context window: provider-reported usage and session totals, the estimated composition by category (system prompt, tool schemas, user messages, injected context, skills, tool calls, tool results, reasoning, answers), and the largest items.",
+			"Report your own context window. Without a section: provider-reported usage and session totals, the estimated composition by category (system prompt, tool schemas, user messages, injected context, skills, tool calls, tool results, reasoning, answers), and the largest items. A section returns one part in more detail.",
 		promptSnippet: "Report context window usage and what it is composed of",
-		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return { content: [{ type: "text", text: report(collect(ctx)) }], details: {} };
+		parameters: Type.Object({
+			section: Type.Optional(
+				StringEnum(SECTIONS, {
+					description:
+						"summary (default): usage, totals, composition. composition: categories and the 20 largest items. requests: recent requests with cache use and cost per model. tools: calls and tokens per tool, skills loaded. files: reads, writes and edits per file. commands: shell commands and how they ended. hints: what could be dropped from the context.",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return { content: [{ type: "text", text: report(collect(ctx), SECTIONS.find((section) => section === params.section)) }], details: {} };
 		},
 	});
 }

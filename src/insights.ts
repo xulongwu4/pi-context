@@ -5,8 +5,10 @@ import { fmtDay } from "./format.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 2;
 const TOP = 10;
+/** Cached summaries of files older than this are dropped. */
+const KEEP_DAYS = 120;
 
 /** What Insights keeps of one session file. */
 export interface SessionSummary {
@@ -21,8 +23,8 @@ export interface SessionSummary {
 	/** Input, cache and output tokens of the session's own requests. */
 	tokens: number;
 	cost: number;
-	/** Hours since the epoch to [requests, tokens, cost]. */
-	hours: Record<string, [number, number, number]>;
+	/** Model, then hours since the epoch, to [requests, tokens, cost]. */
+	models: Record<string, Record<string, [number, number, number]>>;
 	tools: Record<string, number>;
 	programs: Record<string, number>;
 	skills: Record<string, number>;
@@ -35,10 +37,19 @@ export interface DayStat {
 	cost: number;
 }
 
+export type SessionSort = "recent" | "cost" | "tokens";
+
+export interface InsightsFilter {
+	/** Count only sessions that ran in this directory or below it. */
+	cwd?: string;
+	/** Order of the sessions. Default: the most recent first. */
+	sort?: SessionSort;
+}
+
 export interface Insights {
 	/** Length of the period in days. */
 	days: number;
-	/** Sessions with a request in the period, newest first. */
+	/** Sessions with a request in the period. */
 	sessions: SessionSummary[];
 	requests: number;
 	tokens: number;
@@ -48,6 +59,8 @@ export interface Insights {
 	week: DayStat[];
 	/** Requests by weekday (Monday first) and hour of day. */
 	heat: number[][];
+	/** Model, requests, tokens and cost in the period; the most expensive first. */
+	models: [string, number, number, number][];
 	tools: [string, number][];
 	programs: [string, number][];
 	skills: [string, number][];
@@ -87,14 +100,14 @@ export function summarize(entries: any[]): SessionSummary {
 		toolCalls: analysis.toolCalls,
 		tokens: 0,
 		cost: 0,
-		hours: {},
+		models: {},
 		tools: {},
 		programs: {},
 		skills: {},
 	};
 	for (const request of analysis.requests) {
 		const tokens = request.context + request.output;
-		const bucket = (summary.hours[Math.floor(request.time / HOUR)] ??= [0, 0, 0]);
+		const bucket = ((summary.models[request.model] ??= {})[Math.floor(request.time / HOUR)] ??= [0, 0, 0]);
 		bucket[0]++;
 		bucket[1] += tokens;
 		bucket[2] += request.cost;
@@ -109,7 +122,7 @@ export function summarize(entries: any[]): SessionSummary {
 }
 
 /** Combines session summaries into the figures for the `days` days that end at `now`. */
-export function aggregate(summaries: SessionSummary[], now: number, days: number): Insights {
+export function aggregate(summaries: SessionSummary[], now: number, days: number, filter: InsightsFilter = {}): Insights {
 	const since = now - days * DAY;
 	const byDay = new Map<string, DayStat>();
 	const insights: Insights = {
@@ -121,28 +134,38 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		activeDays: 0,
 		week: [],
 		heat: Array.from({ length: 7 }, () => new Array<number>(24).fill(0)),
+		models: [],
 		tools: [],
 		programs: [],
 		skills: [],
 	};
+	const models = new Map<string, [string, number, number, number]>();
 	const counts = { tools: new Map<string, number>(), programs: new Map<string, number>(), skills: new Map<string, number>() };
 	for (const summary of summaries) {
+		if (filter.cwd && summary.cwd !== filter.cwd && !summary.cwd.startsWith(`${filter.cwd}/`)) continue;
 		let active = false;
-		for (const [hour, [requests, tokens, cost]] of Object.entries(summary.hours)) {
-			const time = Number(hour) * HOUR;
-			if (time + HOUR <= since) continue;
-			active = true;
-			const date = new Date(time);
-			const day = fmtDay(time);
-			const stat = byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 };
-			stat.requests += requests;
-			stat.tokens += tokens;
-			stat.cost += cost;
-			byDay.set(day, stat);
-			insights.requests += requests;
-			insights.tokens += tokens;
-			insights.cost += cost;
-			insights.heat[(date.getDay() + 6) % 7][date.getHours()] += requests;
+		for (const [name, hours] of Object.entries(summary.models)) {
+			for (const [hour, [requests, tokens, cost]] of Object.entries(hours)) {
+				const time = Number(hour) * HOUR;
+				if (time + HOUR <= since) continue;
+				active = true;
+				const date = new Date(time);
+				const day = fmtDay(time);
+				const stat = byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 };
+				const model = models.get(name) ?? [name, 0, 0, 0];
+				stat.requests += requests;
+				stat.tokens += tokens;
+				stat.cost += cost;
+				model[1] += requests;
+				model[2] += tokens;
+				model[3] += cost;
+				byDay.set(day, stat);
+				models.set(name, model);
+				insights.requests += requests;
+				insights.tokens += tokens;
+				insights.cost += cost;
+				insights.heat[(date.getDay() + 6) % 7][date.getHours()] += requests;
+			}
 		}
 		if (!active) continue;
 		insights.sessions.push(summary);
@@ -150,7 +173,14 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 			for (const [name, n] of Object.entries(summary[key])) counts[key].set(name, (counts[key].get(name) ?? 0) + n);
 		}
 	}
-	insights.sessions.sort((a, b) => b.end - a.end);
+	const order: Record<SessionSort, (session: SessionSummary) => number> = {
+		recent: (session) => session.end,
+		cost: (session) => session.cost,
+		tokens: (session) => session.tokens,
+	};
+	const rank = order[filter.sort ?? "recent"];
+	insights.sessions.sort((a, b) => rank(b) - rank(a) || b.end - a.end);
+	insights.models = [...models.values()].sort((a, b) => b[3] - a[3] || b[2] - a[2]);
 	insights.activeDays = byDay.size;
 	for (let i = 6; i >= 0; i--) {
 		const day = fmtDay(now - i * DAY);
@@ -189,20 +219,26 @@ export async function scan(
 		}
 	}
 	const next: Cache = { version: CACHE_VERSION, files: {} };
+	// Keep the summaries of older files, so that a scan of a longer period after a shorter one reads nothing again.
+	for (const [path, file] of Object.entries(cache.files)) {
+		if (file.mtimeMs < since && file.mtimeMs >= Date.now() - KEEP_DAYS * DAY) next.files[path] = file;
+	}
+	const summaries: SessionSummary[] = [];
 	let done = 0;
 	for (const file of files) {
 		const hit = cache.files[file.path];
-		if (hit && hit.size === file.size && hit.mtimeMs === file.mtimeMs) next.files[file.path] = hit;
-		else {
-			try {
-				const summary = summarize(parseEntries(await readFile(file.path, "utf8")));
-				next.files[file.path] = { size: file.size, mtimeMs: file.mtimeMs, summary };
-			} catch {
-				// Skip a file that cannot be read.
-			}
+		try {
+			const summary =
+				hit && hit.size === file.size && hit.mtimeMs === file.mtimeMs
+					? hit.summary
+					: summarize(parseEntries(await readFile(file.path, "utf8")));
+			next.files[file.path] = { size: file.size, mtimeMs: file.mtimeMs, summary };
+			summaries.push(summary);
+		} catch {
+			// Skip a file that cannot be read.
 		}
 		onProgress?.(++done, files.length);
 	}
 	await writeFile(cachePath, JSON.stringify(next)).catch(() => {});
-	return Object.values(next.files).map((file) => file.summary);
+	return summaries;
 }

@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	analyze,
+	cacheStats,
 	declaredTools,
 	programOf,
 	recordedDeclarations,
 	rowsOf,
+	scaleOf,
 	schemasOf,
 	sumByCategory,
 	TURN_ENTRY,
@@ -17,6 +19,7 @@ import {
 import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
 import { exportMarkdown } from "../src/export.ts";
 import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
+import { hintsOf } from "../src/hints.ts";
 import { aggregate, parseEntries, scan, summarize } from "../src/insights.ts";
 import { report } from "../src/report.ts";
 
@@ -186,6 +189,9 @@ const view = (entries: any[]): ViewData => ({
 	usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 },
 	model: "m1",
 	declared: ["codemode", "read"],
+	factor: 1,
+	hints: [],
+	config: {},
 	agents: [],
 	running: false,
 	reconstruct: () => [],
@@ -282,7 +288,7 @@ test("summarize and aggregate build the cross-session figures", () => {
 	const old = summarize(session(now - 40 * 24 * HOUR, "old"));
 	expect(recent).toMatchObject({ id: "recent", cwd: "/work/proj", name: "Named", requests: 2, userInputs: 1, toolCalls: 7, tokens: 2020, cost: 0.75 });
 	expect(recent.end).toBe(now - 25 * HOUR);
-	expect(Object.values(recent.hours)).toEqual([[1, 1010, 0.5], [1, 1010, 0.25]]);
+	expect(Object.values(recent.models.m1)).toEqual([[1, 1010, 0.5], [1, 1010, 0.25]]);
 	expect(recent.tools).toMatchObject({ read: 2, insert: 2, codemode: 1 });
 	expect(recent.programs).toEqual({ git: 1 });
 	expect(recent.skills).toEqual({ x: 2 });
@@ -297,6 +303,34 @@ test("summarize and aggregate build the cross-session figures", () => {
 	expect(insights.heat[1].slice(9, 13)).toEqual([0, 1, 1, 0]);
 	expect(insights.tools[0]).toEqual(["read", 2]);
 	expect(insights.skills).toEqual([["x", 2]]);
+	expect(insights.models).toEqual([["m1", 2, 2020, 0.75]]);
+});
+
+test("aggregate filters by project, sorts sessions and counts models in the period only", () => {
+	const now = 100 * 24 * HOUR;
+	const summary = (id: string, cwd: string, cost: number, models: Record<string, Record<string, [number, number, number]>>) => ({
+		...summarize([]),
+		id,
+		cwd,
+		cost,
+		tokens: 1000 - cost,
+		end: now - cost * HOUR,
+		models,
+	});
+	const inPeriod = String(now / HOUR - 2);
+	const before = String(now / HOUR - 10 * 24);
+	const a = summary("a", "/work/proj", 1, { m1: { [inPeriod]: [1, 100, 1] }, old: { [before]: [5, 500, 5] } });
+	const b = summary("b", "/work/proj/sub", 3, { m2: { [inPeriod]: [2, 50, 3] } });
+	const c = summary("c", "/work/project2", 2, { m1: { [inPeriod]: [1, 10, 2] } });
+	const ids = (filter?: Parameters<typeof aggregate>[3]) => aggregate([a, b, c], now, 7, filter).sessions.map((s) => s.id);
+	expect(ids()).toEqual(["a", "c", "b"]);
+	expect(ids({ sort: "cost" })).toEqual(["b", "c", "a"]);
+	expect(ids({ sort: "tokens" })).toEqual(["a", "c", "b"]);
+	expect(ids({ cwd: "/work/proj" })).toEqual(["a", "b"]);
+	const week = aggregate([a, b, c], now, 7);
+	expect(week.models).toEqual([["m1", 2, 110, 3], ["m2", 2, 50, 3]]);
+	expect(week).toMatchObject({ requests: 4, cost: 6 });
+	expect(aggregate([a, b, c], now, 30).models.map((m) => m[0])).toEqual(["old", "m1", "m2"]);
 });
 
 test("parseEntries skips broken lines", () => {
@@ -330,16 +364,40 @@ test("scan reads changed session files and reuses cached summaries", async () =>
 	expect(await scan(join(root, "missing"), cache, 0)).toEqual([]);
 });
 
+test("scan keeps cached summaries of files older than the period", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-context-"));
+	const cache = join(root, "cache.json");
+	const dir = join(root, "sessions", "--work-proj--");
+	mkdirSync(dir, { recursive: true });
+	const day = 24 * HOUR;
+	const file = (name: string, ageDays: number) => {
+		writeFileSync(join(dir, name), session(0, name).map((entry) => JSON.stringify(entry)).join("\n"));
+		const time = (Date.now() - ageDays * day) / 1000;
+		utimesSync(join(dir, name), time, time);
+	};
+	file("new.jsonl", 0);
+	file("older.jsonl", 20);
+	file("ancient.jsonl", 200);
+	const cached = () => Object.keys(JSON.parse(readFileSync(cache, "utf8")).files).map((path) => path.split("/").pop()).sort();
+	expect(await scan(join(root, "sessions"), cache, 0)).toHaveLength(3);
+	expect((await scan(join(root, "sessions"), cache, Date.now() - 7 * day)).map((s) => s.id)).toEqual(["new.jsonl"]);
+	expect(cached()).toEqual(["new.jsonl", "older.jsonl"]);
+});
+
 test("exportMarkdown writes every section", () => {
 	const data = view(session(0));
 	data.agents = [{ id: "a1", type: "Explore", description: "look | see", status: "completed", startedAt: 1000, completedAt: 61000, requests: 3, tokens: 1200, cost: 0.1 }];
 	const text = exportMarkdown(data, aggregate([summarize(session(0))], HOUR, 30));
-	for (const heading of ["Stats", "Current context", "Requests", "Events", "Files", "Commands", "Tools", "Fleet", "Insights: last 30 days, all projects"]) {
+	for (const heading of ["Stats", "Current context", "Hints", "Requests", "Events", "Files", "Commands", "Tools", "Fleet", "Insights: last 30 days, all projects"]) {
 		expect(text).toContain(`## ${heading}`);
 	}
 	expect(text).toContain("| read | 1 | 1 | 0 | ≈9 | ≈100 |  |");
 	// "bash" was called directly but is not declared; "insert" was only called from a script.
-	expect(text).toContain("| bash | 1 | 0 | 1 | ≈11 | ≈10 | direct call, not declared |");
+	expect(text).toContain("| bash | 1 | 0 | 1 | ≈11 | ≈10 | direct calls while not declared: 1 |");
+	expect(text).toContain("| m1 | 2 | 2.0k | 20 | $0.7500 |");
+	expect(text).toContain("90% of the tokens sent were read from the cache; 0 misses");
+	data.factor = 2;
+	expect(exportMarkdown(data, aggregate([], HOUR, 30))).toContain("| bash | 1 | 0 | 1 | ≈22 | ≈20 |");
 	expect(text).toContain("| insert | 0 | 2 | 1 |  |  |  |");
 	expect(text).toContain("| x | 2 | ≈100 | /skills/x/SKILL.md |");
 	expect(text).toContain("| a1 | Explore | look \\| see | completed | 1m0s | 3 | 1.2k | $0.1000 |");
@@ -398,9 +456,129 @@ test("schemasOf lists the tool schemas a request carries", () => {
 });
 
 test("undeclared flags direct calls to tools the model was not given", () => {
-	const tool = (name: string, calls: number) => ({ name, calls, nested: 3, errors: 0, callTokens: 0, resultTokens: 0 });
-	expect(undeclared(tool("write", 2), ["codemode"])).toBe(true);
-	expect(undeclared(tool("Write", 1), ["codemode", "write"])).toBe(true);
-	expect(undeclared(tool("codemode", 9), ["codemode"])).toBe(false);
-	expect(undeclared(tool("bash", 0), ["codemode"])).toBe(false);
+	const tool = (name: string, calls: number) => ({ name, calls, nested: 3, errors: 0, callTokens: 0, resultTokens: 0, undeclared: 0, unchecked: calls });
+	expect(undeclared(tool("write", 2), ["codemode"])).toBe(2);
+	expect(undeclared(tool("Write", 1), ["codemode", "write"])).toBe(1);
+	expect(undeclared(tool("codemode", 9), ["codemode"])).toBe(0);
+	expect(undeclared(tool("bash", 0), ["codemode"])).toBe(0);
+});
+
+test("analyze judges a direct call by the declarations recorded when it was made", () => {
+	const call = (time: number) => at({ ...assistant(time, [{ type: "toolCall", id: `w${time}`, name: "write", arguments: { path: "/a", content: "" } }]) });
+	const turn = (time: number, declared: Record<string, number>) => ({ type: "custom", customType: TURN_ENTRY, data: { time, ms: 0, toolMs: 0, activeMs: 0, sums: {}, declared } });
+	const entries = [
+		call(1000),
+		call(2000),
+		turn(2000, { codemode: 10 }),
+		call(3000),
+		turn(3000, { codemode: 10, write: 5 }),
+		call(4000),
+	];
+	const write = analyze(entries).tools.find((t) => t.name === "write");
+	// 1000: nothing recorded yet. 2000: not declared. 3000 and 4000: declared.
+	expect(write).toMatchObject({ calls: 4, undeclared: 1, unchecked: 1 });
+	expect(undeclared(write!, ["write"])).toBe(1);
+	expect(undeclared(write!, ["codemode"])).toBe(2);
+});
+
+test("analyze flags cache misses and sums requests by model", () => {
+	const request = (time: number, model: string, input: number, cacheRead: number, cacheWrite: number, cost: Record<string, number>) =>
+		at({ role: "assistant", model, stopReason: "stop", timestamp: time, content: [], usage: { input, output: 5, cacheRead, cacheWrite, cost: { total: 1, ...cost } } });
+	const a = analyze([
+		request(1000, "m1", 10, 0, 2000, { cacheWrite: 0.025 }),
+		request(2000, "m1", 50, 2010, 0, { cacheRead: 0.00201 }),
+		// Reads nothing of the 2060 tokens of the previous request.
+		request(602_000, "m1", 10, 0, 2100, { input: 0.0001, cacheWrite: 0.02625 }),
+		// Another model has its own cache, and a compaction starts a new context.
+		request(603_000, "m2", 10, 0, 3000, {}),
+		{ type: "compaction", timestamp: new Date(604_000).toISOString(), tokensBefore: 3000 },
+		request(605_000, "m2", 10, 0, 3000, {}),
+		request(606_000, "m2", 10, 3010, 0, {}),
+	]);
+	expect(a.requests.map((r) => r.miss?.tokens)).toEqual([undefined, undefined, 2060, undefined, undefined, undefined]);
+	expect(a.requests[2].miss?.idleMs).toBe(600_000);
+	// 2060 tokens at the rate paid (0.02635 / 2110) less the cache read rate (0.000001).
+	expect(a.requests[2].miss?.cost).toBeCloseTo(2060 * (0.02635 / 2110 - 0.000001), 6);
+	expect(a.models).toEqual([
+		{ model: "m1", requests: 3, sent: 6180, output: 15, cost: 3 },
+		{ model: "m2", requests: 3, sent: 9040, output: 15, cost: 3 },
+	]);
+	const stats = cacheStats(a);
+	expect(stats).toMatchObject({ misses: 1, tokens: 2060 });
+	expect(stats.rate).toBeCloseTo(5020 / 15220, 6);
+	// A model that never used the cache has no misses.
+	expect(analyze([request(1000, "m3", 5000, 0, 0, {}), request(2000, "m3", 6000, 0, 0, {})]).requests[1].miss).toBeUndefined();
+});
+
+test("rowsOf keeps the whole content only when asked", () => {
+	expect(rowsOf(messages).every((row) => row.text === undefined)).toBe(true);
+	const rows = rowsOf([{ role: "system", content: "", sections: { rules: "be brief" }, toolsAdded: messages[0].toolsAdded }, ...messages.slice(2)], undefined, [], true);
+	const text = (label: string) => rows.find((row) => row.label === label)?.text;
+	expect(text("system")).toBe("[rules]\nbe brief");
+	expect(text("2 tool schemas")).toContain("read");
+	expect(text("result read")).toBe("k".repeat(400));
+	expect(text("bash")).toBe(`ls\n${"x".repeat(38)}`);
+});
+
+test("scaleOf scales estimates to the provider-reported figure", () => {
+	expect(scaleOf(100, 250)).toBe(2.5);
+	expect(scaleOf(0, 250)).toBe(1);
+	expect(scaleOf(100, null)).toBe(1);
+	const data = view([]);
+	expect(report(data)).toContain("System prompt     ≈   100");
+	data.factor = 2.5;
+	expect(report(data)).toContain("System prompt     ≈   250");
+	expect(report(data)).toContain("scaled ×2.50");
+});
+
+test("hintsOf lists superseded reads, repeated skills and large old results", () => {
+	const read = (id: string, args: object) => ({ type: "toolCall", id, name: "read", arguments: args });
+	const result = (toolCallId: string, toolName: string, chars: number, isError = false) => ({ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text: "z".repeat(chars) }], isError });
+	const hints = hintsOf([
+		{ role: "user", content: "go" },
+		{
+			role: "assistant",
+			content: [
+				read("r1", { path: "/a.ts" }),
+				read("r2", { path: "/a.ts" }),
+				read("r3", { path: "/a.ts", offset: 100 }),
+				read("s1", { path: "/skills/x/SKILL.md" }),
+				read("s2", { path: "/skills/x/SKILL.md" }),
+				{ type: "toolCall", id: "b1", name: "bash", arguments: { command: "ls" } },
+				{ type: "toolCall", id: "b2", name: "bash", arguments: { command: "false" } },
+			],
+		},
+		result("r1", "read", 800),
+		result("r2", "read", 1200),
+		result("r3", "read", 6000),
+		result("s1", "read", 400),
+		result("s2", "read", 400),
+		result("b1", "bash", 8000),
+		result("b2", "bash", 8000, true),
+		{ role: "user", content: "more" },
+		{ role: "assistant", content: [{ type: "toolCall", id: "b3", name: "bash", arguments: { command: "ls" } }] },
+		result("b3", "bash", 9000),
+	]);
+	expect(hints.map((hint) => [hint.kind, hint.tokens, hint.label])).toEqual([
+		["result", 2000, "result bash"],
+		// A read of another range is not superseded, but it is a large old result.
+		["result", 1500, "result read"],
+		["reread", 200, "read /a.ts ×2"],
+		["skill", 100, "skill x ×2"],
+	]);
+	expect(hintsOf([{ role: "user", content: "go" }])).toEqual([]);
+});
+
+test("report returns one section when asked", () => {
+	const data = view(session(0));
+	expect(report(data, "composition")).toStartWith("Current context composition");
+	expect(report(data, "requests")).toContain("#2 ");
+	expect(report(data, "requests")).toContain("m1: 2 requests, sent 2.0k, output 20, $0.7500");
+	expect(report(data, "tools")).toContain("bash: 1 direct, 0 nested, 1 errors, calls ≈11, results ≈10, direct calls while not declared: 1");
+	expect(report(data, "tools")).toContain("x ×2 ≈100  /skills/x/SKILL.md");
+	expect(report(data, "files")).toContain("2 0 0  /skills/x/SKILL.md");
+	expect(report(data, "commands")).toContain("Programs: git ×1");
+	expect(report(data, "hints")).toContain("Nothing stands out");
+	data.hints = [{ kind: "result", tokens: 2000, label: "result bash", detail: "zzz" }];
+	expect(report(data, "hints")).toContain("≈  2.0k  result bash: zzz");
 });
