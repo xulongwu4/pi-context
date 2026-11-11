@@ -1,0 +1,18 @@
+{
+  "name": "pi-context",
+  "version": "0.1.0",
+  "description": "Context insight for pi: /context dashboard overlay, footer indicator, system prompt prefix/suffix, and a context_insight tool",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
