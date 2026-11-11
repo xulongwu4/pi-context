@@ -3,7 +3,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 export interface Config {
 	systemPromptPrefix?: string;
 	systemPromptSuffix?: string;
+	/** Context use, in percent, at which a warning is shown. 0 disables it. */
+	warnPercent?: number;
 }
+
+export const DEFAULT_WARN_PERCENT = 80;
 
 export function loadConfig(path: string): Config {
 	try {

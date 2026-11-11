@@ -1,10 +1,23 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { analyze, programOf, rowsOf, sumByCategory } from "../src/analyze.ts";
+import {
+	analyze,
+	declaredTools,
+	programOf,
+	recordedDeclarations,
+	rowsOf,
+	schemasOf,
+	sumByCategory,
+	TURN_ENTRY,
+	undeclared,
+	type ViewData,
+} from "../src/analyze.ts";
 import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
-import { bar, fmtDuration, fmtTokens } from "../src/format.ts";
+import { exportMarkdown } from "../src/export.ts";
+import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
+import { aggregate, parseEntries, scan, summarize } from "../src/insights.ts";
 import { report } from "../src/report.ts";
 
 const usage = (input: number, output: number, cacheRead = 0, cost = 0) => ({
@@ -158,23 +171,236 @@ test("format helpers", () => {
 	expect(fmtTokens(999)).toBe("999");
 	expect(fmtTokens(84200)).toBe("84.2k");
 	expect(fmtTokens(1250000)).toBe("1.3M");
+	expect(fmtTokens(2.5e9)).toBe("2.5B");
 	expect(fmtTokens(null)).toBe("?");
+	expect(fmtDay(new Date(2026, 0, 5, 23, 59).getTime())).toBe("2026-01-05");
 	expect(fmtDuration(59000)).toBe("59s");
 	expect(fmtDuration(723000)).toBe("12m3s");
 	expect(bar(0.5, 4)).toBe("██░░");
 	expect(bar(Number.NaN, 2)).toBe("░░");
 });
 
+const view = (entries: any[]): ViewData => ({
+	analysis: analyze(entries),
+	current: rowsOf(messages),
+	usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 },
+	model: "m1",
+	declared: ["codemode", "read"],
+	agents: [],
+	running: false,
+	reconstruct: () => [],
+});
+
 test("report lists usage, composition and largest items", () => {
-	const text = report({
-		analysis: analyze([]),
-		current: rowsOf(messages),
-		usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 },
-		model: "m1",
-		timing: { activeMs: 0, modelMs: 0, toolMs: 0 },
-	});
+	const text = report(view([]));
 	expect(text).toContain("Context: 84.2k / 200.0k tokens (42%)");
 	expect(text).toContain("System prompt");
 	expect(text).toContain("Skill injections");
 	expect(text).toContain("Largest items:");
+});
+const HOUR = 3_600_000;
+const at = (message: any, parentId?: string) => ({ type: "message", parentId, timestamp: new Date(message.timestamp).toISOString(), message });
+const assistant = (timestamp: number, content: any[] = [], cost = 0.5) => ({
+	role: "assistant",
+	model: "m1",
+	stopReason: "stop",
+	timestamp,
+	usage: usage(100, 10, 900, cost),
+	content,
+});
+/** A session: one skill read and one failed command, then a script that reads the skill again and edits by anchor. */
+const session = (start: number, id = "s1") => [
+	{ type: "session", id, timestamp: new Date(start).toISOString(), cwd: "/work/proj" },
+	at({ role: "user", content: "hi", timestamp: start }),
+	at({ ...assistant(start + 1000, messages[3].content as any[]) }, "p1"),
+	at({ ...messages[4], timestamp: start + 2000 }),
+	at({ ...messages[5], timestamp: start + 3000 }),
+	at(assistant(start + HOUR, [{ type: "toolCall", id: "c5", name: "codemode", arguments: { code: "x".repeat(91) } }], 0.25), "p2"),
+	at({
+		role: "toolResult",
+		toolCallId: "c5",
+		toolName: "codemode",
+		content: [{ type: "text", text: "o".repeat(80) }],
+		isError: false,
+		timestamp: start + HOUR + 1000,
+		nestedCalls: {
+			complete: true,
+			calls: [
+				{ id: "c5/1", name: "read", status: "ok", arguments: { path: "/skills/x/SKILL.md" } },
+				{ id: "c5/2", name: "replace", status: "ok", arguments: { remove_from: "abcde", remove_to: "abcde", text: "" } },
+				{ id: "c5/3", name: "insert", status: "ok", arguments: { anchor: "fghij", direction: "after", text: "" } },
+				{ id: "c5/4", name: "insert", status: "error", arguments: { anchor: "zzzzz", direction: "after", text: "" } },
+			],
+		},
+	}),
+	{ type: "session_info", name: "Named" },
+];
+
+test("analyze reports tools and skills", () => {
+	const a = analyze(session(0));
+	const tool = (name: string) => a.tools.find((t) => t.name === name);
+	expect(tool("read")).toMatchObject({ calls: 1, nested: 1, errors: 0, resultTokens: 100 });
+	expect(tool("bash")).toMatchObject({ calls: 1, nested: 0, errors: 1, resultTokens: 10 });
+	expect(tool("codemode")).toMatchObject({ calls: 1, callTokens: 28, resultTokens: 20 });
+	expect(tool("insert")).toMatchObject({ calls: 0, nested: 2, errors: 1, callTokens: 0 });
+	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: 100 }]);
+});
+
+test("analyze applies the turn records pi-context saved", () => {
+	const sums = sumByCategory(rowsOf(messages));
+	const turn = (data: any) => ({ type: "custom", customType: TURN_ENTRY, data });
+	const entries = [
+		...session(0),
+		turn({ time: 1000, ms: 4000, toolMs: 500, activeMs: 5000, sums }),
+		turn({ time: HOUR, ms: 2000, toolMs: 1000, activeMs: 4000, sums, paths: { "c5/2": "/a.ts" } }),
+	];
+	const a = analyze(entries);
+	expect(a.timing).toEqual({ activeMs: 9000, modelMs: 6000, toolMs: 1500 });
+	expect(a.requests.map((r) => [r.ms, r.sums?.system, r.parentId])).toEqual([[4000, 100, "p1"], [2000, 100, "p2"]]);
+	expect(a.files.find((f) => f.path === "/a.ts")).toEqual({ path: "/a.ts", reads: 0, writes: 0, edits: 1 });
+	// c5/3 succeeded but no record names its file; the failed c5/4 changed nothing.
+	expect(a.unresolvedEdits).toBe(1);
+	expect(analyze(session(0)).unresolvedEdits).toBe(2);
+	expect(analyze(session(0)).requests[0].ms).toBeUndefined();
+});
+
+test("analyze keeps the last saved record of each subagent", () => {
+	const record = (data: any) => ({ type: "custom", customType: "subagents:record", data });
+	const a = analyze([
+		record({ id: "a1", type: "Explore", description: "look", status: "error", startedAt: 1, completedAt: 2, error: "boom" }),
+		record({ id: "a1", type: "Explore", description: "look", status: "completed", startedAt: 5, completedAt: 9, sessionFile: "/s.jsonl" }),
+		record({ type: "broken" }),
+	]);
+	expect(a.agents).toEqual([
+		{ id: "a1", type: "Explore", description: "look", status: "completed", startedAt: 5, completedAt: 9, sessionFile: "/s.jsonl", error: undefined },
+	]);
+});
+
+test("summarize and aggregate build the cross-session figures", () => {
+	const now = new Date(2026, 5, 10, 12).getTime(); // a Wednesday
+	const recent = summarize(session(now - 26 * HOUR, "recent"));
+	const old = summarize(session(now - 40 * 24 * HOUR, "old"));
+	expect(recent).toMatchObject({ id: "recent", cwd: "/work/proj", name: "Named", requests: 2, userInputs: 1, toolCalls: 7, tokens: 2020, cost: 0.75 });
+	expect(recent.end).toBe(now - 25 * HOUR);
+	expect(Object.values(recent.hours)).toEqual([[1, 1010, 0.5], [1, 1010, 0.25]]);
+	expect(recent.tools).toMatchObject({ read: 2, insert: 2, codemode: 1 });
+	expect(recent.programs).toEqual({ git: 1 });
+	expect(recent.skills).toEqual({ x: 2 });
+
+	const insights = aggregate([old, recent], now, 30);
+	expect(insights.sessions.map((s) => s.id)).toEqual(["recent"]);
+	expect(insights).toMatchObject({ requests: 2, tokens: 2020, cost: 0.75, activeDays: 1 });
+	expect(insights.week).toHaveLength(7);
+	expect(insights.week[6]).toEqual({ day: "2026-06-10", requests: 0, tokens: 0, cost: 0 });
+	expect(insights.week[5]).toEqual({ day: "2026-06-09", requests: 2, tokens: 2020, cost: 0.75 });
+	// 26 and 25 hours before Wednesday noon: Tuesday 10:00 and 11:00.
+	expect(insights.heat[1].slice(9, 13)).toEqual([0, 1, 1, 0]);
+	expect(insights.tools[0]).toEqual(["read", 2]);
+	expect(insights.skills).toEqual([["x", 2]]);
+});
+
+test("parseEntries skips broken lines", () => {
+	expect(parseEntries('{"a":1}\n\n{"b":\n{"c":3}')).toEqual([{ a: 1 }, { c: 3 }]);
+});
+
+test("scan reads changed session files and reuses cached summaries", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-context-"));
+	const cache = join(root, "cache.json");
+	const dir = join(root, "sessions", "--work-proj--");
+	mkdirSync(dir, { recursive: true });
+	const file = (name: string, id: string) => {
+		writeFileSync(join(dir, name), session(0, id).map((entry) => JSON.stringify(entry)).join("\n"));
+		return join(dir, name);
+	};
+	const a = file("a.jsonl", "a");
+	file("b.jsonl", "b");
+	utimesSync(file("old.jsonl", "old"), 1, 1);
+	writeFileSync(join(dir, "notes.txt"), "x");
+	const progress: number[][] = [];
+	const ids = async () => (await scan(join(root, "sessions"), cache, 1000_000, (done, total) => progress.push([done, total]))).map((s) => s.id).sort();
+	expect(await ids()).toEqual(["a", "b"]);
+	expect(progress).toEqual([[1, 2], [2, 2]]);
+
+	// An unchanged file comes from the cache; a changed one is read again.
+	const saved = JSON.parse(readFileSync(cache, "utf8"));
+	for (const entry of Object.values<any>(saved.files)) entry.summary.id += "-cached";
+	writeFileSync(cache, JSON.stringify(saved));
+	writeFileSync(a, `${readFileSync(a, "utf8")}\n`);
+	expect(await ids()).toEqual(["a", "b-cached"]);
+	expect(await scan(join(root, "missing"), cache, 0)).toEqual([]);
+});
+
+test("exportMarkdown writes every section", () => {
+	const data = view(session(0));
+	data.agents = [{ id: "a1", type: "Explore", description: "look | see", status: "completed", startedAt: 1000, completedAt: 61000, requests: 3, tokens: 1200, cost: 0.1 }];
+	const text = exportMarkdown(data, aggregate([summarize(session(0))], HOUR, 30));
+	for (const heading of ["Stats", "Current context", "Requests", "Events", "Files", "Commands", "Tools", "Fleet", "Insights: last 30 days, all projects"]) {
+		expect(text).toContain(`## ${heading}`);
+	}
+	expect(text).toContain("| read | 1 | 1 | 0 | ≈9 | ≈100 |  |");
+	// "bash" was called directly but is not declared; "insert" was only called from a script.
+	expect(text).toContain("| bash | 1 | 0 | 1 | ≈11 | ≈10 | direct call, not declared |");
+	expect(text).toContain("| insert | 0 | 2 | 1 |  |  |  |");
+	expect(text).toContain("| x | 2 | ≈100 | /skills/x/SKILL.md |");
+	expect(text).toContain("| a1 | Explore | look \\| see | completed | 1m0s | 3 | 1.2k | $0.1000 |");
+	expect(text).toContain("2 anchor-based edits are not listed");
+	expect(text).toContain("- Top programs: git ×1");
+	expect(text).toContain("## Events\n\nNone.");
+});
+test("declaredTools reads the declarations of each provider payload shape", () => {
+	const size = (value: unknown) => JSON.stringify(value).length;
+	const anthropic = { name: "codemode", description: "d", input_schema: {} };
+	const chat = { type: "function", function: { name: "codemode", description: "d", parameters: {} } };
+	const google = { functionDeclarations: [{ name: "a", description: "d" }, { name: "b", description: "dd" }] };
+	const bedrock = { toolSpec: { name: "codemode", description: "d", inputSchema: {} } };
+	expect(declaredTools({ tools: [anthropic, { type: "web_search_20250305", name: "web_search" }] })).toEqual({
+		codemode: size(anthropic),
+		web_search: size({ type: "web_search_20250305", name: "web_search" }),
+	});
+	expect(declaredTools({ tools: [chat] })).toEqual({ codemode: size(chat) });
+	expect(declaredTools({ config: { tools: [google] } })).toEqual({ a: size(google.functionDeclarations[0]), b: size(google.functionDeclarations[1]) });
+	expect(declaredTools({ toolConfig: { tools: [bedrock] } })).toEqual({ codemode: size(bedrock) });
+	expect(declaredTools({ tools: [] })).toEqual({});
+	expect(declaredTools({ messages: [] })).toBeUndefined();
+	expect(declaredTools(undefined)).toBeUndefined();
+});
+
+test("rowsOf counts the declarations a request carries, not every active tool", () => {
+	// The transcript declares both tools, but the request hides "read" and sends a longer description of "codemode".
+	const transcript = [
+		{ role: "system", content: "s".repeat(40), toolsAdded: [{ name: "read", description: "r".repeat(400) }, { name: "codemode", description: "c" }] },
+		{ role: "user", content: "hi" },
+	];
+	const tools = (declared?: Record<string, number>) => rowsOf(transcript, declared).filter((row) => row.cat === "tools");
+	expect(tools()[0].label).toBe("2 tool schemas");
+	expect(tools({ codemode: 200 })).toEqual([{ cat: "tools", tokens: 50, label: "1 tool schemas", preview: "codemode" }]);
+	expect(tools({})).toEqual([]);
+	// Before a request is seen, the hidden names are all that is known.
+	expect(rowsOf(transcript, undefined, ["read"]).filter((row) => row.cat === "tools")).toMatchObject([{ label: "1 tool schemas", preview: "codemode" }]);
+	expect(tools({ codemode: 200 })).toEqual(rowsOf(transcript, { codemode: 200 }, ["codemode"]).filter((row) => row.cat === "tools"));
+	expect(rowsOf([{ role: "user", content: "hi" }], { codemode: 200 }).map((row) => row.cat)).toEqual(["tools", "user"]);
+});
+
+test("recordedDeclarations returns the last declarations saved on the branch", () => {
+	const turn = (data: any) => ({ type: "custom", customType: TURN_ENTRY, data });
+	expect(recordedDeclarations([turn({ declared: { a: 1 } }), turn({ declared: { b: 2 } }), turn({ time: 3 })])).toEqual({ b: 2 });
+	expect(recordedDeclarations([turn({ time: 3 }), { type: "custom", customType: "other", data: { declared: { x: 1 } } }])).toBeUndefined();
+});
+test("schemasOf lists the tool schemas a request carries", () => {
+	const transcript = [
+		{ role: "system", content: "", toolsAdded: [{ name: "read" }, { name: "codemode" }, { name: "gone" }] },
+		{ role: "user", content: "hi" },
+		{ role: "system", content: "", toolsRemoved: [{ name: "gone" }] },
+	];
+	expect([...schemasOf(transcript).keys()]).toEqual(["read", "codemode"]);
+	expect([...schemasOf(transcript, undefined, ["read"]).keys()]).toEqual(["codemode"]);
+	expect([...schemasOf(transcript, { other: 5 }, ["other"])]).toEqual([["other", 5]]);
+});
+
+test("undeclared flags direct calls to tools the model was not given", () => {
+	const tool = (name: string, calls: number) => ({ name, calls, nested: 3, errors: 0, callTokens: 0, resultTokens: 0 });
+	expect(undeclared(tool("write", 2), ["codemode"])).toBe(true);
+	expect(undeclared(tool("Write", 1), ["codemode", "write"])).toBe(true);
+	expect(undeclared(tool("codemode", 9), ["codemode"])).toBe(false);
+	expect(undeclared(tool("bash", 0), ["codemode"])).toBe(false);
 });
