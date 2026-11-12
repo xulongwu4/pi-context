@@ -21,6 +21,7 @@ import {
 	fileOp,
 	LABELS,
 	recordedDeclarations,
+	recordedSources,
 	type Row,
 	rowsOf,
 	scaleOf,
@@ -28,6 +29,7 @@ import {
 	sumByCategory,
 	sumTokens,
 	TURN_ENTRY,
+	toolSource,
 	type TurnData,
 	type ViewData,
 } from "./analyze.ts";
@@ -111,6 +113,8 @@ export default function (pi: ExtensionAPI) {
 	let declared: Record<string, number> | undefined;
 	/** The declarations last written to the session, as JSON. */
 	let savedDeclared = "";
+	/** Who provided the tools that the session recorded. See {@link toolSource}. */
+	let recordedFrom: Record<string, string> = {};
 	/** Active tools whose declarations requests leave out. Used until the declarations of a request are known. */
 	let hidden: string[] = [];
 	// The turn in progress. It is written to the session when the turn ends.
@@ -137,30 +141,41 @@ export default function (pi: ExtensionAPI) {
 	/** The server of the context page, while it runs. */
 	let web: WebServer | undefined;
 
+	/** Who provides each tool: the tools that pi knows now, then those that the session recorded. */
+	const sourcesNow = (): Record<string, string> => ({
+		...recordedFrom,
+		...Object.fromEntries(pi.getAllTools().map((tool) => [tool.name, toolSource(tool.name, tool.sourceInfo)])),
+	});
+
+	/** A system message that adds the tools active now. It stands for the tools of messages that record none. */
+	function activeTools() {
+		const active = new Set(pi.getActiveTools());
+		const toolsAdded = pi
+			.getAllTools()
+			.filter((tool) => active.has(tool.name))
+			.map(({ name, description, parameters }) => ({ name, description, parameters }));
+		return { role: "system", content: "", toolsAdded };
+	}
+
 	/** Rows of the messages, with the system prompt and tool schemas added when the messages do not carry them. */
 	function rowsFor(messages: any[], ctx: ExtensionContext, full = false): Row[] {
-		const rows = rowsOf(messages, declared, hidden, full);
+		const sources = full ? sourcesNow() : undefined;
+		const rows = rowsOf(messages, declared, hidden, full, sources);
 		const hasSystem = rows.some((row) => row.cat === "system");
 		const hasTools = rows.some((row) => row.cat === "tools");
 		if (hasSystem && hasTools) return rows;
-		const active = new Set(pi.getActiveTools());
-		const toolsAdded = hasTools
-			? []
-			: pi
-					.getAllTools()
-					.filter((tool) => active.has(tool.name))
-					.map(({ name, description, parameters }) => ({ name, description, parameters }));
-		const head = { role: "system", content: hasSystem ? "" : ctx.getSystemPrompt(), toolsAdded };
-		return [...rowsOf([head], hasTools ? {} : declared, hidden, full), ...rows];
+		// With tool schemas among the rows, the empty declarations keep those of the head out.
+		const head = { ...activeTools(), content: hasSystem ? "" : ctx.getSystemPrompt() };
+		return [...rowsOf([head], hasTools ? {} : declared, hidden, full, sources), ...rows];
 	}
-
 	const currentRows = (ctx: ExtensionContext) => rowsFor(ctx.sessionManager.buildSessionProjection().messages, ctx);
 
-	/** Names of the tools declared to the model now. */
-	function declaredNames(messages: any[]): string[] {
-		const schemas = schemasOf(messages, declared, hidden);
+	/** The tool schemas declared to the model now: name to estimated tokens. */
+	function schemasNow(messages: any[]): Record<string, number> {
+		let schemas = schemasOf(messages, declared, hidden);
 		// A session without a recorded system message says nothing about tools; the active ones are declared.
-		return schemas.size > 0 ? [...schemas.keys()] : pi.getActiveTools().filter((name) => !hidden.includes(name));
+		if (schemas.size === 0) schemas = schemasOf([activeTools()], undefined, hidden);
+		return Object.fromEntries([...schemas].map(([name, chars]) => [name, estimate(chars)]));
 	}
 
 	/** Requests, tokens and cost of a finished subagent, read from its saved session. */
@@ -213,6 +228,7 @@ export default function (pi: ExtensionAPI) {
 		const current = rowsFor(messages, ctx, true);
 		for (const row of current) if (row.id && pruned.has(row.id)) row.dropped = true;
 		const usage = ctx.getContextUsage();
+		const schemas = schemasNow(messages);
 		const fileSize = (path: string) => {
 			try {
 				return statSync(resolve(ctx.cwd, path)).size;
@@ -225,7 +241,9 @@ export default function (pi: ExtensionAPI) {
 			current,
 			usage,
 			model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
-			declared: declaredNames(messages),
+			declared: Object.keys(schemas),
+			schemas,
+			sources: sourcesNow(),
 			factor: scaleOf(sumTokens(current), usage?.tokens),
 			hints: hintsOf(messages, fileSize),
 			dropped: droppedOf(projection, pruned),
@@ -247,9 +265,11 @@ export default function (pi: ExtensionAPI) {
 		const analysis = analyze(branch);
 		const ids = prunedOf(branch);
 		const then = recordedDeclarations(branch);
+		const sources = recordedSources(branch) ?? {};
 		const projection = buildSessionProjection(entries, leaf).messages;
 		const messages = prune(projection, ids);
-		const current = rowsOf(messages, then, [], true);
+		const current = rowsOf(messages, then, [], true, sources);
+		const schemas = Object.fromEntries([...schemasOf(messages, then)].map(([name, chars]) => [name, estimate(chars)]));
 		for (const row of current) if (row.id && ids.has(row.id)) row.dropped = true;
 		const last = analysis.requests.at(-1);
 		const usage = last ? { tokens: last.context + last.output, contextWindow: 0, percent: null } : undefined;
@@ -258,7 +278,9 @@ export default function (pi: ExtensionAPI) {
 			current,
 			usage,
 			model: last?.model,
-			declared: [...schemasOf(messages, then).keys()],
+			declared: Object.keys(schemas),
+			schemas,
+			sources,
 			factor: scaleOf(sumTokens(current), usage?.tokens),
 			hints: hintsOf(messages),
 			dropped: droppedOf(projection, ids),
@@ -267,7 +289,7 @@ export default function (pi: ExtensionAPI) {
 			running: false,
 			parentSession: all.find((entry) => entry.type === "session")?.parentSession,
 			other: title,
-			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true) : []),
+			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true, sources) : []),
 		};
 	}
 
@@ -456,6 +478,7 @@ export default function (pi: ExtensionAPI) {
 		const branch = ctx.sessionManager.getBranch();
 		declared = recordedDeclarations(branch);
 		savedDeclared = JSON.stringify(declared) ?? "";
+		recordedFrom = recordedSources(branch) ?? {};
 		pruned = prunedOf(branch);
 		requestStart = 0;
 		turnRequest = undefined;
@@ -602,6 +625,9 @@ export default function (pi: ExtensionAPI) {
 			if (Object.keys(turnPaths).length > 0) data.paths = turnPaths;
 			if (declared && JSON.stringify(declared) !== savedDeclared) {
 				data.declared = declared;
+				const sources = sourcesNow();
+				recordedFrom = Object.fromEntries(Object.keys(declared).map((name) => [name, sources[name] ?? ""]));
+				data.sources = recordedFrom;
 				savedDeclared = JSON.stringify(declared);
 			}
 			pi.appendEntry(TURN_ENTRY, data);

@@ -3,7 +3,21 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { briefOf, diffRows, LABELS, type RequestRec, type Row, scaleOf, sumTokens, textOf, trendBars, type ViewData } from "./analyze.ts";
+import {
+	briefOf,
+	diffRows,
+	LABELS,
+	type RequestRec,
+	type Row,
+	scaleOf,
+	schemaSources,
+	sumTokens,
+	TOOL_ORDERS,
+	textOf,
+	toolRows,
+	trendBars,
+	type ViewData,
+} from "./analyze.ts";
 import { DEFAULT_WARN_PERCENT } from "./config.ts";
 import { viewJson } from "./export.ts";
 import { footerItems } from "./footer.ts";
@@ -131,6 +145,8 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			return {
 				...viewJson(data),
 				trend: trendBars(data.analysis, query.get("turn") === "1", query.get("delta") === "1"),
+				toolRows: toolRows(data.analysis.tools, data.schemas, data.sources, TOOL_ORDERS.find((order) => order === query.get("tools"))),
+				schemaSources: schemaSources(data.schemas, data.sources),
 				version: collected,
 				title: data.other ?? host.title(),
 				readOnly: !!data.other,

@@ -16,9 +16,12 @@ import {
 	type RequestRec,
 	type Row,
 	scaleOf,
+	schemaSources,
 	sumByCategory,
 	sumTokens,
+	TOOL_ORDERS,
 	textOf,
+	toolRows,
 	trendBars,
 	undeclared,
 	type ViewData,
@@ -164,6 +167,8 @@ export class ContextOverlay {
 	private delta = false;
 	/** Whether the Browser tab, opened from Trend, must select the first item added since the request before. */
 	private toAdded = false;
+	/** Position in TOOL_ORDERS of the order of the Tools tab. */
+	private toolOrder = 0;
 	/** Compositions rebuilt from the session, by request number. */
 	private rebuilt = new Map<number, Row[]>();
 	/** The item being inspected. `back` is the scroll position to return to. */
@@ -271,6 +276,7 @@ export class ContextOverlay {
 			this.scroll = 0;
 		} else if (key === "g" && this.name === "Trend") this.byTurn = !this.byTurn;
 		else if (key === "m" && this.name === "Trend") this.delta = !this.delta;
+		else if (key === "s" && this.name === "Tools") this.toolOrder = (this.toolOrder + 1) % TOOL_ORDERS.length;
 		else if (key === "o" && this.name === "Current") {
 			this.ordered = !this.ordered;
 			this.item = 0;
@@ -350,7 +356,7 @@ export class ContextOverlay {
 			Events: "↑/↓ scroll  k kind",
 			Files: "↑/↓ scroll  / filter",
 			Commands: "↑/↓ scroll  / filter",
-			Tools: "↑/↓ scroll  / filter",
+			Tools: "↑/↓ scroll  / filter  s sort",
 			Fleet: "↑/↓ select  enter open",
 			Insights: "↑/↓ select  enter open  p period  [ ] day  a project  s sort  / filter",
 			Settings: "↑/↓ select  enter edit  x clear",
@@ -1124,28 +1130,34 @@ export class ContextOverlay {
 	}
 
 	private tools(): string[] {
-		const { analysis, declared, factor } = this.data;
+		const { analysis, declared, schemas, sources, factor } = this.data;
 		const { skills } = analysis;
-		if (analysis.tools.length === 0) return ["No tool calls yet."];
-		const tools = analysis.tools.filter((tool) => this.matches(tool.name));
+		const order = TOOL_ORDERS[this.toolOrder];
+		const all = toolRows(analysis.tools, schemas, sources, order);
+		if (all.length === 0) return ["No tools yet."];
+		const tools = all.filter((tool) => this.matches(`${tool.name} ${tool.source}`));
 		const flagged = tools.some((tool) => undeclared(tool, declared) > 0);
 		const count = (n: number) => String(n).padStart(7);
 		const size = (tokens: number) => (tokens ? `≈${fmtTokens(tokens * factor)}` : "–").padStart(9);
+		const wide = Math.max(6, ...tools.map((tool) => tool.source.length));
 		const name = (tool: (typeof tools)[number]) => {
 			const calls = undeclared(tool, declared);
 			return calls ? this.theme.fg("warning", `${tool.name}  ! ${calls} not declared`) : tool.name;
 		};
+		const groups = schemaSources(schemas, sources);
 		const lines = [
-			this.head(`${"calls".padStart(9)}${"nested".padStart(8)}${"errors".padStart(8)}${"call".padStart(10)}${"result".padStart(10)}  tool`),
-			...tools
-				.sort((a, b) => b.calls + b.nested - (a.calls + a.nested))
-				.map(
-					(tool) =>
-						`  ${count(tool.calls)} ${count(tool.nested)} ${tool.errors ? this.theme.fg("error", count(tool.errors)) : count(0)} ${size(tool.callTokens)} ${size(tool.resultTokens)}  ${name(tool)}`,
-				),
+			this.head(`${"calls".padStart(9)}${"nested".padStart(8)}${"errors".padStart(8)}${"call".padStart(10)}${"result".padStart(10)}${"schema".padStart(10)}  ${"source".padEnd(wide)}  tool`),
+			...tools.map(
+				(tool) =>
+					`  ${count(tool.calls)} ${count(tool.nested)} ${tool.errors ? this.theme.fg("error", count(tool.errors)) : count(0)} ${size(tool.callTokens)} ${size(tool.resultTokens)} ${size(tool.schema)}  ${this.theme.fg("muted", tool.source.padEnd(wide))}  ${name(tool)}`,
+			),
 			...(flagged ? [this.theme.fg("warning", "  ! Direct calls that the model made while the tool was not declared to it.")] : []),
-			this.theme.fg("dim", "  Session totals; token figures are estimates."),
+			this.theme.fg("dim", `  Sorted by ${order === "calls" ? "calls" : order === "schema" ? "the size of the schema" : "name"}. Session totals; token figures are estimates.`),
+			this.theme.fg("dim", "  schema: what the declaration of the tool takes in each request now; – when the tool is not declared."),
 			this.theme.fg("dim", "  A nested call is made by another tool and occupies that tool's tokens."),
+			"",
+			this.head("Tool schemas by source"),
+			...(groups.length ? groups.map((group) => `  ${size(group.tokens)} ${`${group.tools} ${group.tools === 1 ? "tool" : "tools"}`.padStart(10)}  ${group.source || "unknown"}`) : ["  None."]),
 			"",
 			this.head("Skills loaded"),
 		];

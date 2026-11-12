@@ -19,6 +19,8 @@ const view = (other?: string): ViewData => ({
 	usage: { tokens: 160, contextWindow: 1000, percent: 16 },
 	model: "m1",
 	declared: ["bash"],
+	schemas: { bash: 40, read: 90 },
+	sources: { bash: "pi", read: "pi" },
 	factor: 1,
 	hints: [],
 	dropped: [],
@@ -125,6 +127,16 @@ test("web collects the session once until it changes, and refuses the text of a 
 	const stale = await get("text", { i: 2, v: body.version });
 	expect(stale.status).toBe(400);
 	expect((await get("data")).body.version).toBeGreaterThan(body.version);
+});
+
+test("web data lists the tools that were called or are declared, in the order that the page asked for", async () => {
+	const names = async (query = {}) => (await get("data", query)).body.toolRows.map((tool: any) => tool.name);
+	expect(await names()).toEqual(["bash", "read"]);
+	expect(await names({ tools: "schema" })).toEqual(["read", "bash"]);
+	expect(await names({ tools: "nonsense" })).toEqual(["bash", "read"]);
+	const { body } = await get("data");
+	expect(body.toolRows[1]).toMatchObject({ name: "read", calls: 0, schema: 90, source: "pi" });
+	expect(body.schemaSources).toEqual([{ source: "pi", tools: 2, tokens: 130 }]);
 });
 
 test("web shows what a request was assembled from and what changed since the request before", async () => {

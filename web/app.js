@@ -33,6 +33,8 @@ const state = {
 	view: null,
 	/** Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width. */
 	trend: { byTurn: false, delta: false, fit: false },
+	/** Order of the tools: calls, schema or name. */
+	toolOrder: "calls",
 	openCats: new Set(),
 	openItems: new Set(),
 	texts: new Map(),
@@ -427,18 +429,18 @@ function commandsCard(d) {
 }
 
 function toolsCard(d) {
-	const tools = [...d.tools]
-		.sort((a, b) => b.calls + b.nested - (a.calls + a.nested))
-		.map((tool) => {
-			const undeclared = tool.undeclared + (d.declared.includes(tool.name) ? 0 : tool.unchecked);
-			const flag = undeclared ? ` <span class="warn" title="${undeclared} direct calls while the tool was not declared to the model">!</span>` : "";
-			const size = (tokens) => (tokens ? "≈" + tok(tokens) : "");
-			return [esc(tool.name) + flag, tool.calls || "", tool.nested || "", tool.errors || "", size(tool.callTokens), size(tool.resultTokens)];
-		});
+	const size = (tokens) => (tokens ? "≈" + tok(tokens) : "");
+	const tools = d.toolRows.map((tool) => {
+		const undeclared = tool.undeclared + (d.declared.includes(tool.name) ? 0 : tool.unchecked);
+		const flag = undeclared ? ` <span class="warn" title="${undeclared} direct calls while the tool was not declared to the model">!</span>` : "";
+		return [esc(tool.name) + flag, esc(tool.source), size(tool.schema * d.factor), tool.calls || "", tool.nested || "", tool.errors || "", size(tool.callTokens), size(tool.resultTokens)];
+	});
+	const sources = d.schemaSources.map((group) => [esc(group.source || "unknown"), group.tools, "≈" + tok(group.tokens * d.factor)]);
 	const skills = d.skills.map((skill) => [clip(skill.name), skill.loads, "≈" + tok(skill.tokens)]);
 	const models = [...d.models].sort((a, b) => b.cost - a.cost).map((model) => [esc(model.model), model.requests, tok(model.sent), tok(model.output), cost(model.cost)]);
 	return [
-		table(["Tool", ">Calls", ">In scripts", ">Errors", ">Arguments", ">Results"], tools, "No tool call yet."),
+		table(["Tool", "Source", ">Schema", ">Calls", ">In scripts", ">Errors", ">Arguments", ">Results"], tools, "No tool yet."),
+		sources.length ? "<h3>Tool schemas by source</h3>" + table(["Source", ">Tools", ">Tokens"], sources) : "",
 		skills.length ? "<h3>Skills</h3>" + table(["Skill", ">Loads", ">Tokens"], skills) : "",
 		"<h3>Models</h3>" + table(["Model", ">Requests", ">Sent", ">Output", ">Cost"], models, "No request yet."),
 	].join("");
@@ -612,6 +614,7 @@ function render() {
 	paint("events", eventsCard(d));
 	paint("files", filesCard(d));
 	paint("commands", commandsCard(d));
+	for (const button of document.querySelectorAll("[data-act=order]")) button.classList.toggle("on", state.toolOrder === button.dataset.order);
 	paint("tools", toolsCard(d));
 }
 
@@ -625,7 +628,7 @@ async function load() {
 	}
 	loading = true;
 	try {
-		const d = await api("data", params({ turn: state.trend.byTurn ? 1 : 0, delta: state.trend.delta ? 1 : 0 }));
+		const d = await api("data", params({ turn: state.trend.byTurn ? 1 : 0, delta: state.trend.delta ? 1 : 0, tools: state.toolOrder }));
 		labels = d.labels;
 		state.data = d;
 		setError("");
@@ -733,6 +736,10 @@ const actions = {
 		if (key === "fit") return render();
 		// The lines under the chart tell of a request or of a human input: load() reads the request again.
 		if (key === "byTurn") state.view = null;
+		load();
+	},
+	order(el) {
+		state.toolOrder = el.dataset.order;
 		load();
 	},
 	cat: (el) => toggle(state.openCats, el.dataset.cat),

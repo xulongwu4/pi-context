@@ -13,11 +13,15 @@ import {
 	introducedAt,
 	programOf,
 	recordedDeclarations,
+	recordedSources,
 	rowsOf,
 	scaleOf,
+	schemaSources,
 	schemasOf,
 	sumByCategory,
 	TURN_ENTRY,
+	toolRows,
+	toolSource,
 	trendBars,
 	undeclared,
 	type ViewData,
@@ -232,6 +236,8 @@ const view = (entries: any[]): ViewData => ({
 	usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 },
 	model: "m1",
 	declared: ["codemode", "read"],
+	schemas: { codemode: 500, read: 80 },
+	sources: { codemode: "npm:codemode", read: "pi" },
 	factor: 1,
 	hints: [],
 	dropped: [],
@@ -499,6 +505,8 @@ test("recordedDeclarations returns the last declarations saved on the branch", (
 	const turn = (data: any) => ({ type: "custom", customType: TURN_ENTRY, data });
 	expect(recordedDeclarations([turn({ declared: { a: 1 } }), turn({ declared: { b: 2 } }), turn({ time: 3 })])).toEqual({ b: 2 });
 	expect(recordedDeclarations([turn({ time: 3 }), { type: "custom", customType: "other", data: { declared: { x: 1 } } }])).toBeUndefined();
+	expect(recordedSources([turn({ declared: { a: 1 }, sources: { a: "pi" } }), turn({ time: 3 })])).toEqual({ a: "pi" });
+	expect(recordedSources([turn({ declared: { a: 1 } })])).toBeUndefined();
 });
 test("schemasOf lists the tool schemas a request carries", () => {
 	const transcript = [
@@ -517,6 +525,32 @@ test("undeclared flags direct calls to tools the model was not given", () => {
 	expect(undeclared(tool("Write", 1), ["codemode", "write"])).toBe(1);
 	expect(undeclared(tool("codemode", 9), ["codemode"])).toBe(0);
 	expect(undeclared(tool("bash", 0), ["codemode"])).toBe(0);
+});
+
+test("toolSource names the MCP server, pi, the package or the extension file that provides a tool", () => {
+	expect(toolSource("mcp__github__list_issues", { source: "builtin", path: "builtin:mcp" })).toBe("mcp:github");
+	expect(toolSource("mcp__github__list_issues")).toBe("mcp:github");
+	expect(toolSource("read", { source: "builtin", path: "builtin:read" })).toBe("pi");
+	expect(toolSource("btw", { source: "npm:pi-btw", path: "/x/node_modules/pi-btw/extensions/btw.ts" })).toBe("npm:pi-btw");
+	expect(toolSource("todo", { source: "auto", path: "/home/u/.pi/agent/extensions/todo.ts" })).toBe("todo");
+	expect(toolSource("plan", { source: "local", path: "/work/ext/planner/index.ts" })).toBe("planner");
+	expect(toolSource("read")).toBe("");
+});
+
+test("toolRows joins the calls of each tool with its schema and source, in the order asked for", () => {
+	const tool = (name: string, calls: number, nested = 0) => ({ name, calls, nested, errors: 0, callTokens: 0, resultTokens: 0, undeclared: 0, unchecked: 0 });
+	const tools = [tool("read", 2), tool("bash", 0, 5), tool("mcp__gh__get", 1)];
+	const schemas = { read: 100, codemode: 900, write: 300 };
+	const sources = { read: "pi", write: "pi", codemode: "npm:codemode", bash: "pi" };
+	const rows = (order?: "calls" | "schema" | "name") => toolRows(tools, schemas, sources, order).map((row) => row.name);
+	// A declared tool that was never called is listed too.
+	expect(rows()).toEqual(["bash", "read", "mcp__gh__get", "codemode", "write"]);
+	expect(rows("schema")).toEqual(["codemode", "write", "read", "bash", "mcp__gh__get"]);
+	expect(rows("name")).toEqual(["bash", "codemode", "mcp__gh__get", "read", "write"]);
+	expect(toolRows(tools, schemas, sources).find((row) => row.name === "codemode")).toMatchObject({ calls: 0, schema: 900, source: "npm:codemode" });
+	// A tool that is not declared has no schema. Its name can still tell the MCP server.
+	expect(toolRows(tools, schemas, sources).find((row) => row.name === "mcp__gh__get")).toMatchObject({ calls: 1, schema: 0, source: "mcp:gh" });
+	expect(schemaSources(schemas, sources)).toEqual([{ source: "npm:codemode", tools: 1, tokens: 900 }, { source: "pi", tools: 2, tokens: 400 }]);
 });
 
 test("analyze judges a direct call by the declarations recorded when it was made", () => {
@@ -572,6 +606,8 @@ test("rowsOf keeps the whole content only when asked", () => {
 	const text = (label: string) => rows.find((row) => row.label === label)?.text;
 	expect(text("system")).toBe("[rules]\nbe brief");
 	expect(text("2 tool schemas")).toContain("read");
+	// The content of the tool schemas names who provides each tool, when that is known.
+	expect(rowsOf([{ role: "user", content: "hi" }], { read: 400, mcp__gh__get: 40, bash: 4 }, [], true, { read: "pi" })[0].text).toBe("≈   100  read  pi\n≈    10  mcp__gh__get  mcp:gh\n≈     1  bash");
 	expect(text("result read")).toBe("k".repeat(400));
 	expect(text("bash")).toBe(`ls\n${"x".repeat(38)}`);
 });

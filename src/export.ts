@@ -229,6 +229,8 @@ export function viewJson(data: ViewData) {
 		usage: data.usage,
 		factor: data.factor,
 		declared: data.declared,
+		schemas: data.schemas,
+		sources: data.sources,
 		...analysis,
 		requests: analysis.requests.map(({ rows, ...request }) => request),
 		cache: cacheStats(analysis),

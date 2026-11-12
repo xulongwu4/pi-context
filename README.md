@@ -24,7 +24,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Events | Compactions, dropped and restored tool results, model switches, thinking level changes and branch summaries: the number of events of each kind, the request each event followed, and the tokens it added to the context or took from it |
   | Files | Reads, writes and edits per file |
   | Commands | Shell commands, their result, and the programs they ran |
-  | Tools | Calls, errors and estimated tokens per tool, and the skills that were loaded |
+  | Tools | Calls, errors and estimated tokens per tool, the size of its schema and who provides it (pi, an MCP server, a package or an extension file), the tool schemas summed by source, and the skills that were loaded. Declared tools that were never called are listed too |
   | Fleet | The main agent and its subagents: status, time, model, requests, tokens, cost |
   | Insights | The last 7, 30 or 90 days or all time, over all projects or the current one, or one day of that period: totals, a calendar of the tokens by day, a 7-day chart, activity by weekday and hour, the tokens sent by category, requests and cost per model, cost per project, top tools, programs and skills, and the sessions |
   | Settings | The context warning, auto-compact, the cost budget, the cache expiry warning, the footer, and the system prompt prefix and suffix |
@@ -38,6 +38,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Current, Browser | `enter` shows the whole content of the selected item; `esc` goes back |
   | Current | `o` switches the list between largest first and reading order |
   | Current, Hints | `d` drops the selected tool result from the context, `u` restores it |
+  | Tools | `s` changes the order: most called first, largest schema first, or by name |
   | Current, Browser, Files, Commands, Tools, Insights | `/` starts a filter: type text, `enter` keeps it, `esc` clears it. Only lines that contain the text stay |
   | Events | `k` lists one kind of event, then the next kind, then all again |
   | Insights | `p` changes the period, `[`/`]` narrow the tab to one day, `a` switches between all projects and the current one, `s` changes the order of the sessions, `enter` opens the selected session |
@@ -76,6 +77,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 - The strip in the Context Browser has one band per item, in reading order. Click a band to show its item. `One list, in reading order` lists the items of all categories together. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 - `Drop` and `Restore` on a tool result, in the Context Browser or in Hints, do what `d` and `u` do in the overlay.
 - In Context Events, the buttons list one kind of event or all. The number in the After column opens that request in the Context Browser.
+- In Tools, Skills and Models, each tool shows the size of its schema and who provides it. `Calls`, `Schema` and `Name` change the order. A second table sums the tool schemas by source.
 - The Settings card changes the context warning, auto-compact, the cost budget, the cache expiry warning, the footer, and the system prompt prefix and suffix. An empty number restores the default.
 - The Insights page shows the last 7, 30 or 90 days or all time, over all projects or the current one. `Today` or a click on a day in the calendar narrows the page to that day; a second click shows the whole period again. Click a session to open its Context page. A saved session is read-only.
 - The page loads the data again after each request and each turn of the current session, at most every 2 seconds.
@@ -89,7 +91,7 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 ## Stored data
 
 - Settings are in `pi-context.json` in the pi agent directory.
-- At the end of each turn, the extension appends one `pi-context:turn` entry to the session. It holds the duration of the request, the tool time, the composition by category, the file of each anchor-based edit, and the tool declarations when they changed. Pi does not send these entries to the model.
+- At the end of each turn, the extension appends one `pi-context:turn` entry to the session. It holds the duration of the request, the tool time, the composition by category, the file of each anchor-based edit, and the tool declarations with the source of each tool when they changed. Pi does not send these entries to the model.
 - Each time a tool result is dropped or restored, the extension appends one `pi-context:prune` entry with the ids of the dropped tool calls. The last entry on the branch applies, so the dropped results follow the branch and survive a resume.
 - Insights caches one summary per session file in `pi-context-cache.json` in the pi agent directory. Only new or changed session files are read again. Summaries of files unchanged for 120 days are dropped, so the period `All` reads those files again.
 
@@ -118,6 +120,8 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - The first request that carried an item is the first request made after the message of the item was created. The system prompt and the tool schemas have no such time and show none. An item that no request has carried yet shows none either. In the overlay, the strip does not show an item smaller than one cell.
 - File activity counts tool calls named `read` or `write`, or matching `edit|replace|insert|patch`. Edit tools that address lines by anchor name the file only in their result, so their file is known only for turns that ran while the extension was loaded. The Files tab says how many such edits it cannot list.
 - The Tools tab marks a tool with `!` when the model called it directly although it is not declared to the model. This happens in codemode `only` mode: a hidden tool stays active, so a direct call by name still runs. Each call is judged by the declarations the extension recorded for the request that made it. Calls made before the first record are judged by the tools declared now.
+- The source of a tool is `mcp:<server>` when its name is `mcp__<server>__<tool>`, `pi` for a built-in tool, the package for a tool of a package, and the name of the extension file otherwise. Pi tells the source only of the tools that are loaded now. For a saved session, the sources are those recorded with the tool declarations; a session recorded by an earlier version shows only MCP servers. The whole content of the tool schemas item in Current and Browser lists each schema with its size and source.
+- The Schema column shows the declarations of the last request, not those of the request that made a call. A tool that was called and is no longer declared shows no schema.
 - Calls nested in another tool's result, for example from a script, are counted. Their tokens belong to the tool that made them. The size of a skill loaded by a nested call is the current size of its file.
 - Fleet needs [pi-subagents](https://github.com/tintinweb/pi-subagents). Finished subagents come from the records it saves in the session. Model, requests, tokens and cost come from its live events, or from the subagent's saved session when there is one.
 - The Insights project filter counts sessions that ran in the working directory or below it. The per-session figures in its session list cover the whole session, also the part before the period.

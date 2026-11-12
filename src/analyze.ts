@@ -214,6 +214,8 @@ export interface TurnData {
 	paths?: Record<string, string>;
 	/** Tool declarations the request carried, when they differ from the last record: name to size in characters. */
 	declared?: Record<string, number>;
+	/** Who provides each of those tools. Written with `declared`. See {@link toolSource}. */
+	sources?: Record<string, string>;
 }
 
 export interface Totals {
@@ -258,6 +260,10 @@ export interface ViewData {
 	model?: string;
 	/** Names of the tools declared to the model now. */
 	declared: string[];
+	/** Schemas of those tools: name to estimated tokens. */
+	schemas: Record<string, number>;
+	/** Who provides each known tool. See {@link toolSource}. */
+	sources: Record<string, string>;
 	/** Scales the estimates of the current context to the provider-reported size; 1 when that size is unknown. */
 	factor: number;
 	hints: Hint[];
@@ -327,13 +333,35 @@ export function declaredTools(payload: any): Record<string, number> | undefined 
 	return declared;
 }
 
-/** The tool declarations pi-context last recorded on the branch. */
-export function recordedDeclarations(entries: any[]): Record<string, number> | undefined {
+function recorded<K extends "declared" | "sources">(entries: any[], key: K): TurnData[K] {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
-		if (entry.type === "custom" && entry.customType === TURN_ENTRY && entry.data?.declared) return entry.data.declared;
+		if (entry.type === "custom" && entry.customType === TURN_ENTRY && entry.data?.[key]) return entry.data[key];
 	}
 	return undefined;
+}
+
+/** The tool declarations pi-context last recorded on the branch. */
+export const recordedDeclarations = (entries: any[]) => recorded(entries, "declared");
+
+/** Who provided the tools that pi-context last recorded on the branch. */
+export const recordedSources = (entries: any[]) => recorded(entries, "sources");
+
+/**
+ * Who provides a tool: `mcp:<server>` for a tool of an MCP server, `pi` for a built-in tool,
+ * the package of an extension (such as `npm:name`), or the name of an extension file.
+ * `info` is what pi tells about the tool; without it, only the name of an MCP tool tells.
+ */
+export function toolSource(name: string, info?: { source?: string; path?: string }): string {
+	const server = /^mcp__(.+?)__/.exec(name)?.[1];
+	if (server) return `mcp:${server}`;
+	const source = info?.source ?? "";
+	if (source === "builtin") return "pi";
+	if (source !== "local" && source !== "auto") return source;
+	// An extension outside a package: the name of its file, or of its directory.
+	const parts = (info?.path ?? "").split(/[\\/]/).filter(Boolean);
+	const file = (parts.pop() ?? "").replace(/\.[^.]+$/, "");
+	return (file === "index" ? parts.pop() : file) || source;
 }
 
 /**
@@ -355,6 +383,45 @@ export function schemasOf(messages: any[], declared?: Record<string, number>, hi
 	return schemas;
 }
 
+const newTool = (name: string): ToolRec => ({ name, calls: 0, nested: 0, errors: 0, callTokens: 0, resultTokens: 0, undeclared: 0, unchecked: 0 });
+
+/** A tool with its calls, the estimated tokens of its schema (0 when it is not declared now), and who provides it. */
+export interface ToolRow extends ToolRec {
+	schema: number;
+	source: string;
+}
+
+export const TOOL_ORDERS = ["calls", "schema", "name"] as const;
+export type ToolOrder = (typeof TOOL_ORDERS)[number];
+
+/** The tools that were called or are declared now, most called first, or largest schema first, or by name. */
+export function toolRows(tools: ToolRec[], schemas: Record<string, number>, sources: Record<string, string>, order: ToolOrder = "calls"): ToolRow[] {
+	const names = new Set([...tools.map((tool) => tool.name), ...Object.keys(schemas)]);
+	const rows = [...names].map((name) => ({
+		...(tools.find((tool) => tool.name === name) ?? newTool(name)),
+		schema: schemas[name] ?? 0,
+		source: sources[name] ?? toolSource(name),
+	}));
+	const used = (row: ToolRow) => row.calls + row.nested;
+	const byName = (a: ToolRow, b: ToolRow) => a.name.localeCompare(b.name);
+	if (order === "name") return rows.sort(byName);
+	if (order === "schema") return rows.sort((a, b) => b.schema - a.schema || used(b) - used(a) || byName(a, b));
+	return rows.sort((a, b) => used(b) - used(a) || b.schema - a.schema || byName(a, b));
+}
+
+/** The declared tool schemas by who provides the tools, largest first. */
+export function schemaSources(schemas: Record<string, number>, sources: Record<string, string>): { source: string; tools: number; tokens: number }[] {
+	const groups = new Map<string, { source: string; tools: number; tokens: number }>();
+	for (const [name, tokens] of Object.entries(schemas)) {
+		const source = sources[name] ?? toolSource(name);
+		const group = groups.get(source) ?? { source, tools: 0, tokens: 0 };
+		group.tools++;
+		group.tokens += tokens;
+		groups.set(source, group);
+	}
+	return [...groups.values()].sort((a, b) => b.tokens - a.tokens);
+}
+
 /**
  * Direct calls to the tool that the model made while the tool was not declared to it.
  * Calls made before pi-context recorded declarations are judged by `declared`, the tools declared now.
@@ -368,9 +435,9 @@ export const sumTokens = (rows: Row[]) => rows.reduce((total, row) => total + ro
 
 /**
  * Splits the messages of one request into categorized rows with estimated token counts. See {@link schemasOf}.
- * With `full`, each row also carries its whole content.
+ * With `full`, each row also carries its whole content. `sources` tells who provides each tool; the content of the tool schemas names it.
  */
-export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = [], full = false): Row[] {
+export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = [], full = false, sources: Record<string, string> = {}): Row[] {
 	const rows: Row[] = [];
 	/** Time of the message being read. */
 	let time: number | undefined;
@@ -483,7 +550,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 		full
 			? [...schemas]
 					.sort((x, y) => y[1] - x[1])
-					.map(([name, chars]) => `≈${fmtTokens(estimate(chars)).padStart(6)}  ${name}`)
+					.map(([name, chars]) => `≈${fmtTokens(estimate(chars)).padStart(6)}  ${name}  ${sources[name] ?? toolSource(name)}`.trimEnd())
 					.join("\n")
 			: "",
 	);
@@ -735,7 +802,7 @@ export function analyze(entries: any[]): Analysis {
 	const tool = (name: string) => {
 		let rec = tools.get(name);
 		if (!rec) {
-			rec = { name, calls: 0, nested: 0, errors: 0, callTokens: 0, resultTokens: 0, undeclared: 0, unchecked: 0 };
+			rec = newTool(name);
 			tools.set(name, rec);
 		}
 		return rec;
