@@ -111,6 +111,11 @@ test("web data carries the session without the content of the items", async () =
 	expect(body.labels.toolResults).toBe("Tool results");
 });
 
+test("web data carries the bars of the trend that the page asked for", async () => {
+	expect((await get("data")).body.trend).toEqual([{ index: 0, n: 1, value: 100 }, { index: 1, n: 2, value: 150 }]);
+	expect((await get("data", { delta: 1 })).body.trend.map((bar: any) => bar.value)).toEqual([100, 50]);
+	expect((await get("data", { turn: 1 })).body.trend).toEqual([{ index: 1, n: 1, value: 150 }]);
+});
 test("web collects the session once until it changes, and refuses the text of a changed context", async () => {
 	const before = collected;
 	const { body } = await get("data");

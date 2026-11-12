@@ -31,6 +31,8 @@ const state = {
 	request: null,
 	/** What the server said about that request. */
 	view: null,
+	/** Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width. */
+	trend: { byTurn: false, delta: false, fit: false },
 	openCats: new Set(),
 	openItems: new Set(),
 	texts: new Map(),
@@ -220,30 +222,51 @@ function currentCard(d) {
 }
 
 function trendCard(d) {
-	const requests = d.requests;
-	if (requests.length === 0) return `<p class="muted">No requests yet.</p>`;
-	const max = Math.max(...requests.map((request) => request.context), 1);
+	const bars = d.trend;
+	if (bars.length === 0) return `<p class="muted">No requests yet.</p>`;
+	const { byTurn, delta, fit } = state.trend;
+	// What a bar adds above the base line, and what it takes away below the line.
+	const sides = (bar) => {
+		const values = bar.parts ? CATS.map((cat) => bar.parts[cat]) : [bar.value];
+		return [values.reduce((sum, value) => sum + Math.max(0, value), 0), values.reduce((sum, value) => sum - Math.min(0, value), 0)];
+	};
+	const up = Math.max(...bars.map((bar) => sides(bar)[0]), 1);
+	const down = Math.max(...bars.map((bar) => sides(bar)[1]), 0);
 	// A compaction is marked on the first request after it.
 	const cuts = new Set();
 	for (const event of d.events) {
-		if (/compact/i.test(event.kind)) cuts.add(requests.find((request) => request.time >= event.time)?.n);
+		if (/compact/i.test(event.kind)) cuts.add(d.requests.find((request) => request.time >= event.time)?.n);
 	}
-	const column = (request) => {
-		const stack = request.sums
-			? CATS.filter((cat) => request.sums[cat] > 0).map((cat) => `<i style="flex:${request.sums[cat]};background:${COLORS[cat]}"></i>`).join("")
-			: `<i style="flex:1;background:#9ca3af"></i>`;
+	const column = (bar, i) => {
+		const request = d.requests[bar.index];
+		const input = byTurn ? d.inputs[bar.n - 1] : undefined;
+		// The requests that the bar stands for: one, or those of the human input.
+		const covered = d.requests.slice((bars[i - 1]?.index ?? -1) + 1, bar.index + 1);
+		const cut = covered.some((r) => cuts.has(r.n));
+		const miss = covered.find((r) => r.miss)?.miss;
+		const [more, less] = sides(bar);
+		const stack = (sign) =>
+			bar.parts
+				? CATS.filter((cat) => sign * bar.parts[cat] > 0).map((cat) => `<i style="flex:${sign * bar.parts[cat]};background:${COLORS[cat]}"></i>`).join("")
+				: `<i style="flex:1;background:#9ca3af"></i>`;
+		const half = (size, most, sign) =>
+			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack" style="flex:0 0 ${(size / most) * 100}%">${stack(sign)}</div>` : ""}</div>`;
 		const tip = [
+			input ? `input #${input.n} · ${input.requests} requests · ${input.preview}` : "",
 			`#${request.n} · ${clock(request.time)} · ${request.model}`,
+			delta ? `change ${bar.value < 0 ? "−" : "+"}${tok(Math.abs(bar.value))}` : "",
 			`sent ${tok(request.context)}, ${pct(request.cacheRead, request.context)} from cache · output ${tok(request.output)} · ${cost(request.cost)}`,
-			cuts.has(request.n) ? "first request after a compaction" : "",
-			request.miss ? "cache miss: " + missText(request.miss) : "",
+			cut ? "first request after a compaction" : "",
+			miss ? "cache miss: " + missText(miss) : "",
 		];
-		const mark = cuts.has(request.n) ? "✂" : request.miss ? "!" : "";
-		return `<div class="col${request.n === state.request ? " on" : ""}" data-act="request" data-n="${request.n}" title="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark}</b><div class="stack" style="flex:0 0 ${(request.context / max) * 100}%">${stack}</div></div>`;
+		const on = covered.some((r) => r.n === state.request);
+		return `<div class="col${on ? " on" : ""}" data-act="request" data-n="${request.n}" title="${esc(tip.filter(Boolean).join("\n"))}"><b>${cut ? "✂" : miss ? "!" : ""}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}</div>`;
 	};
 	const key = CATS.map((cat) => `<span class="pill"><i class="dot" style="background:${COLORS[cat]}"></i> ${esc(labels[cat])}</span>`).join("");
-	const note = "Tokens sent by each request. Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context. ✂ compaction, ! cache miss.";
-	return `<div class="trend"><div class="axis"><span>${tok(max)}</span><span>0</span></div><div class="cols" data-keep="trend">${requests.map(column).join("")}</div></div><div class="pills">${key}</div><p class="muted">${note}</p>`;
+	const what = `${delta ? "The change of the tokens sent since the bar before: growth above the line, the rest below it. One bar for" : "Tokens sent by"} ${byTurn ? "the last request of each human input" : "each request"}.`;
+	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context. ✂ compaction, ! cache miss.`;
+	const axis = `<div class="axis"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
+	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div><div class="pills">${key}</div><p class="muted">${note}</p>`;
 }
 
 /** Number of the first request that carried the row: the first one made after the message of the row was created. */
@@ -575,6 +598,7 @@ function render() {
 	paint("tokens", tokensCard(d));
 	paint("timing", timingCard(d));
 	paint("current", currentCard(d));
+	for (const button of document.querySelectorAll("[data-act=trend]")) button.classList.toggle("on", state.trend[button.dataset.key]);
 	paint("trend", trendCard(d));
 	paint("browser", browserCard(d));
 	paint("hints", hintsCard(d));
@@ -595,7 +619,7 @@ async function load() {
 	}
 	loading = true;
 	try {
-		const d = await api("data", params());
+		const d = await api("data", params({ turn: state.trend.byTurn ? 1 : 0, delta: state.trend.delta ? 1 : 0 }));
 		labels = d.labels;
 		state.data = d;
 		setError("");
@@ -695,6 +719,13 @@ const actions = {
 		const numbers = (state.data?.requests ?? []).map((request) => request.n);
 		const next = (state.request == null ? numbers.length : numbers.indexOf(state.request)) + Number(el.dataset.by);
 		if (next >= 0 && next <= numbers.length) selectRequest(numbers[next] ?? null);
+	},
+	trend(el) {
+		const key = el.dataset.key;
+		state.trend[key] = !state.trend[key];
+		// The server makes the bars; the width is a matter of the page.
+		if (key === "fit") render();
+		else load();
 	},
 	cat: (el) => toggle(state.openCats, el.dataset.cat),
 	item: (el) => openItem(Number(el.dataset.i)),

@@ -17,13 +17,14 @@ import {
 	schemasOf,
 	sumByCategory,
 	TURN_ENTRY,
+	trendBars,
 	undeclared,
 	type ViewData,
 } from "../src/analyze.ts";
 import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
 import { exportJson, exportMarkdown } from "../src/export.ts";
 import { expiryText, expiryWarnAt, footerItems, footerText } from "../src/footer.ts";
-import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
+import { bar, fmtDay, fmtDuration, fmtTokens, sparkline } from "../src/format.ts";
 import { hintsOf, hintTotal } from "../src/hints.ts";
 import { aggregate, branchOf, calendar, parseEntries, scan, summarize } from "../src/insights.ts";
 import { droppedOf, isStub, PRUNE_ENTRY, prune, prunedOf } from "../src/prune.ts";
@@ -219,6 +220,9 @@ test("format helpers", () => {
 	expect(fmtDuration(723000)).toBe("12m3s");
 	expect(bar(0.5, 4)).toBe("██░░");
 	expect(bar(Number.NaN, 2)).toBe("░░");
+	expect(sparkline([1, 2, 4, 8], 9)).toBe("▁▂▄█");
+	expect(sparkline([1, 2, 4, 8, 0], 2)).toBe("▂█");
+	expect(sparkline([], 4)).toBe("");
 });
 
 const view = (entries: any[]): ViewData => ({
@@ -651,6 +655,34 @@ test("analyze sums the recorded compositions, scaled to what each request sent",
 	const analysis = analyze([at(assistant(1000)), turn, at(assistant(2000))]);
 	expect(analysis.billedRequests).toBe(1);
 	expect(analysis.billed).toMatchObject({ system: 750, user: 250, answers: 0 });
+});
+
+test("trendBars gives one bar for each request or human input, as totals or as changes", () => {
+	const reply = (timestamp: number, sent: number) => at({ ...assistant(timestamp), usage: usage(sent, 10) });
+	const turn = (time: number, sums: object) => ({ type: "custom", customType: TURN_ENTRY, data: { time, ms: 1, toolMs: 0, activeMs: 1, sums: { ...sumByCategory([]), ...sums } } });
+	const analysis = analyze([
+		at({ role: "user", content: "one", timestamp: 1 }),
+		reply(10, 1000),
+		turn(10, { system: 300, user: 100 }),
+		reply(20, 2000),
+		turn(20, { system: 300, user: 100, toolResults: 400 }),
+		at({ role: "user", content: "two", timestamp: 30 }),
+		reply(40, 500),
+		turn(40, { system: 300, user: 200 }),
+		reply(50, 800),
+		at({ role: "user", content: "three", timestamp: 60 }),
+	]);
+	const bars = (byTurn: boolean, delta: boolean) => trendBars(analysis, byTurn, delta).map(({ index, n, value }) => [index, n, value]);
+	expect(bars(false, false)).toEqual([[0, 1, 1000], [1, 2, 2000], [2, 3, 500], [3, 4, 800]]);
+	expect(bars(false, true)).toEqual([[0, 1, 1000], [1, 2, 1000], [2, 3, -1500], [3, 4, 300]]);
+	// A human input shows its last request. An input without a request has no bar.
+	expect(bars(true, false)).toEqual([[1, 1, 2000], [3, 2, 800]]);
+	expect(bars(true, true)).toEqual([[1, 1, 2000], [3, 2, -1200]]);
+	// The recorded composition is scaled to the size the provider reported. A request without a record has none.
+	const parts = (delta: boolean) => trendBars(analysis, false, delta).map(({ parts }) => parts && [parts.system, parts.user, parts.toolResults]);
+	expect(parts(false)).toEqual([[750, 250, 0], [750, 250, 1000], [300, 200, 0], undefined]);
+	expect(parts(true)).toEqual([[750, 250, 0], [0, 0, 1000], [-450, -50, -1000], undefined]);
+	expect(trendBars(analysis, true, true).map(({ parts }) => parts?.toolResults)).toEqual([1000, undefined]);
 });
 
 test("analyze estimates when the prompt cache expires", () => {

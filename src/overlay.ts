@@ -18,12 +18,13 @@ import {
 	sumByCategory,
 	sumTokens,
 	textOf,
+	trendBars,
 	undeclared,
 	type ViewData,
 } from "./analyze.ts";
 import { DEFAULT_WARN_PERCENT } from "./config.ts";
 import { footerItems } from "./footer.ts";
-import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
+import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens, sparkline } from "./format.ts";
 import { hintTotal } from "./hints.ts";
 import { aggregate, calendar, type Insights, type SessionSort, type SessionSummary } from "./insights.ts";
 
@@ -62,6 +63,8 @@ const REFRESH_MS = 1000;
 const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Insights"];
 /** Removed items that the Browser tab lists at most. */
 const MAX_REMOVED = 30;
+/** Cells of the Trend tab that a change takes at most, on each side of the middle. */
+const HALF_BAR = 12;
 /** Color of each category in the strip of the reading order. */
 const COLORS: Record<Category, Parameters<Theme["fg"]>[0]> = {
 	system: "syntaxKeyword",
@@ -147,6 +150,9 @@ export class ContextOverlay {
 	private positions: number[] = [];
 	/** The Current tab lists the items in reading order, not largest first. */
 	private ordered = false;
+	/** Whether the Trend tab shows one bar for each human input, and whether a bar is the change since the bar before. */
+	private byTurn = false;
+	private delta = false;
 	/** Compositions rebuilt from the session, by request number. */
 	private rebuilt = new Map<number, Row[]>();
 	/** The item being inspected. `back` is the scroll position to return to. */
@@ -246,7 +252,9 @@ export class ContextOverlay {
 			const kinds = ["", ...eventKinds(this.data.analysis.events).map(([kind]) => kind)];
 			this.kind = kinds[(kinds.indexOf(this.kind) + 1) % kinds.length];
 			this.scroll = 0;
-		} else if (key === "o" && this.name === "Current") {
+		} else if (key === "g" && this.name === "Trend") this.byTurn = !this.byTurn;
+		else if (key === "m" && this.name === "Trend") this.delta = !this.delta;
+		else if (key === "o" && this.name === "Current") {
 			this.ordered = !this.ordered;
 			this.item = 0;
 			this.scroll = 0;
@@ -320,7 +328,7 @@ export class ContextOverlay {
 			Current: "↑/↓ select  enter inspect  o order  d drop  u restore  / filter",
 			Hints: "↑/↓ select  d drop  u restore",
 			Turns: "↑/↓ select  enter browse",
-			Trend: "↑/↓ select  enter browse  [ ] request",
+			Trend: `↑/↓ select  enter browse  [ ] request  g ${this.byTurn ? "requests" : "inputs"}  m ${this.delta ? "totals" : "changes"}`,
 			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
 			Events: "↑/↓ scroll  k kind",
 			Files: "↑/↓ scroll  / filter",
@@ -478,9 +486,18 @@ export class ContextOverlay {
 		this.request = next;
 	}
 
+	/** Position of the bar of the Trend tab that shows the selected request. */
+	private barAt(bars: { index: number }[]): number {
+		const at = bars.findIndex((bar) => bar.index >= this.request);
+		return at < 0 ? bars.length - 1 : at;
+	}
 	private move(delta: number): void {
 		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Settings"];
-		if (this.name === "Trend") this.selectRequest(this.request + delta);
+		if (this.name === "Trend") {
+			const bars = trendBars(this.data.analysis, this.byTurn, false);
+			const next = Math.max(0, Math.min(bars.length - 1, this.barAt(bars) + delta));
+			this.selectRequest(bars[next]?.index ?? 0);
+		}
 		else if (listed.includes(this.name)) this.item = Math.max(0, this.item + delta);
 		else if (this.name === "Insights" || this.name === "Fleet") this.pick(delta);
 		else this.scroll = Math.max(0, this.scroll + delta);
@@ -922,17 +939,43 @@ export class ContextOverlay {
 	}
 
 	private trend(): Body {
-		const requests = this.data.analysis.requests;
+		const t = this.theme;
+		const { requests, inputs } = this.data.analysis;
 		if (requests.length === 0) return { lines: ["No requests yet."] };
-		const max = Math.max(...requests.map((r) => r.context), 1);
-		const lines = [this.head("Tokens sent per request (provider-reported), and the share read from the cache")];
-		requests.forEach((r, i) => {
-			const stop = r.stop === "stop" || r.stop === "toolUse" ? "" : `  ${this.theme.fg("warning", r.stop)}`;
-			const miss = r.miss ? `  ${this.theme.fg("warning", `cache miss ≈${fmtTokens(r.miss.tokens)}`)}` : "";
-			const line = `#${String(r.n).padStart(3)} ${fmtTime(r.time)} ${bar(r.context / max, 24)} ${fmtTokens(r.context).padStart(6)}  out ${fmtTokens(r.output).padStart(6)}  cache ${fmtPercent(r.cacheRead, r.context).padStart(4)}  ${fmtCost(r.cost)}${miss}${stop}`;
-			lines.push(i === this.request ? this.theme.fg("accent", `▶ ${line}`) : `  ${line}`);
+		const bars = trendBars(this.data.analysis, this.byTurn, this.delta);
+		const selected = this.barAt(bars);
+		const max = Math.max(...bars.map((bar) => Math.abs(bar.value)), 1);
+		const what = this.byTurn ? "the last request of each human input" : "each request";
+		// The whole session in one line, with a mark under the selected bar.
+		const line = sparkline(bars.map((bar) => requests[bar.index].context), Math.max(1, this.width - 2));
+		const lines = [
+			this.head(this.delta ? `Change of the tokens sent, from one bar to the next: ${what}` : `Tokens sent by ${what} (provider-reported)`),
+			`  ${t.fg("muted", line)}`,
+			`  ${" ".repeat(Math.floor((selected * line.length) / bars.length))}${t.fg("accent", "▲")}`,
+		];
+		const above = lines.length;
+		bars.forEach((entry, i) => {
+			const on = i === selected;
+			// The selected line has one color.
+			const paint = (color: Parameters<Theme["fg"]>[0], text: string) => (on ? text : t.fg(color, text));
+			const r = requests[entry.index];
+			const input = this.byTurn ? inputs[entry.n - 1] : undefined;
+			let size = `${bar(entry.value / max, 24)} ${fmtTokens(entry.value).padStart(6)}`;
+			if (this.delta) {
+				const cells = "█".repeat(Math.round((Math.abs(entry.value) / max) * HALF_BAR));
+				const less = entry.value < 0 ? paint("success", cells.padStart(HALF_BAR)) : " ".repeat(HALF_BAR);
+				const more = entry.value > 0 ? paint("warning", cells.padEnd(HALF_BAR)) : " ".repeat(HALF_BAR);
+				size = `${less}${paint("dim", "│")}${more} ${`${entry.value < 0 ? "−" : "+"}${fmtTokens(Math.abs(entry.value))}`.padStart(7)}`;
+			}
+			const stop = r.stop === "stop" || r.stop === "toolUse" ? "" : `  ${paint("warning", r.stop)}`;
+			const miss = r.miss ? `  ${paint("warning", `cache miss ≈${fmtTokens(r.miss.tokens)}`)}` : "";
+			const figures = input
+				? `reqs ${String(input.requests).padStart(3)}  out ${fmtTokens(input.output).padStart(6)}  ${fmtCost(input.cost)}  ${paint("dim", input.preview)}`
+				: `out ${fmtTokens(r.output).padStart(6)}  cache ${fmtPercent(r.cacheRead, r.context).padStart(4)}  ${fmtCost(r.cost)}${miss}${stop}`;
+			const row = `#${String(entry.n).padStart(3)} ${fmtTime(input?.time ?? r.time)} ${size}  ${figures}`;
+			lines.push(on ? t.fg("accent", `▶ ${row}`) : `  ${row}`);
 		});
-		return { lines, cursor: this.request + 1 };
+		return { lines, cursor: selected === 0 ? 0 : above + selected };
 	}
 
 	private browser(): Body {

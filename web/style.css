@@ -92,6 +92,11 @@ a { color: var(--accent); cursor: pointer; }
 .col b { position: absolute; top: 0; left: 0; right: 0; font-size: 10px; line-height: 14px; text-align: center; color: var(--bad); }
 .stack { display: flex; flex-direction: column-reverse; min-height: 2px; }
 .stack i { min-height: 0; }
+.half { display: flex; flex-direction: column; justify-content: flex-end; min-height: 0; }
+.half + .half { justify-content: flex-start; border-top: 1px solid var(--muted); }
+.half + .half .stack { flex-direction: column; }
+.cols.fit { gap: 0; overflow-x: hidden; }
+.cols.fit .col { flex: 1 1 0; min-width: 0; max-width: none; }
 
 .cat, .item { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .cat:hover, .item:hover { background: var(--bg); }

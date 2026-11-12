@@ -550,6 +550,47 @@ export function bands(rows: Row[], width: number): Category[] {
 	return cells;
 }
 
+/** One bar of the trend. */
+export interface TrendBar {
+	/** Index in `requests` of the request that the bar shows: the request itself, or the last request of the human input. */
+	index: number;
+	/** Number of the request, or of the human input. */
+	n: number;
+	/** Tokens that the request sent, or their change since the bar before. */
+	value: number;
+	/** `value` by category. Undefined when pi-context has no record of the composition. */
+	parts?: Record<Category, number>;
+}
+
+/**
+ * The bars of the trend: one for each request, or with `byTurn` one for each human input that caused a request.
+ * With `delta`, a bar is the change since the bar before it.
+ */
+export function trendBars(analysis: Analysis, byTurn: boolean, delta: boolean): TrendBar[] {
+	const { requests } = analysis;
+	const picked = byTurn
+		? analysis.inputs.filter((input) => input.requests > 0).map((input) => ({ index: input.first + input.requests - 1, n: input.n }))
+		: requests.map((request, index) => ({ index, n: request.n }));
+	/** The recorded composition of the request, scaled to the size the provider reported. */
+	const scaled = ({ sums, context }: RequestRec) => {
+		const total = sums ? CATEGORIES.reduce((sum, cat) => sum + (sums[cat] ?? 0), 0) : 0;
+		if (!sums || total <= 0) return undefined;
+		const parts = emptySums();
+		for (const cat of CATEGORIES) parts[cat] = ((sums[cat] ?? 0) * context) / total;
+		return parts;
+	};
+	return picked.map(({ index, n }, i) => {
+		const before = delta && i > 0 ? requests[picked[i - 1].index] : undefined;
+		const base = before && scaled(before);
+		let parts = scaled(requests[index]);
+		if (before && !base) parts = undefined;
+		if (parts && base) for (const cat of CATEGORIES) parts[cat] -= base[cat];
+		const bar: TrendBar = { index, n, value: requests[index].context - (before?.context ?? 0) };
+		if (parts) bar.parts = parts;
+		return bar;
+	});
+}
+
 /** The kinds of the events with the number of events of each, in the order in which they first occur. */
 export function eventKinds(events: EventRec[]): [string, number][] {
 	const counts = new Map<string, number>();
