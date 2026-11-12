@@ -90,6 +90,38 @@ test("rowsOf replays system prompt sections", () => {
 	expect(rows[0].preview).toBe("zzzzzzzz");
 });
 
+test("rowsOf counts the skill catalog and /skill invocations as skill injections", () => {
+	const catalog = `The following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file.\n\n<available_skills>\n  <skill>\n    <name>x</name>\n  </skill>\n</available_skills>`;
+	const block = `<skill name="x" location="/skills/x/SKILL.md">\n${"k".repeat(400)}\n</skill>`;
+	const rows = rowsOf(
+		[
+			{ role: "system", content: `${"s".repeat(400)}${catalog}${"e".repeat(40)}` },
+			{ role: "user", content: `${block}\n\nfix the bug` },
+			{ role: "user", content: [{ type: "text", text: block }] },
+			{ role: "user", content: "<skills> are mentioned, not invoked" },
+		],
+		undefined,
+		[],
+		true,
+	);
+	expect(rows.map((row) => [row.cat, row.label, row.tokens])).toEqual([
+		["system", "system", 110],
+		["skills", "skill catalog", Math.ceil(catalog.length / 4)],
+		["skills", "skill x", Math.ceil(block.length / 4)],
+		["user", "user", 4],
+		["skills", "skill x", Math.ceil(block.length / 4)],
+		["user", "user", 9],
+	]);
+	expect(rows[0].text).toBe("s".repeat(400) + "e".repeat(40));
+	expect(rows[1].text).toBe(catalog);
+	expect(rows[2].text).toBe(block);
+	expect(rows[3].text).toBe("fix the bug");
+	// A harness can list the skills in another tag, and a section can hold the list.
+	const other = "<skills>\nThe following skills provide specialized instructions for specific tasks.\n## Skills in /skills\n- x: does x\n</skills>";
+	const sectioned = rowsOf([{ role: "system", content: "s".repeat(40), sections: { skills: other } }]);
+	expect(sectioned.map((row) => [row.cat, row.tokens])).toEqual([["system", 10], ["skills", Math.ceil(other.length / 4)]]);
+});
+
 test("analyze counts calls nested in a tool result", () => {
 	const a = analyze([
 		{
@@ -257,6 +289,17 @@ test("analyze reports tools and skills", () => {
 	expect(tool("codemode")).toMatchObject({ calls: 1, callTokens: 28, resultTokens: 20 });
 	expect(tool("insert")).toMatchObject({ calls: 0, nested: 2, errors: 1, callTokens: 0 });
 	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: 100 }]);
+});
+
+test("analyze counts a /skill invocation as a load of the skill", () => {
+	const block = `<skill name="x" location="/skills/x/SKILL.md">\n${"k".repeat(400)}\n</skill>`;
+	const at = new Date(0).toISOString();
+	const a = analyze([
+		{ type: "message", timestamp: at, message: { role: "user", content: `${block}\n\nfix   the bug`, timestamp: 1 } },
+		{ type: "message", timestamp: at, message: { role: "user", content: block, timestamp: 2 } },
+	]);
+	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: Math.ceil(block.length / 4) }]);
+	expect(a.inputs.map((input) => input.preview)).toEqual(["/skill:x fix the bug", "/skill:x"]);
 });
 
 test("analyze applies the turn records pi-context saved", () => {

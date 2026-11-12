@@ -289,6 +289,15 @@ export function argPath(args: any): string | undefined {
 
 export const isSkillRead = (call: any) => /read/i.test(call.name) && /(^|\/)SKILL\.md$/.test(argPath(call.arguments) ?? "");
 
+/** The list of the available skills in a system prompt, with the lines that introduce it. */
+const SKILL_CATALOG = /(?:The following skills provide[^<]*)?<(available_skills|skills)>[\s\S]*?<\/\1>/;
+
+/** The skill that a `/skill:name` input loads: pi puts its file before the text of the user. */
+export function skillBlock(text: string): { block: string; name: string; path: string; rest: string } | undefined {
+	const found = /^(<skill name="([^"]+)" location="([^"]+)">\n[\s\S]*?\n<\/skill>)(?:\n\n([\s\S]+))?$/.exec(text);
+	return found ? { block: found[1], name: found[2], path: found[3], rest: found[4] ?? "" } : undefined;
+}
+
 /**
  * Tool declarations in a provider request payload: name to size in characters.
  * Undefined when the payload declares no tool list.
@@ -380,9 +389,12 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				}
 				if (headAt < 0) headAt = rows.length;
 				break;
-			case "user":
-				push("user", contentChars(m.content), "user", contentText(m.content));
+			case "user": {
+				const skill = skillBlock(contentText(m.content));
+				if (skill) push("skills", skill.block.length, `skill ${skill.name}`, skill.block);
+				push("user", contentChars(m.content) - (skill?.block.length ?? 0), "user", skill ? skill.rest : contentText(m.content));
 				break;
+			}
 			case "assistant": {
 				const blocks: any[] = Array.isArray(m.content) ? m.content : [];
 				const textOf = (type: string, key: string) =>
@@ -426,6 +438,20 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 		}
 	}
 	const schemas = schemasOf(messages, declared, hidden);
+	// The skill catalog is part of the system prompt, but it counts as a skill injection.
+	let catalog = "";
+	const cut = (text: string) =>
+		text.replace(SKILL_CATALOG, (found) => {
+			catalog += found;
+			return "";
+		});
+	systemText = cut(systemText);
+	systemChars -= catalog.length;
+	for (const [name, text] of sections) {
+		const rest = cut(text);
+		if (rest) sections.set(name, rest);
+		else sections.delete(name);
+	}
 	const sectionChars = [...sections.values()].reduce((total, text) => total + text.length, 0);
 	const schemaChars = [...schemas.values()].reduce((total, size) => total + size, 0);
 	const tail = rows.splice(Math.max(0, headAt));
@@ -437,6 +463,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 		systemText || [...sections.keys()].join(", "),
 		full ? [systemText, ...[...sections].map(([name, text]) => `[${name}]\n${text}`)].filter(Boolean).join("\n\n") : "",
 	);
+	push("skills", catalog.length, "skill catalog", catalog);
 	push(
 		"tools",
 		schemaChars,
@@ -645,6 +672,12 @@ export function analyze(entries: any[]): Analysis {
 		analysis.inputs.push(rec);
 		return rec;
 	};
+	const loadSkill = (path: string) => {
+		const skill = skills.get(path) ?? { path, name: path.split("/").at(-2) ?? path, loads: 0, tokens: 0 };
+		skill.loads++;
+		skills.set(path, skill);
+		return skill;
+	};
 	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string) => {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
@@ -666,12 +699,7 @@ export function analyze(entries: any[]): Analysis {
 			file[op]++;
 			files.set(path, file);
 		} else if (op === "edits" && nestedStatus !== "error" && hasAnchor(call.arguments)) analysis.unresolvedEdits++;
-		if (path && isSkillRead(call)) {
-			const skill = skills.get(path) ?? { path, name: path.split("/").at(-2) ?? path, loads: 0, tokens: 0 };
-			skill.loads++;
-			skills.set(path, skill);
-			skillsById.set(call.id, skill);
-		}
+		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path));
 		if (call.name === "bash" && typeof call.arguments?.command === "string") {
 			const command: CommandRec = { time, command: call.arguments.command, program: programOf(call.arguments.command) };
 			commandsById.set(call.id, command);
@@ -727,7 +755,10 @@ export function analyze(entries: any[]): Analysis {
 		const time = m.timestamp ?? entryTime;
 		if (m.role === "user") {
 			analysis.userInputs++;
-			input = inputAt(time, contentText(m.content).slice(0, 480).replace(/\s+/g, " ").trim().slice(0, 120));
+			const skill = skillBlock(contentText(m.content));
+			if (skill) loadSkill(skill.path).tokens = estimate(skill.block.length);
+			const said = skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content);
+			input = inputAt(time, said.slice(0, 480).replace(/\s+/g, " ").trim().slice(0, 120));
 		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
 		if (m.role === "bashExecution") {
 			analysis.commands.push({ time, command: m.command, program: programOf(m.command), ok: m.exitCode === 0 });
