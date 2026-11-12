@@ -80,6 +80,7 @@ th { position: sticky; top: 0; background: var(--card); color: var(--muted); fon
 th, td { padding: 3px 8px 3px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
 .r { text-align: right; white-space: nowrap; }
 td.clip { max-width: 0; width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.op { padding-left: 14px; color: var(--muted); }
 code, pre, .mono { font: 12px/1.45 ui-monospace, monospace; }
 a { color: var(--accent); cursor: pointer; }
 

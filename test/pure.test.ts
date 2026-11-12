@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	analyze,
+	argLines,
 	bands,
 	briefOf,
 	cacheStats,
 	declaredTools,
+	diffLines,
 	diffRows,
 	eventKinds,
 	introducedAt,
@@ -153,8 +155,58 @@ test("analyze counts calls nested in a tool result", () => {
 	]);
 	expect(a.toolCalls).toBe(3);
 	expect(a.toolErrors).toBe(1);
-	expect(a.files).toEqual([{ path: "/b.ts", reads: 0, writes: 1, edits: 0 }]);
+	expect(a.files).toMatchObject([{ path: "/b.ts", reads: 0, writes: 1, edits: 0 }]);
 	expect(a.commands.map((c) => [c.program, c.ok])).toEqual([["false", false], ["sleep", undefined]]);
+});
+
+test("analyze logs the operations on each file with the lines they changed", () => {
+	const at = (message: any, i: number) => ({ type: "message", timestamp: new Date(1000 * i).toISOString(), message });
+	const call = (id: string, name: string, args: any) => ({ type: "toolCall", id, name, arguments: { path: "/a.ts", ...args } });
+	const result = (id: string, more: any) => ({ role: "toolResult", toolCallId: id, toolName: "edit", content: [], isError: false, ...more });
+	const a = analyze([
+		at(
+			{
+				role: "assistant",
+				timestamp: 1,
+				usage: usage(10, 1),
+				content: [
+					call("w", "write", { content: "one\ntwo\nthree\n" }),
+					call("e", "edit", { edits: [{ oldText: "one\ntwo\nthree", newText: "one\n2\n2.5\nthree" }] }),
+					call("d", "edit", { oldText: "x", newText: "y" }),
+					call("f", "edit", { oldText: "x", newText: "y" }),
+					call("r", "read", {}),
+				],
+			},
+			1,
+		),
+		at(result("d", { details: { diff: " 1 one\n-2 two\n+2 2\n+3 3\n 4 four" }, timestamp: 2 }), 2),
+		at(result("f", { isError: true, timestamp: 3 }), 3),
+		at(
+			result("s", {
+				toolName: "codemode",
+				timestamp: 4,
+				nestedCalls: { calls: [{ id: "s/1", name: "replace", status: "ok", arguments: { remove_from: "aaaaa", remove_to: "bbbbb", text: "x" } }] },
+			}),
+			4,
+		),
+		// The replace names its file and shows its diff only in its result, which pi-context recorded.
+		{ type: "custom", customType: TURN_ENTRY, data: { time: 99, ms: 0, toolMs: 0, activeMs: 0, paths: { "s/1": "/a.ts" }, lines: { "s/1": [1, 4] } } },
+	]);
+	expect(a.files).toMatchObject([{ path: "/a.ts", reads: 1, writes: 1, edits: 4, added: 8, removed: 6 }]);
+	expect(a.files[0].ops.map((op) => [op.tool, op.op, op.id, op.request, op.added, op.removed, op.error])).toEqual([
+		// A write does not tell what it replaced.
+		["write", "writes", "w", 1, 3, undefined, undefined],
+		["edit", "edits", "e", 1, 2, 1, undefined],
+		// The diff of the result replaces the estimate from the arguments.
+		["edit", "edits", "d", 1, 2, 1, undefined],
+		["edit", "edits", "f", 1, undefined, undefined, true],
+		["read", "reads", "r", 1, undefined, undefined, undefined],
+		// A nested call is found through the result of the call that made it.
+		["replace", "edits", "s", 1, 1, 4, undefined],
+	]);
+	expect(a.files[0].ops.at(-1)?.time).toBe(4);
+	expect(diffLines("--- a/x\n+++ b/x\n@@ -1 +1,2 @@\n-a\n+b\n+c\n d")).toEqual([2, 1]);
+	expect(argLines({ anchor: "aaaaa", text: "x" })).toBeUndefined();
 });
 
 test("analyze derives requests, events, files and commands", () => {
@@ -186,7 +238,7 @@ test("analyze derives requests, events, files and commands", () => {
 	expect(a.toolCalls).toBe(4);
 	expect(a.toolErrors).toBe(1);
 	expect(a.events.map((e) => [e.kind, e.detail])).toEqual([["model", "p/m1"], ["compaction", "12.3k tokens before compaction"]]);
-	expect(a.files).toEqual([
+	expect(a.files).toMatchObject([
 		{ path: "/skills/x/SKILL.md", reads: 1, writes: 0, edits: 0 },
 		{ path: "/a.ts", reads: 0, writes: 1, edits: 1 },
 	]);
@@ -324,7 +376,7 @@ test("analyze applies the turn records pi-context saved", () => {
 	const a = analyze(entries);
 	expect(a.timing).toEqual({ activeMs: 9000, modelMs: 6000, toolMs: 1500 });
 	expect(a.requests.map((r) => [r.ms, r.sums?.system, r.parentId])).toEqual([[4000, 100, "p1"], [2000, 100, "p2"]]);
-	expect(a.files.find((f) => f.path === "/a.ts")).toEqual({ path: "/a.ts", reads: 0, writes: 0, edits: 1 });
+	expect(a.files.find((f) => f.path === "/a.ts")).toMatchObject({ path: "/a.ts", reads: 0, writes: 0, edits: 1 });
 	// c5/3 succeeded but no record names its file; the failed c5/4 changed nothing.
 	expect(a.unresolvedEdits).toBe(1);
 	expect(analyze(session(0)).unresolvedEdits).toBe(2);

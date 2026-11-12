@@ -11,6 +11,8 @@ import {
 	type Category,
 	diffRows,
 	eventKinds,
+	type FileOp,
+	type FileRec,
 	introducedAt,
 	LABELS,
 	type RequestRec,
@@ -167,6 +169,13 @@ export class ContextOverlay {
 	private delta = false;
 	/** Whether the Browser tab, opened from Trend, must select the first item added since the request before. */
 	private toAdded = false;
+	/** The file whose operations the Files tab lists, and the entry to select on the way back. */
+	private opened?: { path: string; back: number };
+	/** The files or operations that the Files tab lists. */
+	private fileList: FileRec[] = [];
+	private ops: FileOp[] = [];
+	/** Tool call whose result the list of items selects when it is next shown. */
+	private toResult?: string;
 	/** Position in TOOL_ORDERS of the order of the Tools tab. */
 	private toolOrder = 0;
 	/** Compositions rebuilt from the session, by request number. */
@@ -242,6 +251,9 @@ export class ContextOverlay {
 				this.scroll = this.inspect.back;
 				this.inspect = undefined;
 			} else this.scroll = Math.max(0, this.scroll + step);
+		} else if (escape && this.opened) {
+			this.item = this.opened.back;
+			this.opened = undefined;
 		} else if (escape && this.filterText) this.filterText = "";
 		else if (escape && this.back) this.leaveSession();
 		else if (escape || key === "q") {
@@ -259,6 +271,7 @@ export class ContextOverlay {
 				this.toAdded = true;
 			}
 			else if (this.name === "Turns") this.openTurn();
+			else if (this.name === "Files") this.openFile();
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
 			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
 			else if (this.name === "Settings") {
@@ -268,7 +281,7 @@ export class ContextOverlay {
 		} else if (key === "x" && this.name === "Settings") {
 			this.close({ setting: SETTINGS[this.item], clear: true });
 			return;
-		} else if (key === "/" && FILTERED.includes(this.name)) this.typing = true;
+		} else if (key === "/" && FILTERED.includes(this.name) && !this.opened) this.typing = true;
 		else if ((key === "d" || key === "u") && (this.name === "Current" || this.name === "Hints")) this.drop(key === "d");
 		else if (key === "k" && this.name === "Events") {
 			const kinds = ["", ...eventKinds(this.data.analysis.events).map(([kind]) => kind)];
@@ -354,7 +367,7 @@ export class ContextOverlay {
 			Trend: `↑/↓ select  enter browse  [ ] request  g ${this.byTurn ? "requests" : "inputs"}  m ${this.delta ? "totals" : "changes"}`,
 			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
 			Events: "↑/↓ scroll  k kind",
-			Files: "↑/↓ scroll  / filter",
+			Files: this.opened ? "↑/↓ select  enter result  esc files" : "↑/↓ select  enter operations  / filter",
 			Commands: "↑/↓ scroll  / filter",
 			Tools: "↑/↓ scroll  / filter  s sort",
 			Fleet: "↑/↓ select  enter open",
@@ -407,6 +420,7 @@ export class ContextOverlay {
 		this.scroll = 0;
 		this.item = 0;
 		this.picks = [];
+		this.opened = undefined;
 		this.filterText = "";
 		if (this.name === "Insights" && !this.summaries) this.readInsights();
 	}
@@ -515,7 +529,7 @@ export class ContextOverlay {
 		return at < 0 ? bars.length - 1 : at;
 	}
 	private move(delta: number): void {
-		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Settings"];
+		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Files", "Settings"];
 		if (this.name === "Trend") {
 			const bars = trendBars(this.data.analysis, this.byTurn, false);
 			const next = Math.max(0, Math.min(bars.length - 1, this.barAt(bars) + delta));
@@ -560,6 +574,29 @@ export class ContextOverlay {
 		this.setTab(TABS.indexOf("Browser"));
 	}
 
+	/** Opens the operations of the selected file, or the result of the selected operation. */
+	private openFile(): void {
+		if (this.opened) {
+			const op = this.ops[this.item];
+			if (op) this.openResult(op.request, op.id);
+			return;
+		}
+		const file = this.fileList[this.item];
+		if (!file) return;
+		this.opened = { path: file.path, back: this.item };
+		this.item = 0;
+	}
+
+	/**
+	 * Selects the result of a tool call in the context of the request after the one that made the call,
+	 * or in the current context when no request followed.
+	 */
+	private openResult(request: number, id: string): void {
+		const inRequest = request < this.data.analysis.requests.length;
+		if (inRequest) this.selectRequest(request);
+		this.setTab(TABS.indexOf(inRequest ? "Browser" : "Current"));
+		this.toResult = id;
+	}
 	/** Shows the session of the selected entry of the Insights or Fleet tab. */
 	private openSession(): void {
 		const pick = this.picks[this.item];
@@ -704,7 +741,7 @@ export class ContextOverlay {
 			case "Events":
 				return { lines: this.events() };
 			case "Files":
-				return { lines: this.files() };
+				return this.files();
 			case "Commands":
 				return { lines: this.commands() };
 			case "Tools":
@@ -854,6 +891,12 @@ export class ContextOverlay {
 			.filter(({ row }) => this.matches(`${LABELS[row.cat]} ${row.dropped ? "dropped " : ""}${row.label} ${row.preview}`));
 		this.rows = shown.map(({ row }) => row);
 		this.positions = shown.map(({ position }) => position);
+		if (this.toResult) {
+			const at = shown.findIndex(({ row }) => row.id === this.toResult);
+			if (at >= 0) this.item = at;
+			else this.notice = "The result is not in this context.";
+			this.toResult = undefined;
+		}
 		this.item = Math.min(this.item, Math.max(0, shown.length - 1));
 		if (shown.length === 0) return { lines: [rows.length > 0 ? "  No item matches the filter." : "  None."] };
 		const positionWidth = String(rows.length).length + 1;
@@ -1092,21 +1135,56 @@ export class ContextOverlay {
 		];
 	}
 
-	private files(): string[] {
+	private files(): Body {
+		const t = this.theme;
+		const changed = (added?: number, removed?: number) =>
+			added === undefined ? " ".repeat(16) : `${t.fg("success", `+${added}`.padStart(7))} ${t.fg("error", (removed === undefined ? "" : `−${removed}`).padStart(8))}`;
+		const select = (top: string[], lines: string[], below: string[] = []): Body => ({
+			lines: [...top, ...lines.map((line, i) => (i === this.item ? `${t.fg("accent", "▶")} ${line}` : `  ${line}`)), ...below],
+			cursor: this.item === 0 ? 0 : top.length + this.item,
+		});
+		const columns = `${"+added".padStart(7)} ${"−removed".padStart(8)}`;
+		const file = this.data.analysis.files.find((f) => f.path === this.opened?.path);
+		if (file) {
+			// Newest first.
+			this.ops = [...file.ops].reverse();
+			this.item = Math.min(this.item, this.ops.length - 1);
+			const names = { reads: "read", writes: "write", edits: "edit" };
+			return select(
+				[
+					this.head(file.path),
+					this.pairs([
+						["Reads", file.reads],
+						["Writes", file.writes],
+						["Edits", file.edits],
+						["Lines", `+${file.added} −${file.removed}`],
+					]),
+					"",
+					t.fg("muted", `  ${"time".padEnd(8)}  ${"request".padEnd(7)}  ${"what".padEnd(5)}  ${columns}  tool`),
+				],
+				this.ops.map(
+					(op) =>
+						`${fmtTime(op.time)}  ${`#${op.request}`.padEnd(7)}  ${names[op.op].padEnd(5)}  ${changed(op.added, op.removed)}  ${op.tool}${op.error ? t.fg("error", "  failed") : ""}`,
+				),
+			);
+		}
+		this.opened = undefined;
 		const files = this.data.analysis.files
 			.filter((file) => this.matches(file.path))
 			.sort((a, b) => b.reads + b.writes + b.edits - (a.reads + a.writes + a.edits));
+		this.fileList = files;
 		const unresolved = this.data.analysis.unresolvedEdits;
 		const note = unresolved
 			? [this.theme.fg("dim", `  ${unresolved} anchor-based edits are not listed: they were made before pi-context recorded their file.`)]
 			: [];
-		if (files.length === 0) return [this.filterText ? "No file matches the filter." : "No file activity yet.", ...note];
+		if (files.length === 0) return { lines: [this.filterText ? "No file matches the filter." : "No file activity yet.", ...note] };
+		this.item = Math.min(this.item, files.length - 1);
 		const count = (n: number) => String(n).padStart(5);
-		return [
-			this.head(` ${"read".padStart(6)}${"write".padStart(6)}${"edit".padStart(6)}  path`),
-			...files.map((f) => `  ${count(f.reads)} ${count(f.writes)} ${count(f.edits)}  ${f.path}`),
-			...note,
-		];
+		return select(
+			[this.head(` ${"read".padStart(6)}${"write".padStart(6)}${"edit".padStart(6)}  ${columns}  path`)],
+			files.map((f) => `${count(f.reads)} ${count(f.writes)} ${count(f.edits)}  ${f.added + f.removed ? changed(f.added, f.removed) : changed()}  ${f.path}`),
+			note,
+		);
 	}
 
 	private commands(): string[] {

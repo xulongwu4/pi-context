@@ -125,11 +125,30 @@ export interface EventRec {
 	delta?: number;
 }
 
+/** One read, write or edit of a file. */
+export interface FileOp {
+	time: number;
+	op: "reads" | "writes" | "edits";
+	tool: string;
+	/** Number of the request that made the call. */
+	request: number;
+	/** Tool call whose result tells the outcome. For a nested call, the call that made it. */
+	id: string;
+	/** Lines the write or edit added and removed, when they are known. */
+	added?: number;
+	removed?: number;
+	error?: boolean;
+}
+
 export interface FileRec {
 	path: string;
 	reads: number;
 	writes: number;
 	edits: number;
+	/** Lines added and removed by the writes and edits whose lines are known. */
+	added: number;
+	removed: number;
+	ops: FileOp[];
 }
 
 export interface CommandRec {
@@ -212,6 +231,8 @@ export interface TurnData {
 	sums: Record<Category, number>;
 	/** Tool call id to file path, for edit tools whose arguments carry no path. */
 	paths?: Record<string, string>;
+	/** Tool call id to the lines an edit added and removed, counted in the diff of its result. */
+	lines?: Record<string, [number, number]>;
 	/** Tool declarations the request carried, when they differ from the last record: name to size in characters. */
 	declared?: Record<string, number>;
 	/** Who provides each of those tools. Written with `declared`. See {@link toolSource}. */
@@ -738,6 +759,37 @@ export function fileOp(toolName: string): "reads" | "writes" | "edits" | undefin
 	return undefined;
 }
 
+/** Lines that a diff adds and removes. */
+export function diffLines(diff: string): [number, number] {
+	let added = 0;
+	let removed = 0;
+	for (const line of diff.split("\n")) {
+		if (/^\+(?!\+\+ )/.test(line)) added++;
+		else if (/^-(?!-- )/.test(line)) removed++;
+	}
+	return [added, removed];
+}
+
+/** Lines that a write or an edit adds and removes, as far as its arguments tell. A write counts its whole content as added. */
+export function argLines(args: any): [number, number] | undefined {
+	const lines = (text: string) => (text ? text.replace(/\n$/, "").split("\n") : []);
+	if (typeof args?.content === "string") return [lines(args.content).length, 0];
+	let change: [number, number] | undefined;
+	for (const edit of Array.isArray(args?.edits) ? args.edits : [args]) {
+		if (typeof edit?.oldText !== "string" || typeof edit?.newText !== "string") continue;
+		const before = lines(edit.oldText);
+		const after = lines(edit.newText);
+		// The lines that both texts start and end with are context.
+		let start = 0;
+		while (start < before.length && start < after.length && before[start] === after[start]) start++;
+		let end = 0;
+		while (end < before.length - start && end < after.length - start && before.at(-1 - end) === after.at(-1 - end)) end++;
+		change ??= [0, 0];
+		change[0] += after.length - start - end;
+		change[1] += before.length - start - end;
+	}
+	return change;
+}
 function addUsage(totals: Totals, usage: any): void {
 	totals.input += usage?.input ?? 0;
 	totals.output += usage?.output ?? 0;
@@ -785,12 +837,16 @@ export function analyze(entries: any[]): Analysis {
 	// A turn record follows the messages it describes, so read the records first.
 	const turns = new Map<number, TurnData>();
 	const paths = new Map<string, string>();
+	const lines = new Map<string, [number, number]>();
+	/** File operations of direct calls, until their result tells the outcome. */
+	const opsById = new Map<string, FileOp>();
 	const declarations: { time: number; names: Set<string> }[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== TURN_ENTRY || !entry.data) continue;
 		const turn: TurnData = entry.data;
 		turns.set(turn.time, turn);
 		for (const [id, path] of Object.entries(turn.paths ?? {})) paths.set(id, path);
+		for (const [id, change] of Object.entries(turn.lines ?? {})) lines.set(id, change);
 		if (turn.declared) declarations.push({ time: turn.time, names: new Set(Object.keys(turn.declared)) });
 		analysis.timing.activeMs += turn.activeMs ?? 0;
 		analysis.timing.modelMs += turn.ms ?? 0;
@@ -839,7 +895,8 @@ export function analyze(entries: any[]): Analysis {
 		skills.set(path, skill);
 		return skill;
 	};
-	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string) => {
+	/** Counts a tool call. A call nested in the result of another one comes with its status and the id of that other call. */
+	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string, outer?: string) => {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
 		const rec = tool(call.name);
@@ -856,8 +913,16 @@ export function analyze(entries: any[]): Analysis {
 		const path = argPath(call.arguments) ?? paths.get(call.id);
 		const op = fileOp(call.name);
 		if (path && op) {
-			const file = files.get(path) ?? { path, reads: 0, writes: 0, edits: 0 };
+			const file = files.get(path) ?? { path, reads: 0, writes: 0, edits: 0, added: 0, removed: 0, ops: [] };
 			file[op]++;
+			const rec: FileOp = { time, op, tool: call.name, request: analysis.requests.length, id: outer ?? call.id };
+			if (nestedStatus === "error") rec.error = true;
+			const change = op === "reads" || rec.error ? undefined : (lines.get(call.id) ?? argLines(call.arguments));
+			// A write does not tell what it replaced.
+			if (change && op === "writes") rec.added = change[0];
+			else if (change) [rec.added, rec.removed] = change;
+			file.ops.push(rec);
+			if (!nestedStatus) opsById.set(call.id, rec);
 			files.set(path, file);
 		} else if (op === "edits" && nestedStatus !== "error" && hasAnchor(call.arguments)) analysis.unresolvedEdits++;
 		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path));
@@ -940,13 +1005,18 @@ export function analyze(entries: any[]): Analysis {
 				rec.errors++;
 			}
 			addUsage(analysis.totals, m.usage);
+			const op = opsById.get(m.toolCallId);
+			if (op && m.isError) {
+				op.error = true;
+				op.added = op.removed = undefined;
+			} else if (op && op.op !== "reads" && typeof m.details?.diff === "string") [op.added, op.removed] = diffLines(m.details.diff);
 			const command = commandsById.get(m.toolCallId);
 			if (command) command.ok = !m.isError;
 			const skill = skillsById.get(m.toolCallId);
 			if (skill) skill.tokens = estimate(contentChars(m.content));
 			// Calls that this tool made to other tools (for example from a script).
 			for (const nested of m.nestedCalls?.calls ?? []) {
-				recordCall(nested, time, nested.status ?? "ok");
+				recordCall(nested, time, nested.status ?? "ok", m.toolCallId);
 				if (nested.status === "error") analysis.toolErrors++;
 				const nestedCommand = commandsById.get(nested.id);
 				if (nestedCommand && nested.status !== "unfinished") nestedCommand.ok = nested.status === "ok";
@@ -1026,6 +1096,12 @@ export function analyze(entries: any[]): Analysis {
 		}
 	}
 	analysis.files = [...files.values()];
+	for (const file of analysis.files) {
+		for (const op of file.ops) {
+			file.added += op.added ?? 0;
+			file.removed += op.removed ?? 0;
+		}
+	}
 	analysis.tools = [...tools.values()];
 	analysis.skills = [...skills.values()];
 	analysis.models = [...models.values()];

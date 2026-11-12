@@ -137,8 +137,8 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		"## Files",
 		"",
 		...table(
-			["Path", "Reads", "Writes", "Edits"],
-			analysis.files.map((file) => [file.path, file.reads, file.writes, file.edits]),
+			["Path", "Reads", "Writes", "Edits", "Lines added", "Lines removed"],
+			analysis.files.map((file) => [file.path, file.reads, file.writes, file.edits, file.added, file.removed]),
 		),
 		...(analysis.unresolvedEdits ? [`${analysis.unresolvedEdits} anchor-based edits are not listed: their file was not recorded.`, ""] : []),
 		"## Commands",

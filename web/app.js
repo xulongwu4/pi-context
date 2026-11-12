@@ -37,6 +37,8 @@ const state = {
 	toolOrder: "calls",
 	openCats: new Set(),
 	openItems: new Set(),
+	/** Paths of the files whose operations File Activity lists. */
+	openFiles: new Set(),
 	texts: new Map(),
 	/** The kind of event that Context Events lists. Empty: every kind. */
 	kind: "",
@@ -415,9 +417,27 @@ function eventsCard(d) {
 
 function filesCard(d) {
 	const ops = (file) => file.reads + file.writes + file.edits;
-	const rows = [...d.files].sort((a, b) => ops(b) - ops(a)).map((file) => [clip(file.path, "mono"), file.reads || "", file.writes || "", file.edits || ""]);
+	const names = { reads: "read", writes: "write", edits: "edit" };
+	const added = (n) => (n == null ? "" : `<span class="good">+${n}</span>`);
+	const removed = (n) => (n == null ? "" : `<span class="bad">−${n}</span>`);
+	const rows = [...d.files]
+		.sort((a, b) => ops(b) - ops(a))
+		.flatMap((file) => {
+			const open = state.openFiles.has(file.path);
+			const known = file.added + file.removed > 0;
+			const name = `<a data-act="file" data-path="${esc(file.path)}" title="Show the operations on the file">${open ? "▾" : "▸"} ${clip(file.path, "mono")}</a>`;
+			const row = [name, file.reads || "", file.writes || "", file.edits || "", known ? added(file.added) : "", known ? removed(file.removed) : ""];
+			if (!open) return [row];
+			// Newest first.
+			const log = [...file.ops].reverse().map((op) => {
+				const result = `<a data-act="result" data-n="${op.request}" data-id="${esc(op.id)}" title="Show the tool result in the Context Browser">#${op.request}</a>`;
+				const failed = op.error ? ` <span class="bad">failed</span>` : "";
+				return [`<span class="op">${clock(op.time)} ${result} ${names[op.op]} by ${esc(op.tool)}${failed}</span>`, "", "", "", added(op.added), removed(op.removed)];
+			});
+			return [row, ...log];
+		});
 	const note = d.unresolvedEdits ? `<p class="muted">${d.unresolvedEdits} edits by anchor could not be matched to a file.</p>` : "";
-	return table(["File", ">Reads", ">Writes", ">Edits"], rows, "No file activity yet.") + note;
+	return table(["File", ">Reads", ">Writes", ">Edits", ">Added", ">Removed"], rows, "No file activity yet.") + note;
 }
 
 function commandsCard(d) {
@@ -788,6 +808,15 @@ const actions = {
 	},
 	session: (el) => openSession(el.dataset.file, el.dataset.title),
 	back: () => openSession(null),
+	file: (el) => toggle(state.openFiles, el.dataset.path),
+	/** Shows the result of a tool call: in the request after the one that made the call, or in the current context when no request followed. */
+	async result(el) {
+		const next = state.data.requests.find((request) => request.n > Number(el.dataset.n))?.n ?? null;
+		await selectRequest(next);
+		const i = (next == null ? state.data.current : state.view?.rows)?.findIndex((row) => row.id === el.dataset.id) ?? -1;
+		if (i >= 0) actions.band({ dataset: { i } });
+		else setError("The result is not in this context.");
+	},
 	kind(el) {
 		state.kind = el.dataset.kind;
 		render();

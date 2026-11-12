@@ -17,6 +17,7 @@ import {
 	CATEGORIES,
 	type Category,
 	declaredTools,
+	diffLines,
 	estimate,
 	fileOp,
 	LABELS,
@@ -121,6 +122,7 @@ export default function (pi: ExtensionAPI) {
 	let turnStart = 0;
 	let turnToolMs = 0;
 	let turnPaths: Record<string, string> = {};
+	let turnLines: Record<string, [number, number]> = {};
 	let turnRequest: { time: number; ms: number; sums: Record<Category, number> } | undefined;
 	let running = false;
 	let warned = false;
@@ -575,6 +577,7 @@ export default function (pi: ExtensionAPI) {
 		turnStart = Date.now();
 		turnToolMs = 0;
 		turnPaths = {};
+		turnLines = {};
 		turnRequest = undefined;
 	});
 
@@ -611,8 +614,10 @@ export default function (pi: ExtensionAPI) {
 	pi.on("tool_execution_end", (event, ctx) => {
 		// Anchor-based edit tools name the file only in their result.
 		const path = event.result?.structuredContent?.path ?? event.result?.details?.path;
-		if (!event.isError && typeof path === "string" && fileOp(event.toolName) === "edits") {
-			turnPaths[event.toolCallId] = resolve(ctx.cwd, path);
+		const diff = event.result?.structuredContent?.diff ?? event.result?.details?.diff;
+		if (!event.isError && fileOp(event.toolName) === "edits") {
+			if (typeof path === "string") turnPaths[event.toolCallId] = resolve(ctx.cwd, path);
+			if (typeof diff === "string") turnLines[event.toolCallId] = diffLines(diff);
 		}
 		// Parallel tool calls count once: tool time is the wall time with at least one top-level tool running.
 		if (!runningTools.delete(event.toolCallId)) return;
@@ -623,6 +628,7 @@ export default function (pi: ExtensionAPI) {
 		if (turnRequest) {
 			const data: TurnData = { ...turnRequest, toolMs: turnToolMs, activeMs: Date.now() - turnStart };
 			if (Object.keys(turnPaths).length > 0) data.paths = turnPaths;
+			if (Object.keys(turnLines).length > 0) data.lines = turnLines;
 			if (declared && JSON.stringify(declared) !== savedDeclared) {
 				data.declared = declared;
 				const sources = sourcesNow();
