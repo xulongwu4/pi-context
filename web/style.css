@@ -97,6 +97,11 @@ a { color: var(--accent); cursor: pointer; }
 .half + .half .stack { flex-direction: column; }
 .cols.fit { gap: 0; overflow-x: hidden; }
 .cols.fit .col { flex: 1 1 0; min-width: 0; max-width: none; }
+.brief { margin-top: 8px; }
+.brief div { display: flex; gap: 8px; padding: 1px 6px; cursor: pointer; }
+.brief div:hover { background: var(--bg); }
+.brief b { flex: 0 0 34px; color: var(--muted); font-weight: 600; }
+.brief span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .cat, .item { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .cat:hover, .item:hover { background: var(--bg); }

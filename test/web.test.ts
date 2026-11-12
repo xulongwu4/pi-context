@@ -136,6 +136,8 @@ test("web shows what a request was assembled from and what changed since the req
 	expect(body.removed).toEqual([]);
 	expect(body.items).toMatchObject({ user: 0, toolCalls: 1, toolResults: 1 });
 	expect(body.factor).toBeGreaterThan(1);
+	expect(body.brief).toEqual({ first: 0, user: "#1 list the files", added: "result bash ≈3", reply: "Two files." });
+	expect((await get("request", { n: 2, turn: 1 })).body.brief).toMatchObject({ added: "user message ≈4 · result bash ≈3", reply: "calls bash · Two files." });
 	expect((await get("text", { n: 2, i: 2 })).body.text).toBe("a.txt\nb.txt");
 	expect((await get("request", { n: 1 })).body.marks).toBeUndefined();
 	expect((await get("request", { n: 9 })).status).toBe(400);

@@ -19,7 +19,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Current | Composition of the current context by category, a strip of its items in reading order, and the items, largest first or in reading order |
   | Hints | What could be dropped from the context, the tokens that would free, and what was dropped |
   | Turns | One row per human input: its requests, tool calls, tokens, cost and duration |
-| Trend | Tokens sent by each request, the share read from the prompt cache, and cache misses; or the tokens sent by the last request of each human input; or the change from one request or input to the next. One line shows the whole session |
+| Trend | Tokens sent by each request, the share read from the prompt cache, and cache misses; or the tokens sent by the last request of each human input; or the change from one request or input to the next. One line shows the whole session. Under the selected bar, three lines tell what the request did: `User`, the human input it works on; `In`, what entered the context since the request before; `Out`, the tools the model called and the start of its answer |
   | Browser | What one request was assembled from, in reading order, and what changed since the request before it: items added, changed and removed, and the items and tokens each category gained or lost |
   | Events | Compactions, dropped and restored tool results, model switches, thinking level changes and branch summaries: the number of events of each kind, the request each event followed, and the tokens it added to the context or took from it |
   | Files | Reads, writes and edits per file |
@@ -34,7 +34,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Tab | Keys |
   | --- | --- |
   | Turns | `enter` opens the first request of the selected input in Browser |
-| Trend | `enter` opens the selected request in Browser; `g` switches between one bar for each request and one for each human input; `m` switches between totals and changes |
+| Trend | `enter` opens the selected request in Browser, at the first item added since the request before; `g` switches between one bar for each request and one for each human input; `m` switches between totals and changes |
   | Current, Browser | `enter` shows the whole content of the selected item; `esc` goes back |
   | Current | `o` switches the list between largest first and reading order |
   | Current, Hints | `d` drops the selected tool result from the context, `u` restores it |
@@ -70,6 +70,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 
 - The Context page shows the current session in cards: Context Stats, Token Stats, Timing Stats, Current Context, Context Browser, Context Trend, Hints, Turns, Context Events, File Activity, Command Executions, and Tools, Skills and Models.
 - In Context Trend, each bar is one request, split by category. Click a bar to open the request in the Context Browser. `✂` marks the first request after a compaction, `!` a cache miss.
+- Under the chart, three lines tell what the selected request did. Click `User` to open the first request of the human input, `In` to show the first item that entered the context since the request before, and `Out` to show the answer in the context of the next request. With `By input`, `In` and `Out` cover all the requests of the input.
 - `By input` shows one bar for each human input: its last request. `Changes` shows each bar as the change since the bar before, by category: what grew is above the line, what shrank is below it. `Fit` fits the whole session into the width of the card.
 - In the Context Browser, click a category to list its items and an item to show its whole content. The select and the `‹` `›` buttons change the request. A request shows what was added (`+`) or changed (`~`) since the request before it, and the items and tokens each category gained or lost.
 - The strip in the Context Browser has one band per item, in reading order. Click a band to show its item. `One list, in reading order` lists the items of all categories together. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
@@ -111,6 +112,7 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - Auto-compact acts when the agent stops, not between the requests of one run. Pi refuses to compact a session that is too small.
 - In the web page, a grey bar in Context Trend is a request without a turn record: its split by category is not known. The Context Browser rebuilds such a request from the session when you open it.
 - A change in Trend is the difference of the provider-reported sizes of two requests. Its split by category needs a turn record of both requests, each scaled to the size of its request. The bar of a human input shows the context after the last request of the input; the web page marks the bar when any request of the input followed a compaction or missed the cache.
+- The `In` line of Trend comes from the session: human inputs, tool results, `!` commands, messages of extensions, and compaction and branch summaries, each at 4 characters per token and not scaled. It does not show what an extension changed in the context of one request, nor a changed system prompt or tool schema; Browser shows those.
 - Requests, events, file activity, commands and tool counts come from the session branch, so they cover a resumed session.
 - Timing and the recorded composition cover the turns that ran while the extension was loaded. For other requests, Browser rebuilds the composition from the session and says so. A rebuilt composition does not show changes that other extensions made to the context before the request was sent.
 - The first request that carried an item is the first request made after the message of the item was created. The system prompt and the tool schemas have no such time and show none. An item that no request has carried yet shows none either. In the overlay, the strip does not show an item smaller than one cell.

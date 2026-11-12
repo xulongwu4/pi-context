@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
 	analyze,
 	bands,
+	briefOf,
 	cacheStats,
 	declaredTools,
 	diffRows,
@@ -683,6 +684,29 @@ test("trendBars gives one bar for each request or human input, as totals or as c
 	expect(parts(false)).toEqual([[750, 250, 0], [750, 250, 1000], [300, 200, 0], undefined]);
 	expect(parts(true)).toEqual([[750, 250, 0], [0, 0, 1000], [-450, -50, -1000], undefined]);
 	expect(trendBars(analysis, true, true).map(({ parts }) => parts?.toolResults)).toEqual([1000, undefined]);
+});
+
+test("briefOf tells what a request or a human input did: the input, what entered the context, and the answer", () => {
+	const call = (id: string, name: string) => ({ type: "toolCall", id, name, arguments: {} });
+	const result = (toolCallId: string, toolName: string, timestamp: number) => ({ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text: "r".repeat(400) }], timestamp });
+	const analysis = analyze([
+		at({ role: "user", content: "u".repeat(40), timestamp: 1 }),
+		at(assistant(10, [call("c1", "read"), call("c2", "read"), call("c3", "bash")])),
+		at(result("c1", "read", 11)),
+		at(result("c2", "read", 12)),
+		at(result("c3", "bash", 13)),
+		at(assistant(20, [{ type: "thinking", thinking: "hm" }, { type: "text", text: "Two\nfiles." }])),
+		{ type: "compaction", timestamp: new Date(25).toISOString(), summary: "s".repeat(4000), tokensBefore: 5000 },
+		at({ role: "user", content: "next", timestamp: 30 }),
+		at({ ...assistant(40), stopReason: "error" }),
+	]);
+	expect(analysis.requests[1].added).toEqual([{ label: "result read", tokens: 100 }, { label: "result read", tokens: 100 }, { label: "result bash", tokens: 100 }]);
+	expect(briefOf(analysis, 0)).toEqual({ first: 0, user: `#1 ${"u".repeat(40)}`, added: "user message ≈10", reply: "calls read ×2, bash" });
+	expect(briefOf(analysis, 1)).toEqual({ first: 0, user: `#1 ${"u".repeat(40)}`, added: "result read ×2 ≈200 · result bash ≈100", reply: "Two files." });
+	// Of a human input: all that entered the context and all the calls, with the last answer.
+	expect(briefOf(analysis, 1, true)).toMatchObject({ added: "user message ≈10 · result read ×2 ≈200 · result bash ≈100", reply: "calls read ×2, bash · Two files." });
+	expect(briefOf(analysis, 2)).toEqual({ first: 2, user: "#2 next", added: "compaction summary ≈1.0k · user message ≈1", reply: "nothing (error)" });
+	expect(briefOf(analysis, 3)).toBeUndefined();
 });
 
 test("analyze estimates when the prompt cache expires", () => {

@@ -65,6 +65,12 @@ export interface CacheMiss {
 	idleMs: number;
 }
 
+/** Something that entered the context between two requests. */
+export interface AddedRec {
+	label: string;
+	/** Estimated size. */
+	tokens: number;
+}
 export interface RequestRec {
 	n: number;
 	time: number;
@@ -77,6 +83,11 @@ export interface RequestRec {
 	context: number;
 	cost: number;
 	stop: string;
+	/** What entered the context since the request before. */
+	added: AddedRec[];
+	/** What the model answered: the start of its text, and the names of the tools that it called. */
+	reply: string;
+	calls: string[];
 	miss?: CacheMiss;
 	/** Entry the request's context ends at. The composition can be rebuilt from the branch up to it. */
 	parentId?: string | null;
@@ -591,6 +602,44 @@ export function trendBars(analysis: Analysis, byTurn: boolean, delta: boolean): 
 	});
 }
 
+/** What one request did, in three lines. */
+export interface Brief {
+	/** Index in `requests` of the first request of the human input. */
+	first?: number;
+	/** The human input that the request works on. */
+	user: string;
+	/** What entered the context since the request before. */
+	added: string;
+	/** What the model answered: the tools that it called and the start of its text. */
+	reply: string;
+}
+
+/**
+ * Tells what the request at `index` did. With `byTurn`, tells what the human input did up to that request:
+ * all that entered the context and all the tools called since its first request.
+ */
+export function briefOf(analysis: Analysis, index: number, byTurn = false): Brief | undefined {
+	const request = analysis.requests[index];
+	if (!request) return undefined;
+	const input = analysis.inputs.findLast((rec) => rec.first >= 0 && rec.first <= index);
+	const covered = analysis.requests.slice(byTurn && input ? input.first : index, index + 1);
+	const counted = (names: string[]) => {
+		const counts = new Map<string, number>();
+		for (const name of names) counts.set(name, (counts.get(name) ?? 0) + 1);
+		return [...counts].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name));
+	};
+	const sizes = new Map<string, number>();
+	for (const item of covered.flatMap((rec) => rec.added)) sizes.set(item.label, (sizes.get(item.label) ?? 0) + item.tokens);
+	const added = counted(covered.flatMap((rec) => rec.added.map((item) => item.label)));
+	const calls = counted(covered.flatMap((rec) => rec.calls)).join(", ");
+	return {
+		first: input?.first,
+		user: input ? `#${input.n} ${input.preview}`.trim() : "",
+		added: [...sizes.values()].map((tokens, i) => `${added[i]} ≈${fmtTokens(tokens)}`).join(" · ") || "nothing",
+		reply: [calls && `calls ${calls}`, request.reply].filter(Boolean).join(" · ") || `nothing (${request.stop})`,
+	};
+}
+
 /** The kinds of the events with the number of events of each, in the order in which they first occur. */
 export function eventKinds(events: EventRec[]): [string, number][] {
 	const counts = new Map<string, number>();
@@ -706,6 +755,10 @@ export function analyze(entries: any[]): Analysis {
 	const longCache = new Set<string>();
 	/** The last request whose context a later request can read from the cache. */
 	let cached: RequestRec | undefined;
+	/** What entered the context since the last request. */
+	let added: AddedRec[] = [];
+	const add = (label: string, chars: number) => added.push({ label, tokens: estimate(chars) });
+	const preview = (text: string) => text.slice(0, 480).replace(/\s+/g, " ").trim().slice(0, 120);
 	/** The human input whose work the entries now belong to. */
 	let input: InputRec | undefined;
 	const inputAt = (time: number, preview: string) => {
@@ -762,11 +815,13 @@ export function analyze(entries: any[]): Analysis {
 			cached = undefined;
 			analysis.cacheUntil = undefined;
 			addUsage(analysis.totals, entry.usage);
+			add("compaction summary", entry.summary?.length ?? 0);
 		} else if (entry.type === "model_change") event("model", `${entry.provider}/${entry.modelId}`);
 		else if (entry.type === "thinking_level_change") event("thinking", String(entry.thinkingLevel));
 		else if (entry.type === "branch_summary") {
 			const tokens = estimate(entry.summary?.length ?? 0);
 			event("branch summary", `${fmtTokens(tokens)} tokens`, tokens);
+			add("branch summary", entry.summary?.length ?? 0);
 		} else if (entry.type === "custom" && entry.customType === PRUNE_ENTRY) {
 			const ids = new Set<string>(Array.isArray(entry.data?.ids) ? entry.data.ids : []);
 			const change = (kind: string, list: string[], sign: number) => {
@@ -790,6 +845,7 @@ export function analyze(entries: any[]): Analysis {
 			const { id, type, description, status, startedAt, completedAt, sessionFile, error } = entry.data;
 			agents.set(id, { id, type, description, status, startedAt, completedAt, sessionFile, error });
 		}
+		if (entry.type === "custom_message") add(entry.customType ?? "custom", contentChars(entry.content));
 		if (entry.type !== "message") continue;
 
 		const m = entry.message;
@@ -797,16 +853,21 @@ export function analyze(entries: any[]): Analysis {
 		if (m.role === "user") {
 			analysis.userInputs++;
 			const skill = skillBlock(contentText(m.content));
-			if (skill) loadSkill(skill.path).tokens = estimate(skill.block.length);
-			const said = skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content);
-			input = inputAt(time, said.slice(0, 480).replace(/\s+/g, " ").trim().slice(0, 120));
+			if (skill) {
+				loadSkill(skill.path).tokens = estimate(skill.block.length);
+				add(`skill ${skill.name}`, skill.block.length);
+			}
+			if (!skill || skill.rest) add("user message", skill ? skill.rest.length : contentChars(m.content));
+			input = inputAt(time, preview(skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content)));
 		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
 		if (m.role === "bashExecution") {
 			analysis.commands.push({ time, command: m.command, program: programOf(m.command), ok: m.exitCode === 0 });
+			if (!m.excludeFromContext) add("bash", (m.command?.length ?? 0) + (m.output?.length ?? 0));
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
 			rec.resultTokens += estimate(contentChars(m.content));
 			resultTokens.set(m.toolCallId, estimate(contentChars(m.content)));
+			add(`result ${m.toolName}`, contentChars(m.content));
 			if (m.isError) {
 				analysis.toolErrors++;
 				rec.errors++;
@@ -826,6 +887,7 @@ export function analyze(entries: any[]): Analysis {
 		} else if (m.role === "assistant") {
 			const usage = m.usage ?? {};
 			const turn = turns.get(time);
+			const parts: any[] = Array.isArray(m.content) ? m.content : [];
 			addUsage(analysis.totals, usage);
 			const request: RequestRec = {
 				n: analysis.requests.length + 1,
@@ -838,11 +900,15 @@ export function analyze(entries: any[]): Analysis {
 				context: (usage.input ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0),
 				cost: usage.cost?.total ?? 0,
 				stop: m.stopReason ?? "",
+				added,
+				reply: preview(parts.filter((part) => part?.type === "text").map((part) => part.text ?? "").join(" ")),
+				calls: parts.filter((part) => part?.type === "toolCall").map((part) => part.name),
 				parentId: entry.parentId,
 				sums: turn?.sums,
 				ms: turn?.ms,
 			};
 			analysis.requests.push(request);
+			added = [];
 			if (compacted) {
 				compacted.event.delta = request.context - compacted.before;
 				compacted = undefined;
@@ -887,7 +953,7 @@ export function analyze(entries: any[]): Analysis {
 				cached = request;
 				analysis.cacheUntil = caching.has(request.model) ? time + (longCache.has(request.model) ? LONG_CACHE_MS : CACHE_MS) : undefined;
 			}
-			for (const call of Array.isArray(m.content) ? m.content : []) {
+			for (const call of parts) {
 				if (call?.type === "toolCall") recordCall(call, time);
 			}
 		}

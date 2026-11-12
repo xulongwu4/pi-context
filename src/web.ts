@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { diffRows, LABELS, type RequestRec, type Row, scaleOf, sumTokens, textOf, trendBars, type ViewData } from "./analyze.ts";
+import { briefOf, diffRows, LABELS, type RequestRec, type Row, scaleOf, sumTokens, textOf, trendBars, type ViewData } from "./analyze.ts";
 import { DEFAULT_WARN_PERCENT } from "./config.ts";
 import { viewJson } from "./export.ts";
 import { footerItems } from "./footer.ts";
@@ -161,6 +161,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				removed: diff?.removed.map(strip),
 				delta: diff?.delta,
 				items: diff?.items,
+				brief: briefOf(v.data.analysis, index, query.get("turn") === "1"),
 			};
 		},
 		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. */

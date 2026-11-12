@@ -4,6 +4,7 @@ import { basename } from "node:path";
 import {
 	type AgentRec,
 	bands,
+	briefOf,
 	type CacheMiss,
 	cacheStats,
 	CATEGORIES,
@@ -63,6 +64,12 @@ const REFRESH_MS = 1000;
 const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Insights"];
 /** Removed items that the Browser tab lists at most. */
 const MAX_REMOVED = 30;
+/** The lines under the selected bar of the Trend tab. */
+const BRIEF = [
+	["User", "user"],
+	["In", "added"],
+	["Out", "reply"],
+] as const;
 /** Cells of the Trend tab that a change takes at most, on each side of the middle. */
 const HALF_BAR = 12;
 /** Color of each category in the strip of the reading order. */
@@ -105,6 +112,8 @@ interface Body {
 	lines: string[];
 	/** Line that must stay visible. */
 	cursor?: number;
+	/** Lines after the cursor that must stay visible with it. */
+	span?: number;
 }
 
 function pad(line: string, width: number): string {
@@ -153,6 +162,8 @@ export class ContextOverlay {
 	/** Whether the Trend tab shows one bar for each human input, and whether a bar is the change since the bar before. */
 	private byTurn = false;
 	private delta = false;
+	/** Whether the Browser tab, opened from Trend, must select the first item added since the request before. */
+	private toAdded = false;
 	/** Compositions rebuilt from the session, by request number. */
 	private rebuilt = new Map<number, Row[]>();
 	/** The item being inspected. `back` is the scroll position to return to. */
@@ -235,7 +246,13 @@ export class ContextOverlay {
 		else if (matchesKey(key, "right") || matchesKey(key, "tab")) this.setTab((this.tab + 1) % TABS.length);
 		else if (matchesKey(key, "left") || matchesKey(key, "shift+tab")) this.setTab((this.tab + TABS.length - 1) % TABS.length);
 		else if (matchesKey(key, "enter")) {
-			if (this.name === "Trend") this.setTab(TABS.indexOf("Browser"));
+			if (this.name === "Trend") {
+				// The bar of a human input stands for its last request.
+				const bars = trendBars(this.data.analysis, this.byTurn, false);
+				this.selectRequest(bars[this.barAt(bars)]?.index ?? this.request);
+				this.setTab(TABS.indexOf("Browser"));
+				this.toAdded = true;
+			}
 			else if (this.name === "Turns") this.openTurn();
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
 			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
@@ -275,10 +292,10 @@ export class ContextOverlay {
 		const inner = Math.max(10, width - 4);
 		const height = this.bodyHeight();
 		this.width = inner;
-		const { lines, cursor } = this.body();
+		const { lines, cursor, span: below = 0 } = this.body();
 		if (cursor !== undefined) {
+			if (cursor + below >= this.scroll + height) this.scroll = cursor + below - height + 1;
 			if (cursor < this.scroll) this.scroll = cursor;
-			if (cursor >= this.scroll + height) this.scroll = cursor - height + 1;
 		}
 		this.scroll = Math.max(0, Math.min(this.scroll, lines.length - height));
 		const visible = lines.slice(this.scroll, this.scroll + height);
@@ -974,8 +991,10 @@ export class ContextOverlay {
 				: `out ${fmtTokens(r.output).padStart(6)}  cache ${fmtPercent(r.cacheRead, r.context).padStart(4)}  ${fmtCost(r.cost)}${miss}${stop}`;
 			const row = `#${String(entry.n).padStart(3)} ${fmtTime(input?.time ?? r.time)} ${size}  ${figures}`;
 			lines.push(on ? t.fg("accent", `▶ ${row}`) : `  ${row}`);
+			const brief = on ? briefOf(this.data.analysis, entry.index, this.byTurn) : undefined;
+			if (brief) lines.push(...BRIEF.map(([name, key]) => `      ${t.fg("muted", name.padEnd(6))}${brief[key]}`));
 		});
-		return { lines, cursor: selected === 0 ? 0 : above + selected };
+		return { lines, cursor: selected === 0 ? 0 : above + selected, span: BRIEF.length };
 	}
 
 	private browser(): Body {
@@ -1026,6 +1045,8 @@ export class ContextOverlay {
 		}
 		const strip = (selected?: number) => [...this.strip(rows, selected), this.head(`Assembled from${request.rows ? "" : rebuilt}`), this.legend()];
 		const above = top.length + strip().length;
+		if (this.toAdded) this.item = Math.max(0, diff?.marks.indexOf("+") ?? 0);
+		this.toAdded = false;
 		const list = this.list(rows, factor, above, diff?.marks);
 		top.push(...strip(this.positions[this.item]));
 		const removed = diff?.removed ?? [];

@@ -266,7 +266,13 @@ function trendCard(d) {
 	const what = `${delta ? "The change of the tokens sent since the bar before: growth above the line, the rest below it. One bar for" : "Tokens sent by"} ${byTurn ? "the last request of each human input" : "each request"}.`;
 	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context. ✂ compaction, ! cache miss.`;
 	const axis = `<div class="axis"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
-	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div><div class="pills">${key}</div><p class="muted">${note}</p>`;
+	// What the selected request did. Each line opens what it tells of in the Context Browser.
+	const brief = state.view?.brief;
+	const line = (name, text, act, title) => `<div ${act} title="${title}"><b>${name}</b><span>${esc(text)}</span></div>`;
+	const told = brief
+		? `<div class="brief">${line("User", brief.user, brief.first == null ? "" : `data-act="request" data-n="${d.requests[brief.first]?.n}"`, "Open the first request of the human input")}${line("In", brief.added, `data-act="added"`, "Show the first item added since the request before")}${line("Out", brief.reply, `data-act="reply"`, "Show the answer in the context of the next request")}</div>`
+		: "";
+	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div>${told}<div class="pills">${key}</div><p class="muted">${note}</p>`;
 }
 
 /** Number of the first request that carried the row: the first one made after the message of the row was created. */
@@ -648,7 +654,7 @@ async function selectRequest(n) {
 	render();
 	if (n == null) return;
 	try {
-		const view = await api("request", params({ n }));
+		const view = await api("request", params({ n, turn: state.trend.byTurn ? 1 : 0 }));
 		if (state.request === n) state.view = view;
 	} catch (error) {
 		setError(error.message);
@@ -724,8 +730,10 @@ const actions = {
 		const key = el.dataset.key;
 		state.trend[key] = !state.trend[key];
 		// The server makes the bars; the width is a matter of the page.
-		if (key === "fit") render();
-		else load();
+		if (key === "fit") return render();
+		// The lines under the chart tell of a request or of a human input: load() reads the request again.
+		if (key === "byTurn") state.view = null;
+		load();
 	},
 	cat: (el) => toggle(state.openCats, el.dataset.cat),
 	item: (el) => openItem(Number(el.dataset.i)),
@@ -738,6 +746,17 @@ const actions = {
 		if (state.openItems.has(keyOf(row))) render();
 		else openItem(i);
 		document.querySelector(`#browser .item[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
+	},
+	/** Shows the first item that entered the context since the request before. */
+	added() {
+		const i = state.view?.marks?.indexOf("+") ?? -1;
+		if (i >= 0) actions.band({ dataset: { i } });
+	},
+	/** Shows the answer to the selected request: the first item that the next request added. */
+	async reply() {
+		const requests = state.data.requests;
+		await selectRequest(requests[requests.findIndex((request) => request.n === state.request) + 1]?.n ?? null);
+		actions.added();
 	},
 	async drop(el) {
 		try {
