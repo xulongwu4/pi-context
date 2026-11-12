@@ -28,6 +28,8 @@ export interface SessionSummary {
 	tools: Record<string, number>;
 	programs: Record<string, number>;
 	skills: Record<string, number>;
+	/** Path of the session file. `scan` sets it; it is not cached. */
+	file?: string;
 }
 
 export interface DayStat {
@@ -61,6 +63,8 @@ export interface Insights {
 	heat: number[][];
 	/** Model, requests, tokens and cost in the period; the most expensive first. */
 	models: [string, number, number, number][];
+	/** Working directory, sessions, requests, tokens and cost in the period; the most expensive first. */
+	projects: [string, number, number, number, number][];
 	tools: [string, number][];
 	programs: [string, number][];
 	skills: [string, number][];
@@ -69,6 +73,14 @@ export interface Insights {
 interface Cache {
 	version: number;
 	files: Record<string, { size: number; mtimeMs: number; summary: SessionSummary }>;
+}
+
+/** The entries from the root of the session tree to the entry `leafId`, in order. */
+export function branchOf(entries: any[], leafId: string | undefined): any[] {
+	const byId = new Map<string, any>(entries.map((entry) => [entry.id, entry]));
+	const branch: any[] = [];
+	for (let entry = byId.get(leafId ?? ""); entry && branch.length <= entries.length; entry = byId.get(entry.parentId)) branch.push(entry);
+	return branch.reverse();
 }
 
 export function parseEntries(text: string): any[] {
@@ -135,15 +147,18 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		week: [],
 		heat: Array.from({ length: 7 }, () => new Array<number>(24).fill(0)),
 		models: [],
+		projects: [],
 		tools: [],
 		programs: [],
 		skills: [],
 	};
 	const models = new Map<string, [string, number, number, number]>();
+	const projects = new Map<string, [string, number, number, number, number]>();
 	const counts = { tools: new Map<string, number>(), programs: new Map<string, number>(), skills: new Map<string, number>() };
 	for (const summary of summaries) {
 		if (filter.cwd && summary.cwd !== filter.cwd && !summary.cwd.startsWith(`${filter.cwd}/`)) continue;
 		let active = false;
+		const project = projects.get(summary.cwd) ?? [summary.cwd, 0, 0, 0, 0];
 		for (const [name, hours] of Object.entries(summary.models)) {
 			for (const [hour, [requests, tokens, cost]] of Object.entries(hours)) {
 				const time = Number(hour) * HOUR;
@@ -159,6 +174,9 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 				model[1] += requests;
 				model[2] += tokens;
 				model[3] += cost;
+				project[2] += requests;
+				project[3] += tokens;
+				project[4] += cost;
 				byDay.set(day, stat);
 				models.set(name, model);
 				insights.requests += requests;
@@ -168,6 +186,8 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 			}
 		}
 		if (!active) continue;
+		project[1]++;
+		projects.set(summary.cwd, project);
 		insights.sessions.push(summary);
 		for (const key of ["tools", "programs", "skills"] as const) {
 			for (const [name, n] of Object.entries(summary[key])) counts[key].set(name, (counts[key].get(name) ?? 0) + n);
@@ -181,6 +201,7 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	const rank = order[filter.sort ?? "recent"];
 	insights.sessions.sort((a, b) => rank(b) - rank(a) || b.end - a.end);
 	insights.models = [...models.values()].sort((a, b) => b[3] - a[3] || b[2] - a[2]);
+	insights.projects = [...projects.values()].sort((a, b) => b[4] - a[4] || b[3] - a[3]).slice(0, TOP);
 	insights.activeDays = byDay.size;
 	for (let i = 6; i >= 0; i--) {
 		const day = fmtDay(now - i * DAY);
@@ -233,7 +254,7 @@ export async function scan(
 					? hit.summary
 					: summarize(parseEntries(await readFile(file.path, "utf8")));
 			next.files[file.path] = { size: file.size, mtimeMs: file.mtimeMs, summary };
-			summaries.push(summary);
+			summaries.push({ ...summary, file: file.path });
 		} catch {
 			// Skip a file that cannot be read.
 		}

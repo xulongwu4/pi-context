@@ -1,5 +1,6 @@
 import { cacheStats, CATEGORIES, type Category, LABELS, scaleOf, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
+import { hintTotal } from "./hints.ts";
 import type { Insights } from "./insights.ts";
 
 type Cell = string | number;
@@ -55,6 +56,9 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 			["Model", "Requests", "Sent", "Output", "Cost"],
 			analysis.models.map((m) => [m.model, m.requests, fmtTokens(m.sent), fmtTokens(m.output), fmtCost(m.cost)]),
 		),
+		`Tokens sent over the session, by category (${analysis.billedRequests} of ${analysis.requests.length} requests recorded by pi-context):`,
+		"",
+		...composition(analysis.billed),
 		"## Current context",
 		"",
 		...composition(sumByCategory(current), usage?.tokens),
@@ -69,11 +73,37 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		),
 		"## Hints",
 		"",
-		"What could be dropped from the context:",
+		`What could be dropped from the context (≈${fmtTokens(hintTotal(hints) * factor)} tokens; sizes of reads in scripts are upper bounds and not counted):`,
 		"",
 		...table(
 			["Tokens", "Item", "Why"],
 			hints.map((hint) => [approx(hint.tokens, factor), hint.label, hint.detail]),
+		),
+		...(data.dropped.length > 0
+			? [
+					"Dropped by the user (the model gets a stub in their place):",
+					"",
+					...table(
+						["Tokens", "Item"],
+						data.dropped.map((row) => [approx(row.tokens, factor), `${row.label}: ${row.preview}`]),
+					),
+				]
+			: []),
+		"## Turns",
+		"",
+		...table(
+			["#", "Time", "Requests", "Tool calls", "Sent", "Output", "Cost", "Took", "Input"],
+			analysis.inputs.map((input) => [
+				input.n,
+				stamp(input.time),
+				input.requests,
+				input.toolCalls,
+				fmtTokens(input.sent),
+				fmtTokens(input.output),
+				fmtCost(input.cost),
+				fmtDuration(input.ms),
+				input.preview,
+			]),
 		),
 		"## Requests",
 		"",
@@ -167,6 +197,10 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 			insights.models.map(([name, requests, tokens, cost]) => [name, requests, fmtTokens(tokens), fmtCost(cost)]),
 		),
 		...table(
+			["Project", "Sessions", "Requests", "Tokens", "Cost"],
+			insights.projects.map(([cwd, sessions, requests, tokens, cost]) => [cwd, sessions, requests, fmtTokens(tokens), fmtCost(cost)]),
+		),
+		...table(
 			["Day", "Requests", "Tokens", "Cost"],
 			insights.week.map((day) => [day.day, day.requests, fmtTokens(day.tokens), fmtCost(day.cost)]),
 		),
@@ -175,4 +209,27 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 			insights.sessions.map((s) => [stamp(s.end), s.cwd, s.name, s.requests, fmtTokens(s.tokens), fmtCost(s.cost)]),
 		),
 	].join("\n");
+}
+/** The data of the dashboard as JSON. Token figures of items and categories are estimates; multiply them by `factor`. */
+/** The dashboard data as plain values, without the content of the items. */
+export function viewJson(data: ViewData) {
+	const { analysis } = data;
+	const item = ({ text, ...row }: ViewData["current"][number]) => row;
+	return {
+		model: data.model,
+		usage: data.usage,
+		factor: data.factor,
+		declared: data.declared,
+		...analysis,
+		requests: analysis.requests.map(({ rows, ...request }) => request),
+		cache: cacheStats(analysis),
+		current: data.current.map(item),
+		hints: data.hints,
+		dropped: data.dropped.map(item),
+		agents: data.agents,
+	};
+}
+
+export function exportJson(data: ViewData, insights: Insights): string {
+	return JSON.stringify({ ...viewJson(data), insights }, null, "\t");
 }

@@ -1,5 +1,6 @@
 import { cacheStats, CATEGORIES, LABELS, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
+import { hintTotal } from "./hints.ts";
 
 export const SECTIONS = ["summary", "composition", "requests", "tools", "files", "commands", "hints"] as const;
 export type Section = (typeof SECTIONS)[number];
@@ -94,9 +95,8 @@ export function report(data: ViewData, section: Section = "summary"): string {
 			].join("\n");
 		}
 		case "hints": {
-			const total = data.hints.reduce((sum, hint) => sum + hint.tokens, 0);
 			return [
-				`Could be dropped from the context: ${approx(total)} tokens.`,
+				`Could be dropped from the context: ${approx(hintTotal(data.hints))} tokens.`,
 				...none(
 					data.hints.map((hint) => `  ${size(hint.tokens)}  ${hint.label}: ${hint.detail}`),
 					"Nothing stands out: no repeated reads, no repeated skill loads, no large tool results from earlier turns.",

@@ -6,6 +6,7 @@ import {
 	analyze,
 	cacheStats,
 	declaredTools,
+	diffRows,
 	programOf,
 	recordedDeclarations,
 	rowsOf,
@@ -17,10 +18,12 @@ import {
 	type ViewData,
 } from "../src/analyze.ts";
 import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
-import { exportMarkdown } from "../src/export.ts";
+import { exportJson, exportMarkdown } from "../src/export.ts";
+import { footerItems, footerText } from "../src/footer.ts";
 import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
-import { hintsOf } from "../src/hints.ts";
-import { aggregate, parseEntries, scan, summarize } from "../src/insights.ts";
+import { hintsOf, hintTotal } from "../src/hints.ts";
+import { aggregate, branchOf, parseEntries, scan, summarize } from "../src/insights.ts";
+import { droppedOf, isStub, PRUNE_ENTRY, prune, prunedOf } from "../src/prune.ts";
 import { report } from "../src/report.ts";
 
 const usage = (input: number, output: number, cacheRead = 0, cost = 0) => ({
@@ -191,6 +194,7 @@ const view = (entries: any[]): ViewData => ({
 	declared: ["codemode", "read"],
 	factor: 1,
 	hints: [],
+	dropped: [],
 	config: {},
 	agents: [],
 	running: false,
@@ -581,4 +585,159 @@ test("report returns one section when asked", () => {
 	expect(report(data, "hints")).toContain("Nothing stands out");
 	data.hints = [{ kind: "result", tokens: 2000, label: "result bash", detail: "zzz" }];
 	expect(report(data, "hints")).toContain("≈  2.0k  result bash: zzz");
+});
+test("analyze groups the work by human input", () => {
+	const start = 10 * HOUR;
+	const entries = [...session(start), at({ role: "user", content: "second\n input", timestamp: start + 2 * HOUR })];
+	const { inputs } = analyze(entries);
+	expect(inputs).toEqual([
+		{ n: 1, time: start, preview: "hi", first: 0, requests: 2, toolCalls: 7, sent: 2000, output: 20, cost: 0.75, ms: HOUR + 1000 },
+		{ n: 2, time: start + 2 * HOUR, preview: "second input", first: -1, requests: 0, toolCalls: 0, sent: 0, output: 0, cost: 0, ms: 0 },
+	]);
+	// A request before any input still belongs to a row.
+	expect(analyze([at(assistant(1000))]).inputs).toMatchObject([{ n: 1, preview: "", first: 0, requests: 1 }]);
+});
+
+test("analyze sums the recorded compositions, scaled to what each request sent", () => {
+	const sums = { ...sumByCategory([]), system: 300, user: 100 };
+	const turn = { type: "custom", customType: TURN_ENTRY, data: { time: 1000, ms: 1, toolMs: 0, activeMs: 1, sums } };
+	const analysis = analyze([at(assistant(1000)), turn, at(assistant(2000))]);
+	expect(analysis.billedRequests).toBe(1);
+	expect(analysis.billed).toMatchObject({ system: 750, user: 250, answers: 0 });
+});
+
+test("analyze estimates when the prompt cache expires", () => {
+	expect(analyze([at(assistant(1000))]).cacheUntil).toBe(1000 + 5 * 60_000);
+	const long = { ...assistant(1000), usage: { ...usage(100, 10, 900), cacheWrite1h: 50 } };
+	expect(analyze([at(long), at(assistant(2000))]).cacheUntil).toBe(2000 + HOUR);
+	const uncached = { ...assistant(1000), usage: usage(100, 10) };
+	expect(analyze([at(uncached)]).cacheUntil).toBeUndefined();
+	expect(analyze([at(assistant(1000)), { type: "compaction", tokensBefore: 5 }]).cacheUntil).toBeUndefined();
+});
+
+test("diffRows marks what a request added, changed and removed", () => {
+	const row = (cat: any, tokens: number, label: string, id?: string) => ({ cat, tokens, label, preview: label, ...(id ? { id } : {}) });
+	const previous = [row("system", 100, "system"), row("tools", 50, "2 tool schemas"), row("user", 5, "user"), row("toolResults", 50, "result read", "r1"), row("answers", 8, "answer")];
+	const rows = [row("system", 120, "system"), row("tools", 50, "2 tool schemas"), row("user", 5, "user"), row("toolResults", 5, "result read", "r1"), row("toolCalls", 7, "call bash")];
+	const diff = diffRows(previous, rows);
+	expect(diff.marks).toEqual(["~", "", "", "~", "+"]);
+	expect(diff.removed.map((r) => r.label)).toEqual(["answer"]);
+	expect(diff.delta).toMatchObject({ system: 20, tools: 0, toolResults: -45, toolCalls: 7, answers: -8 });
+	// Equal rows are matched one to one.
+	expect(diffRows([row("user", 5, "user")], [row("user", 5, "user"), row("user", 5, "user")]).marks).toEqual(["", "+"]);
+});
+
+test("prune replaces dropped tool results with a stub", () => {
+	const result = (toolCallId: string, chars: number) => ({ role: "toolResult", toolCallId, toolName: "read", content: [{ type: "text", text: "z".repeat(chars) }], isError: false });
+	const list = [{ role: "user", content: "go" }, result("c1", 800), result("c2", 400)];
+	const ids = new Set(["c1"]);
+	const pruned = prune(list, ids);
+	expect(pruned[0]).toBe(list[0]);
+	expect(pruned[2]).toBe(list[2]);
+	expect((pruned[1] as any).content[0].text).toContain("(800 characters)");
+	expect(pruned[1]).toMatchObject({ toolCallId: "c1", toolName: "read", isError: false });
+	expect(isStub(pruned[1])).toBe(true);
+	expect(isStub(list[1])).toBe(false);
+	// Pruning again changes nothing, so the request prefix stays the same.
+	expect(prune(pruned, ids)).toEqual(pruned);
+	expect(prune(list, new Set())).toBe(list);
+	expect(droppedOf(list, ids)).toMatchObject([{ cat: "toolResults", tokens: 200, label: "result read", id: "c1" }]);
+	expect(rowsOf(list).map((r) => r.id)).toEqual([undefined, "c1", "c2"]);
+
+	const entry = (data: any) => ({ type: "custom", customType: PRUNE_ENTRY, data });
+	expect([...prunedOf([entry({ ids: ["a"] }), entry({ ids: ["b", "c"] })])]).toEqual(["b", "c"]);
+	expect(prunedOf([]).size).toBe(0);
+});
+
+test("hintsOf names the results to drop, skips dropped ones and lists repeated reads in scripts", () => {
+	const read = (id: string, args: object) => ({ type: "toolCall", id, name: "read", arguments: args });
+	const result = (toolCallId: string, toolName: string, chars: number, extra = {}) => ({ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text: "z".repeat(chars) }], isError: false, ...extra });
+	const nestedCalls = {
+		complete: true,
+		calls: [
+			{ id: "k1/1", name: "read", status: "ok", arguments: { path: "big.ts" } },
+			{ id: "k1/2", name: "read", status: "ok", arguments: { path: "big.ts", offset: 5 } },
+			{ id: "k1/3", name: "read", status: "error", arguments: { path: "big.ts" } },
+			{ id: "k1/4", name: "read", status: "ok", arguments: { path: "once.ts" } },
+		],
+	};
+	const list = [
+		{ role: "user", content: "go" },
+		{ role: "assistant", content: [read("r1", { path: "/a.ts" }), read("r2", { path: "/a.ts" }), { type: "toolCall", id: "k1", name: "codemode", arguments: {} }] },
+		result("r1", "read", 800),
+		result("r2", "read", 1200),
+		result("k1", "codemode", 8000, { nestedCalls }),
+		{ role: "user", content: "more" },
+	];
+	const hints = hintsOf(list, (path) => (path === "big.ts" ? 4000 : undefined));
+	expect(hints.map((hint) => [hint.kind, hint.tokens, hint.label, hint.ids])).toEqual([
+		["result", 2000, "result codemode", ["k1"]],
+		["nested", 1000, "read big.ts ×2 in scripts", undefined],
+		["reread", 200, "read /a.ts ×2", ["r1"]],
+	]);
+	expect(hintTotal(hints)).toBe(2200);
+	// Without a size, the read is still listed.
+	expect(hintsOf(list).find((hint) => hint.kind === "nested")?.tokens).toBe(0);
+	// Dropped results are not hinted again, and the reads of a dropped script result do not count.
+	expect(hintsOf(prune(list, new Set(["r1", "k1"])))).toEqual([]);
+});
+
+test("footerText shows the configured items that have data", () => {
+	const now = 1_000_000;
+	const stats = { usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 }, cost: 1.5, requests: 3, cacheRate: 0.874, cacheUntil: now + 125_000 };
+	expect(footerText({}, stats, now)).toBe("ctx 42% 84.2k/200.0k");
+	expect(footerText({ footer: ["cost", "context", "cache", "ttl"] }, stats, now)).toBe("$1.50 · ctx 42% 84.2k/200.0k · cache 87% · ttl 2m5s");
+	expect(footerText({ footer: ["ttl"] }, stats, now + 200_000)).toBe("ttl expired");
+	// A budget adds the cost.
+	expect(footerItems({ budget: 5 })).toEqual(["context", "cost"]);
+	expect(footerText({ budget: 5 }, stats, now)).toBe("ctx 42% 84.2k/200.0k · $1.50/$5.00");
+	expect(footerText({ footer: ["context", "cache", "ttl"] }, { cost: 0, requests: 0, cacheRate: 0 }, now)).toBe("");
+});
+
+test("aggregate sums the period by project", () => {
+	const now = new Date(2026, 5, 10, 12).getTime();
+	const a = summarize(session(now - 26 * HOUR, "a"));
+	const b = { ...summarize(session(now - 30 * HOUR, "b")), cwd: "/work/other", cost: 9 };
+	const old = { ...summarize(session(now - 40 * 24 * HOUR, "old")), cwd: "/work/old" };
+	expect(aggregate([a, a, b, old], now, 30).projects).toEqual([
+		["/work/proj", 2, 4, 4040, 1.5],
+		["/work/other", 1, 2, 2020, 0.75],
+	]);
+});
+
+test("branchOf follows the parents of the leaf", () => {
+	const entries = [{ id: "a" }, { id: "b", parentId: "a" }, { id: "c", parentId: "b" }, { id: "d", parentId: "b" }];
+	expect(branchOf(entries, "d").map((entry) => entry.id)).toEqual(["a", "b", "d"]);
+	expect(branchOf(entries, undefined)).toEqual([]);
+});
+
+test("scan names the file of each summary", async () => {
+	const root = mkdtempSync(join(tmpdir(), "pi-context-"));
+	mkdirSync(join(root, "proj"));
+	const file = join(root, "proj", "one.jsonl");
+	writeFileSync(file, session(Date.now()).map((entry) => JSON.stringify(entry)).join("\n"));
+	const cache = join(root, "cache.json");
+	expect((await scan(root, cache, 0)).map((summary) => summary.file)).toEqual([file]);
+	// The cached summary does not hold the path, but a scan that uses the cache still returns it.
+	expect(readFileSync(cache, "utf8")).not.toContain('"file"');
+	expect((await scan(root, cache, 0))[0].file).toBe(file);
+});
+
+test("the exports cover turns, dropped results and projects", () => {
+	const data = view(session(10 * HOUR));
+	data.dropped = [{ cat: "toolResults", tokens: 200, label: "result read", preview: "zzz", id: "c1" }];
+	data.current = rowsOf(messages, undefined, [], true);
+	const insights = aggregate([summarize(session(10 * HOUR))], 11 * HOUR, 30);
+	const text = exportMarkdown(data, insights);
+	expect(text).toContain("## Turns");
+	expect(text).toContain("| 2 | 7 | 2.0k | 20 | $0.7500 | 1h0m | hi |");
+	expect(text).toContain("| ≈200 | result read: zzz |");
+	expect(text).toContain("| /work/proj | 1 | 2 | 2.0k | $0.7500 |");
+	expect(text).toContain("0 of 2 requests recorded by pi-context");
+
+	const json = JSON.parse(exportJson(data, insights));
+	expect(json).toMatchObject({ model: "m1", factor: 1, inputs: [{ n: 1, requests: 2 }], dropped: [{ id: "c1" }], insights: { projects: [["/work/proj", 1, 2, 2020, 0.75]] } });
+	expect(json.requests).toHaveLength(2);
+	expect(json.current.length).toBeGreaterThan(0);
+	expect(JSON.stringify(json.current)).not.toContain('"text"');
 });

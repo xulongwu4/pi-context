@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>pi-context</title>
+	<link rel="stylesheet" href="style.css">
+</head>
+<body>
+	<header>
+		<h1 id="title">Context</h1>
+		<span id="live" class="badge" hidden>● live</span>
+		<span id="model" class="muted"></span>
+		<nav>
+			<button data-act="page" data-page="context">Context</button>
+			<button data-act="page" data-page="insights">Insights</button>
+		</nav>
+	</header>
+	<p id="error" class="notice bad" hidden></p>
+	<p id="other" class="notice" hidden></p>
+
+	<main id="context" class="grid">
+		<section class="card wide" id="stats">
+			<h2>Context Stats</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="tokens">
+			<h2>Token Stats</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="timing">
+			<h2>Timing Stats</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="current">
+			<h2>Current Context</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card tall" id="browser">
+			<h2>Context Browser</h2>
+			<div class="controls">
+				<button data-act="step" data-by="-1" title="Previous request">‹</button>
+				<select id="request"></select>
+				<button data-act="step" data-by="1" title="Next request">›</button>
+				<select id="order">
+					<option value="context">In context order</option>
+					<option value="size">Largest first</option>
+				</select>
+				<input id="filter" type="search" placeholder="Filter items">
+			</div>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="trend">
+			<h2>Context Trend</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="hints">
+			<h2>Hints</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="turns">
+			<h2>Turns</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="events">
+			<h2>Context Events</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="files">
+			<h2>File Activity</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="commands">
+			<h2>Command Executions</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="tools">
+			<h2>Tools, Skills and Models</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card wide" id="settings">
+			<h2>Settings</h2>
+			<form id="settings-form">
+				<label>Context warning, in percent of the window (0 = off)<input name="warn" type="number" min="0" max="100" step="any"></label>
+				<label>Auto-compact, in percent of the window (0 = off)<input name="compact" type="number" min="0" max="100" step="any"></label>
+				<label>Cost budget of a session, in dollars (0 = none)<input name="budget" type="number" min="0" step="any"></label>
+				<label>Footer items, in order: context, cost, cache, ttl<input name="footer"></label>
+				<label class="full">System prompt prefix (empty = disabled)<textarea name="prefix" rows="3"></textarea></label>
+				<label class="full">System prompt suffix (empty = disabled)<textarea name="suffix" rows="3"></textarea></label>
+				<div class="full"><button type="submit" class="on">Save</button> <span id="settings-note" class="muted"></span></div>
+			</form>
+		</section>
+	</main>
+
+	<main id="insights" hidden>
+		<div class="controls">
+			<button data-act="days" data-days="7">7 days</button>
+			<button data-act="days" data-days="30">30 days</button>
+			<button data-act="days" data-days="90">90 days</button>
+			<label><input id="project" type="checkbox"> This project only</label>
+		</div>
+		<div class="grid">
+		<section class="card wide" id="i-kpi">
+			<h2>Totals</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-week">
+			<h2>Last 7 days</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-heat">
+			<h2>Requests by weekday and hour</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-models">
+			<h2>Models</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-projects">
+			<h2>Projects</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-tools">
+			<h2>Tools</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="i-programs">
+			<h2>Programs and skills</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card wide" id="i-sessions">
+			<h2>Sessions</h2>
+			<div class="controls">
+				<input id="search" type="search" placeholder="Search title or directory">
+				<select id="sort">
+					<option value="recent">Most recent first</option>
+					<option value="cost">Highest cost first</option>
+					<option value="tokens">Most tokens first</option>
+				</select>
+			</div>
+			<div class="body"></div>
+		</section>
+		</div>
+	</main>
+	<script src="app.js"></script>
+</body>
+</html>

@@ -35,6 +35,20 @@ export interface Row {
 	preview: string;
 	/** Full content. Only rows built for inspection carry it. */
 	text?: string;
+	/** Tool call id, for a tool result. */
+	id?: string;
+	/** The user dropped this tool result: the model gets a stub in its place. */
+	dropped?: boolean;
+}
+
+/** How the rows of a request differ from those of the request before it. */
+export interface RowDiff {
+	/** For each row of the request: "+" added, "~" changed, "" unchanged. */
+	marks: ("+" | "~" | "")[];
+	/** Rows of the previous request that this one no longer carries. */
+	removed: Row[];
+	/** Change of the estimated size of each category. */
+	delta: Record<Category, number>;
 }
 
 /** A request that read little of the previous request from the cache, so the provider billed that part again. */
@@ -67,6 +81,23 @@ export interface RequestRec {
 	/** Composition by category and duration, when pi-context recorded the turn in the session. */
 	sums?: Record<Category, number>;
 	ms?: number;
+}
+
+/** One human input and the work it caused, up to the next input. */
+export interface InputRec {
+	n: number;
+	time: number;
+	preview: string;
+	/** Index in `requests` of the first request it caused; -1 when it caused none. */
+	first: number;
+	requests: number;
+	toolCalls: number;
+	/** Input and cache tokens of its requests. */
+	sent: number;
+	output: number;
+	cost: number;
+	/** Time from the input to the last message it caused. */
+	ms: number;
 }
 
 export interface EventRec {
@@ -173,6 +204,7 @@ export interface Totals {
 
 export interface Analysis {
 	requests: RequestRec[];
+	inputs: InputRec[];
 	events: EventRec[];
 	files: FileRec[];
 	commands: CommandRec[];
@@ -189,6 +221,12 @@ export interface Analysis {
 	totals: Totals;
 	/** Sums over the turns pi-context recorded. */
 	timing: Timing;
+	/** Tokens sent over the session by category: the recorded composition of each request, scaled to its provider-reported size. */
+	billed: Record<Category, number>;
+	/** Requests that `billed` covers. */
+	billedRequests: number;
+	/** Estimated time at which the prompt cache of the last request expires. Undefined when the model does not cache. */
+	cacheUntil?: number;
 }
 
 export interface ViewData {
@@ -201,11 +239,15 @@ export interface ViewData {
 	/** Scales the estimates of the current context to the provider-reported size; 1 when that size is unknown. */
 	factor: number;
 	hints: Hint[];
+	/** The dropped tool results that the context still holds, with their original sizes. */
+	dropped: Row[];
 	config: Config;
 	/** Finished and live subagents, newest first. */
 	agents: AgentRec[];
 	running: boolean;
 	parentSession?: string;
+	/** Name of the session, when it is not the current one. Such data is read-only. */
+	other?: string;
 	/** Rebuilds the composition of a request that has no snapshot. */
 	reconstruct: (request: RequestRec) => Row[];
 }
@@ -299,10 +341,11 @@ export const sumTokens = (rows: Row[]) => rows.reduce((total, row) => total + ro
  */
 export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = [], full = false): Row[] {
 	const rows: Row[] = [];
-	const push = (cat: Category, chars: number, label: string, text: string, content = text) => {
+	const push = (cat: Category, chars: number, label: string, text: string, content = text, id?: string) => {
 		if (chars <= 0) return;
 		const row: Row = { cat, tokens: estimate(chars), label, preview: text.slice(0, 640).replace(/\s+/g, " ").trim().slice(0, 160) };
 		if (full) row.text = content;
+		if (id) row.id = id;
 		rows.push(row);
 	};
 	// System messages replay in order: later ones append text, and replace or remove sections.
@@ -349,6 +392,8 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 					contentChars(m.content),
 					`result ${m.toolName}`,
 					contentText(m.content),
+					undefined,
+					m.toolCallId,
 				);
 				break;
 			case "bashExecution":
@@ -392,10 +437,44 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 	return rows;
 }
 
+/**
+ * The whole content of a row. A row of a recorded request carries none;
+ * its content is that of the same item among `rebuilt`, the rows of the request rebuilt from the session.
+ */
+export function textOf(row: Row, index: number, rebuilt: Row[]): string | undefined {
+	if (row.text !== undefined) return row.text;
+	const same = (other?: Row) => other?.cat === row.cat && other.label === row.label && other.preview === row.preview;
+	const fixed = row.cat === "system" || row.cat === "tools";
+	return (same(rebuilt[index]) ? rebuilt[index] : (rebuilt.find(same) ?? (fixed ? rebuilt.find((other) => other.cat === row.cat) : undefined)))?.text;
+}
+
 export function sumByCategory(rows: Row[]): Record<Category, number> {
-	const sums = Object.fromEntries(CATEGORIES.map((cat) => [cat, 0])) as Record<Category, number>;
+	const sums = emptySums();
 	for (const row of rows) sums[row.cat] += row.tokens;
 	return sums;
+}
+
+const emptySums = () => Object.fromEntries(CATEGORIES.map((cat) => [cat, 0])) as Record<Category, number>;
+
+/** Compares the rows of a request with those of the request before it. */
+export function diffRows(previous: Row[], rows: Row[]): RowDiff {
+	const content = (row: Row) => `${row.cat}\n${row.label}\n${row.tokens}\n${row.preview}`;
+	// The system prompt, the tool schemas and a tool result keep their identity when their content changes.
+	const identity = (row: Row) => (row.cat === "system" || row.cat === "tools" ? row.cat : row.id ? `id\n${row.id}` : content(row));
+	const left = new Map<string, Row[]>();
+	for (const row of previous) {
+		const same = left.get(identity(row));
+		if (same) same.push(row);
+		else left.set(identity(row), [row]);
+	}
+	const marks = rows.map((row) => {
+		const match = left.get(identity(row))?.shift();
+		return !match ? "+" : content(match) === content(row) ? "" : "~";
+	});
+	const before = sumByCategory(previous);
+	const delta = sumByCategory(rows);
+	for (const cat of CATEGORIES) delta[cat] -= before[cat];
+	return { marks, removed: [...left.values()].flat(), delta };
 }
 
 /** Program a shell command runs: the first one that is not `cd`, ignoring env assignments, sudo and directories. */
@@ -432,6 +511,9 @@ function addUsage(totals: Totals, usage: any): void {
 
 /** Providers do not cache prompts shorter than about this. */
 const MIN_CACHED_TOKENS = 1024;
+/** How long providers keep a cached prompt after its last use: by default, and with the long retention. */
+const CACHE_MS = 5 * 60_000;
+const LONG_CACHE_MS = 60 * 60_000;
 
 const ANCHOR_KEYS = ["anchor", "remove_from", "replace_from", "source_from"];
 const hasAnchor = (args: any) => ANCHOR_KEYS.some((key) => typeof args?.[key] === "string");
@@ -440,6 +522,7 @@ const hasAnchor = (args: any) => ANCHOR_KEYS.some((key) => typeof args?.[key] ==
 export function analyze(entries: any[]): Analysis {
 	const analysis: Analysis = {
 		requests: [],
+		inputs: [],
 		events: [],
 		files: [],
 		commands: [],
@@ -453,6 +536,8 @@ export function analyze(entries: any[]): Analysis {
 		unresolvedEdits: 0,
 		totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 		timing: { activeMs: 0, modelMs: 0, toolMs: 0 },
+		billed: emptySums(),
+		billedRequests: 0,
 	};
 	const files = new Map<string, FileRec>();
 	const tools = new Map<string, ToolRec>();
@@ -490,10 +575,20 @@ export function analyze(entries: any[]): Analysis {
 	const readRates = new Map<string, number>();
 	/** Models that have used the prompt cache on this branch. */
 	const caching = new Set<string>();
+	/** Models that have written to the cache with the long retention. */
+	const longCache = new Set<string>();
 	/** The last request whose context a later request can read from the cache. */
 	let cached: RequestRec | undefined;
+	/** The human input whose work the entries now belong to. */
+	let input: InputRec | undefined;
+	const inputAt = (time: number, preview: string) => {
+		const rec: InputRec = { n: analysis.inputs.length + 1, time, preview, first: -1, requests: 0, toolCalls: 0, sent: 0, output: 0, cost: 0, ms: 0 };
+		analysis.inputs.push(rec);
+		return rec;
+	};
 	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string) => {
 		analysis.toolCalls++;
+		if (input) input.toolCalls++;
 		const rec = tool(call.name);
 		if (nestedStatus) {
 			rec.nested++;
@@ -531,6 +626,7 @@ export function analyze(entries: any[]): Analysis {
 			event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
 			// The compacted context is new to the cache; the next request is not a miss.
 			cached = undefined;
+			analysis.cacheUntil = undefined;
 			addUsage(analysis.totals, entry.usage);
 		} else if (entry.type === "model_change") event("model", `${entry.provider}/${entry.modelId}`);
 		else if (entry.type === "thinking_level_change") event("thinking", String(entry.thinkingLevel));
@@ -544,8 +640,11 @@ export function analyze(entries: any[]): Analysis {
 
 		const m = entry.message;
 		const time = m.timestamp ?? entryTime;
-		if (m.role === "user") analysis.userInputs++;
-		else if (m.role === "bashExecution") {
+		if (m.role === "user") {
+			analysis.userInputs++;
+			input = inputAt(time, contentText(m.content).slice(0, 480).replace(/\s+/g, " ").trim().slice(0, 120));
+		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
+		if (m.role === "bashExecution") {
 			analysis.commands.push({ time, command: m.command, program: programOf(m.command), ok: m.exitCode === 0 });
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
@@ -586,6 +685,17 @@ export function analyze(entries: any[]): Analysis {
 				ms: turn?.ms,
 			};
 			analysis.requests.push(request);
+			input ??= inputAt(time, "");
+			if (input.first < 0) input.first = request.n - 1;
+			input.requests++;
+			input.sent += request.context;
+			input.output += request.output;
+			input.cost += request.cost;
+			const estimated = turn?.sums ? CATEGORIES.reduce((sum, cat) => sum + (turn.sums[cat] ?? 0), 0) : 0;
+			if (turn && estimated > 0 && request.context > 0) {
+				for (const cat of CATEGORIES) analysis.billed[cat] += ((turn.sums[cat] ?? 0) * request.context) / estimated;
+				analysis.billedRequests++;
+			}
 			const model = models.get(request.model) ?? { model: request.model, requests: 0, sent: 0, output: 0, cost: 0 };
 			model.requests++;
 			model.sent += request.context;
@@ -594,6 +704,7 @@ export function analyze(entries: any[]): Analysis {
 			models.set(request.model, model);
 			if (request.cacheRead > 0 && usage.cost?.cacheRead > 0) readRates.set(request.model, usage.cost.cacheRead / request.cacheRead);
 			if (request.cacheRead + request.cacheWrite > 0) caching.add(request.model);
+			if (usage.cacheWrite1h > 0) longCache.add(request.model);
 			if (request.context > 0) {
 				if (
 					cached &&
@@ -612,6 +723,7 @@ export function analyze(entries: any[]): Analysis {
 					};
 				}
 				cached = request;
+				analysis.cacheUntil = caching.has(request.model) ? time + (longCache.has(request.model) ? LONG_CACHE_MS : CACHE_MS) : undefined;
 			}
 			for (const call of Array.isArray(m.content) ? m.content : []) {
 				if (call?.type === "toolCall") recordCall(call, time);

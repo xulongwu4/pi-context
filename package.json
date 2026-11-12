@@ -1,7 +1,7 @@
 {
   "name": "pi-context",
   "version": "0.1.0",
-  "description": "Context insight for pi: /context dashboard overlay, footer indicator, system prompt prefix/suffix, and a context_insight tool",
+  "description": "Context insight for pi: /context dashboard overlay and web page, footer indicator, system prompt prefix/suffix, and a context_insight tool",
   "type": "module",
   "keywords": ["pi-package"],
   "pi": {

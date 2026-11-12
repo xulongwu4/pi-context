@@ -7,23 +7,28 @@ import {
 	cacheStats,
 	CATEGORIES,
 	type Category,
+	diffRows,
 	LABELS,
 	type RequestRec,
 	type Row,
 	scaleOf,
 	sumByCategory,
 	sumTokens,
+	textOf,
 	undeclared,
 	type ViewData,
 } from "./analyze.ts";
 import { DEFAULT_WARN_PERCENT } from "./config.ts";
+import { footerItems } from "./footer.ts";
 import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
+import { hintTotal } from "./hints.ts";
 import { aggregate, type Insights, type SessionSort, type SessionSummary } from "./insights.ts";
 
 const TABS = [
 	"Stats",
 	"Current",
 	"Hints",
+	"Turns",
 	"Trend",
 	"Browser",
 	"Events",
@@ -44,11 +49,15 @@ const SORTS: [SessionSort, string][] = [
 	["cost", "by cost"],
 	["tokens", "by tokens"],
 ];
-export const SETTINGS = ["warn", "prefix", "suffix"] as const;
+export const SETTINGS = ["warn", "compact", "budget", "footer", "prefix", "suffix"] as const;
 export type Setting = (typeof SETTINGS)[number];
 /** Characters of an item that the inspector shows at most. */
 const MAX_INSPECT_CHARS = 200_000;
 const REFRESH_MS = 1000;
+/** Tabs whose lists the user can filter. */
+const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Insights"];
+/** Removed items that the Browser tab lists at most. */
+const MAX_REMOVED = 30;
 
 /** What the overlay needs from the extension. */
 export interface OverlayHost {
@@ -57,6 +66,10 @@ export interface OverlayHost {
 	isLive(): boolean;
 	/** Summaries of the sessions of the last `days` days. */
 	loadSummaries(days: number, onProgress: (done: number, total: number) => void): Promise<SessionSummary[]>;
+	/** The dashboard data of a saved session. Throws when the file cannot be read. */
+	openSession(file: string, title: string): ViewData;
+	/** Drops tool results from the context, or restores them. */
+	setDropped(ids: string[], dropped: boolean): void;
 	cwd: string;
 	configPath: string;
 	/** Tab to open on. */
@@ -98,8 +111,20 @@ export class ContextOverlay {
 	private tab: number;
 	private scroll = 0;
 	private request: number;
-	/** Selected line of the list in the Current, Browser and Settings tabs. */
+	/** Selected entry of the list that the tab shows. */
 	private item = 0;
+	/** Body line of each entry of the list in the Insights or Fleet tab, and the session it opens, as of the last render. */
+	private picks: { line: number; file?: string; title: string }[] = [];
+	/** Entries of the list in the Hints tab, as of the last render. */
+	private hintList: { ids: string[]; dropped: boolean }[] = [];
+	/** Text that the lists of the tab must contain. */
+	private filterText = "";
+	/** The user is typing the filter. */
+	private typing = false;
+	/** Shown in place of the key hints until the next key. */
+	private notice = "";
+	/** Where to return to when the overlay shows another session. */
+	private back?: { tab: number; scroll: number; item: number };
 	/** Rows of the list in the Current or Browser tab, as of the last render. */
 	private rows: Row[] = [];
 	/** Compositions rebuilt from the session, by request number. */
@@ -142,6 +167,19 @@ export class ContextOverlay {
 	}
 
 	handleInput(key: string): void {
+		this.notice = "";
+		if (this.typing) {
+			if (matchesKey(key, "enter")) this.typing = false;
+			else if (matchesKey(key, "escape")) {
+				this.typing = false;
+				this.filterText = "";
+			} else if (matchesKey(key, "backspace")) this.filterText = this.filterText.slice(0, -1);
+			else if ([...key].length === 1 && key >= " " && key !== "\x7f") this.filterText += key;
+			this.item = 0;
+			this.scroll = 0;
+			this.tui.requestRender();
+			return;
+		}
 		const page = this.bodyHeight() - 1;
 		const step = matchesKey(key, "up")
 			? -1
@@ -152,13 +190,15 @@ export class ContextOverlay {
 					: matchesKey(key, "pageDown")
 						? page
 						: 0;
-		const close = matchesKey(key, "escape") || key === "q";
+		const escape = matchesKey(key, "escape");
 		if (this.inspect) {
-			if (close || matchesKey(key, "enter") || matchesKey(key, "left")) {
+			if (escape || key === "q" || matchesKey(key, "enter") || matchesKey(key, "left")) {
 				this.scroll = this.inspect.back;
 				this.inspect = undefined;
 			} else this.scroll = Math.max(0, this.scroll + step);
-		} else if (close) {
+		} else if (escape && this.filterText) this.filterText = "";
+		else if (escape && this.back) this.leaveSession();
+		else if (escape || key === "q") {
 			this.close();
 			return;
 		} else if (step) this.move(step);
@@ -166,7 +206,9 @@ export class ContextOverlay {
 		else if (matchesKey(key, "left") || matchesKey(key, "shift+tab")) this.setTab((this.tab + TABS.length - 1) % TABS.length);
 		else if (matchesKey(key, "enter")) {
 			if (this.name === "Trend") this.setTab(TABS.indexOf("Browser"));
+			else if (this.name === "Turns") this.openTurn();
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
+			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
 			else if (this.name === "Settings") {
 				this.close({ setting: SETTINGS[this.item], clear: false });
 				return;
@@ -174,7 +216,9 @@ export class ContextOverlay {
 		} else if (key === "x" && this.name === "Settings") {
 			this.close({ setting: SETTINGS[this.item], clear: true });
 			return;
-		} else if (key === "[") this.selectRequest(this.request - 1);
+		} else if (key === "/" && FILTERED.includes(this.name)) this.typing = true;
+		else if ((key === "d" || key === "u") && (this.name === "Current" || this.name === "Hints")) this.drop(key === "d");
+		else if (key === "[") this.selectRequest(this.request - 1);
 		else if (key === "]") this.selectRequest(this.request + 1);
 		else if (key === "r") {
 			this.reload();
@@ -200,7 +244,8 @@ export class ContextOverlay {
 
 		// When the tab bar is too wide, drop leading tabs until the active one fits.
 		let first = 0;
-		const span = (from: number) => TABS.slice(from, this.tab + 1).join(" │ ").length + (from > 0 ? 2 : 0);
+		const more = this.tab + 1 < TABS.length ? 2 : 0;
+		const span = (from: number) => TABS.slice(from, this.tab + 1).join(" │ ").length + (from > 0 ? 2 : 0) + more;
 		while (first < this.tab && span(first) > inner) first++;
 		// Then drop trailing tabs that do not fit.
 		let end = TABS.length;
@@ -213,12 +258,15 @@ export class ContextOverlay {
 				.join(t.fg("dim", " │ ")) +
 			(end < TABS.length ? t.fg("dim", " …") : "");
 		const position = lines.length > height ? `  ${this.scroll + 1}-${this.scroll + height}/${lines.length}` : "";
-		const hint = (this.live ? t.fg("accent", "● live  ") : "") + t.fg("dim", this.hint() + position);
+		const hint = this.notice
+			? t.fg("warning", this.notice)
+			: (this.live ? t.fg("accent", "● live  ") : "") + t.fg("dim", this.hint() + position);
 		const border = (s: string) => t.fg("dim", s);
 		const frame = (line: string) => `${border("│")} ${pad(line, inner)} ${border("│")}`;
-		const title = " Context ";
+		const other = this.data.other?.replace(/\s+/g, " ");
+		const title = other === undefined ? " Context " : ` Context · ${truncateToWidth(other, Math.max(4, width - 30))} (read-only) `;
 		return [
-			border(`╭─${title}${"─".repeat(Math.max(0, width - 3 - title.length))}╮`),
+			border(`╭─${title}${"─".repeat(Math.max(0, width - 3 - visibleWidth(title)))}╮`),
 			frame(this.inspect ? t.bold(t.fg("accent", this.inspect.title)) : tabs),
 			border(`├${"─".repeat(Math.max(0, width - 2))}┤`),
 			...visible.map(frame),
@@ -232,15 +280,23 @@ export class ContextOverlay {
 	}
 
 	private hint(): string {
+		if (this.typing) return `Filter: ${this.filterText}▏  enter keep  esc clear`;
 		if (this.inspect) return "↑/↓ scroll  esc back";
 		const keys: Partial<Record<Tab, string>> = {
-			Current: "↑/↓ select  enter inspect",
+			Current: "↑/↓ select  enter inspect  d drop  u restore  / filter",
+			Hints: "↑/↓ select  d drop  u restore",
+			Turns: "↑/↓ select  enter browse",
 			Trend: "↑/↓ select  enter browse  [ ] request",
-			Browser: "↑/↓ select  enter inspect  [ ] request",
-			Insights: "↑/↓ scroll  p period  a project  s sort",
+			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
+			Files: "↑/↓ scroll  / filter",
+			Commands: "↑/↓ scroll  / filter",
+			Tools: "↑/↓ scroll  / filter",
+			Fleet: "↑/↓ select  enter open",
+			Insights: "↑/↓ select  enter open  p period  a project  s sort  / filter",
 			Settings: "↑/↓ select  enter edit  x clear",
 		};
-		return `←/→ tab  ${keys[this.name] ?? "↑/↓ scroll"}  r refresh  q close`;
+		const filter = this.filterText ? `filter "${this.filterText}" (esc clears)  ` : "";
+		return `${filter}←/→ tab  ${keys[this.name] ?? "↑/↓ scroll"}  r refresh  ${this.back ? "esc back  " : ""}q close`;
 	}
 
 	private close(request?: SettingRequest): void {
@@ -255,7 +311,7 @@ export class ContextOverlay {
 			if (live !== this.live) this.tui.requestRender();
 			this.live = live;
 			if (live) this.stale = true;
-			if (!this.stale || this.inspect || Date.now() < this.nextRefresh) return;
+			if (!this.stale || this.inspect || this.back || Date.now() < this.nextRefresh) return;
 			this.reload();
 			this.stale = live;
 			this.tui.requestRender();
@@ -266,6 +322,8 @@ export class ContextOverlay {
 	}
 
 	private reload(): void {
+		// Another session is shown as it was when it was opened.
+		if (this.back) return;
 		const started = Date.now();
 		const follow = this.request >= this.data.analysis.requests.length - 1;
 		this.data = this.host.collect();
@@ -282,6 +340,8 @@ export class ContextOverlay {
 		this.tab = tab;
 		this.scroll = 0;
 		this.item = 0;
+		this.picks = [];
+		this.filterText = "";
 		if (this.name === "Insights" && !this.summaries) this.readInsights();
 	}
 
@@ -330,9 +390,110 @@ export class ContextOverlay {
 	}
 
 	private move(delta: number): void {
+		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Settings"];
 		if (this.name === "Trend") this.selectRequest(this.request + delta);
-		else if (this.name === "Current" || this.name === "Browser" || this.name === "Settings") this.item = Math.max(0, this.item + delta);
+		else if (listed.includes(this.name)) this.item = Math.max(0, this.item + delta);
+		else if (this.name === "Insights" || this.name === "Fleet") this.pick(delta);
 		else this.scroll = Math.max(0, this.scroll + delta);
+	}
+
+	/**
+	 * Moves in a tab whose list follows other content. The tab scrolls like a page until the selected entry is in view;
+	 * then the selection moves, and the tab scrolls again when the selection is at an end of the list.
+	 */
+	private pick(delta: number): void {
+		const height = this.bodyHeight();
+		const inView = (line: number | undefined) => line !== undefined && line >= this.scroll && line < this.scroll + height;
+		const next = Math.max(0, Math.min(this.picks.length - 1, this.item + delta));
+		if (!inView(this.picks[this.item]?.line) || next === this.item) {
+			this.scroll = Math.max(0, this.scroll + delta);
+			return;
+		}
+		this.item = next;
+		const line = this.picks[next].line;
+		if (line < this.scroll) this.scroll = line;
+		else if (line >= this.scroll + height) this.scroll = line - height + 1;
+	}
+
+	/** Whether the text passes the filter of the tab. */
+	private matches(text: string): boolean {
+		return !this.filterText || text.toLowerCase().includes(this.filterText.toLowerCase());
+	}
+
+	/** Opens the first request of the selected turn in the Browser tab. */
+	private openTurn(): void {
+		const input = this.data.analysis.inputs.at(-1 - this.item);
+		if (!input || input.first < 0) {
+			this.notice = "This input caused no request.";
+			return;
+		}
+		this.selectRequest(input.first);
+		this.setTab(TABS.indexOf("Browser"));
+	}
+
+	/** Shows the session of the selected entry of the Insights or Fleet tab. */
+	private openSession(): void {
+		const pick = this.picks[this.item];
+		if (!pick) return;
+		const height = this.bodyHeight();
+		if (pick.line < this.scroll || pick.line >= this.scroll + height) {
+			// Do not open an entry that the user cannot see.
+			this.scroll = Math.max(0, pick.line - Math.floor(height / 2));
+			this.notice = "The selected entry is now in view. Press enter again to open it.";
+			return;
+		}
+		if (!pick.file) {
+			this.notice = "No saved session is known for this entry.";
+			return;
+		}
+		try {
+			const data = this.host.openSession(pick.file, pick.title);
+			this.back ??= { tab: this.tab, scroll: this.scroll, item: this.item };
+			this.show(data);
+			this.setTab(0);
+		} catch (error) {
+			this.notice = `Could not open the session: ${error instanceof Error ? error.message : error}`;
+		}
+	}
+
+	/** Returns from another session to the current one. */
+	private leaveSession(): void {
+		const back = this.back;
+		if (!back) return;
+		this.back = undefined;
+		this.show(this.host.collect());
+		this.setTab(back.tab);
+		this.scroll = back.scroll;
+		this.item = back.item;
+	}
+
+	private show(data: ViewData): void {
+		this.data = data;
+		this.rebuilt.clear();
+		this.request = data.analysis.requests.length - 1;
+	}
+
+	/** Drops the selected tool result from the context, or restores it. */
+	private drop(dropping: boolean): void {
+		if (this.back) {
+			this.notice = "Another session is read-only.";
+			return;
+		}
+		let ids: string[] = [];
+		if (this.name === "Current") {
+			const row = this.rows[this.item];
+			if (!row?.id) this.notice = "Only tool results can be dropped.";
+			else if (!!row.dropped !== dropping) ids = [row.id];
+		} else {
+			const entry = this.hintList[this.item];
+			if (entry && entry.dropped !== dropping) ids = entry.ids;
+		}
+		if (ids.length === 0) return;
+		this.host.setDropped(ids, dropping);
+		this.reload();
+		this.notice = dropping
+			? "Dropped: from the next request on, the model gets a stub. That request reads less from the prompt cache."
+			: "Restored: the model gets the result again from the next request on.";
 	}
 
 	private rebuiltRows(request: RequestRec): Row[] {
@@ -352,10 +513,7 @@ export class ContextOverlay {
 		const request = this.data.analysis.requests[this.request];
 		if (text === undefined && this.name === "Browser" && request) {
 			// A snapshot keeps no content. Find the item in the context rebuilt from the session.
-			const rebuilt = this.rebuiltRows(request);
-			const same = (other?: Row) => other?.cat === row.cat && other.label === row.label && other.preview === row.preview;
-			const fixed = row.cat === "system" || row.cat === "tools";
-			text = (same(rebuilt[this.item]) ? rebuilt[this.item] : (rebuilt.find(same) ?? (fixed ? rebuilt.find((other) => other.cat === row.cat) : undefined)))?.text;
+			text = textOf(row, this.item, this.rebuiltRows(request));
 		}
 		this.inspect = {
 			title: `${LABELS[row.cat]} · ${row.label}${text === undefined ? "" : ` · ${fmtTokens(text.length)} characters`}`,
@@ -407,7 +565,9 @@ export class ContextOverlay {
 			case "Current":
 				return this.current();
 			case "Hints":
-				return { lines: this.hintsTab() };
+				return this.hintsTab();
+			case "Turns":
+				return this.turns();
 			case "Trend":
 				return this.trend();
 			case "Browser":
@@ -437,11 +597,21 @@ export class ContextOverlay {
 		const overhead = Math.max(0, timing.activeMs - timing.modelMs - timing.toolMs);
 		const share = (ms: number) => `${fmtDuration(ms)} (${fmtPercent(ms, timing.activeMs)})`;
 		const cell = (value: string | number, width: number) => String(value).padStart(width);
-		const window = usage
-			? `  ${bar((usage.percent ?? 0) / 100, 30)} ${fmtTokens(usage.tokens)} / ${fmtTokens(usage.contextWindow)} (${
-					usage.percent == null ? "?" : `${Math.round(usage.percent)}%`
-				})`
-			: "  unknown";
+		const window = !usage
+			? "  unknown"
+			: usage.contextWindow > 0
+				? `  ${bar((usage.percent ?? 0) / 100, 30)} ${fmtTokens(usage.tokens)} / ${fmtTokens(usage.contextWindow)} (${
+						usage.percent == null ? "?" : `${Math.round(usage.percent)}%`
+					})`
+				: `  ${fmtTokens(usage.tokens)} tokens after the last request. The size of the window is not known.`;
+		const billed = analysis.billedRequests
+			? [
+					"",
+					this.head(`Sent over the session, by category (${analysis.billedRequests} of ${analysis.requests.length} requests recorded by pi-context)`),
+					...this.shares(analysis.billed),
+					this.theme.fg("dim", "  Each request sends the whole context again. A category's figure is the sum over the requests."),
+				]
+			: [];
 		return [
 			this.head("Context window"),
 			window,
@@ -462,6 +632,7 @@ export class ContextOverlay {
 				["Cache write", fmtTokens(totals.cacheWrite)],
 				["Output", fmtTokens(totals.output)],
 			]),
+			...billed,
 			"",
 			this.head("Prompt cache"),
 			this.pairs([
@@ -489,14 +660,20 @@ export class ContextOverlay {
 		];
 	}
 
+	/** One line for each category that has tokens: a bar for its share, and its size times `factor`. */
+	private shares(sums: Record<Category, number>, factor = 1): string[] {
+		const total = CATEGORIES.reduce((sum, cat) => sum + sums[cat], 0);
+		return CATEGORIES.filter((cat) => sums[cat] > 0).map(
+			(cat) =>
+				`  ${LABELS[cat].padEnd(17)} ${this.theme.fg("accent", bar(sums[cat] / total, 24))} ≈${fmtTokens(sums[cat] * factor).padStart(6)}  ${fmtPercent(sums[cat], total)}`,
+		);
+	}
+
 	/** Shares of the categories. With `reported`, the provider-reported size, the estimates are scaled to add up to it. */
 	private composition(sums: Record<Category, number>, reported?: number | null): string[] {
 		const total = CATEGORIES.reduce((sum, cat) => sum + sums[cat], 0);
 		const factor = scaleOf(total, reported);
-		const lines = CATEGORIES.filter((cat) => sums[cat] > 0).map(
-			(cat) =>
-				`  ${LABELS[cat].padEnd(17)} ${this.theme.fg("accent", bar(sums[cat] / total, 24))} ≈${fmtTokens(sums[cat] * factor).padStart(6)}  ${fmtPercent(sums[cat], total)}`,
-		);
+		const lines = this.shares(sums, factor);
 		if (factor === 1) {
 			lines.push(
 				`  ${"Estimated total".padEnd(17)} ${" ".repeat(24)} ≈${fmtTokens(total).padStart(6)}`,
@@ -511,13 +688,22 @@ export class ContextOverlay {
 		return lines;
 	}
 
-	/** A selectable list of rows that starts `above` lines into the tab. */
-	private list(rows: Row[], factor: number, above: number): Body {
+	/**
+	 * A selectable list of the rows that pass the filter. It starts `above` lines into the tab.
+	 * `marks` holds one mark for each row: "+" added, "~" changed.
+	 */
+	private list(rows: Row[], factor: number, above: number, marks?: string[]): Body {
 		const t = this.theme;
-		this.rows = rows;
-		this.item = Math.min(this.item, Math.max(0, rows.length - 1));
-		const lines = rows.map((row, i) => {
-			const line = `${t.fg("muted", LABELS[row.cat].padEnd(17))} ≈${fmtTokens(row.tokens * factor).padStart(6)}  ${row.label}: ${t.fg("dim", row.preview)}`;
+		const shown = rows
+			.map((row, i) => ({ row, mark: marks?.[i] }))
+			.filter(({ row }) => this.matches(`${LABELS[row.cat]} ${row.dropped ? "dropped " : ""}${row.label} ${row.preview}`));
+		this.rows = shown.map(({ row }) => row);
+		this.item = Math.min(this.item, Math.max(0, shown.length - 1));
+		if (shown.length === 0) return { lines: [rows.length > 0 ? "  No item matches the filter." : "  None."] };
+		const lines = shown.map(({ row, mark }, i) => {
+			const change = mark === undefined ? "" : `${mark === "+" ? t.fg("success", "+") : mark === "~" ? t.fg("warning", "~") : " "} `;
+			const state = row.dropped ? t.fg("warning", "dropped  ") : "";
+			const line = `${change}${t.fg("muted", LABELS[row.cat].padEnd(17))} ≈${fmtTokens(row.tokens * factor).padStart(6)}  ${state}${row.label}: ${t.fg("dim", row.preview)}`;
 			return i === this.item ? `${t.fg("accent", "▶")} ${line}` : `  ${line}`;
 		});
 		// With the first item selected, the tab shows from its top.
@@ -535,25 +721,68 @@ export class ContextOverlay {
 		return { lines: [...top, ...list.lines], cursor: list.cursor };
 	}
 
-	private hintsTab(): string[] {
-		const { hints, factor, usage } = this.data;
-		if (hints.length === 0) {
-			return ["Nothing stands out: no repeated reads, no repeated skill loads, and no large tool results from earlier turns."];
-		}
-		const total = hints.reduce((sum, hint) => sum + hint.tokens, 0) * factor;
-		return [
+	private hintsTab(): Body {
+		const { hints, dropped, factor, usage } = this.data;
+		const t = this.theme;
+		const droppable = hints.filter((hint) => hint.ids?.length);
+		const nested = hints.filter((hint) => hint.kind === "nested");
+		this.hintList = [
+			...droppable.map((hint) => ({ ids: hint.ids ?? [], dropped: false })),
+			...dropped.map((row) => ({ ids: row.id ? [row.id] : [], dropped: true })),
+		];
+		this.item = Math.min(this.item, Math.max(0, this.hintList.length - 1));
+		const size = (tokens: number) => `≈${fmtTokens(tokens * factor).padStart(6)}`;
+		const entry = (index: number, text: string) => (index === this.item ? `${t.fg("accent", "▶")} ${text}` : `  ${text}`);
+		const total = hintTotal(hints) * factor;
+		const lines = [
 			this.head("Could be dropped from the context"),
 			this.pairs([
 				["Tokens", `≈${fmtTokens(total)}`],
 				["Share of the context", usage?.tokens ? fmtPercent(total, usage.tokens) : "?"],
 			]),
-			"",
-			...hints.map(
-				(hint) => `  ≈${fmtTokens(hint.tokens * factor).padStart(6)}  ${hint.label}  ${this.theme.fg("dim", hint.detail)}`,
-			),
-			"",
-			this.theme.fg("dim", "  This list is advice. pi-context does not remove anything from the context."),
+			...droppable.map((hint, i) => entry(i, `${size(hint.tokens)}  ${hint.label}  ${t.fg("dim", hint.detail)}`)),
 		];
+		if (droppable.length === 0) lines.push("  Nothing stands out: no repeated reads, no repeated skill loads, and no large tool results from earlier turns.");
+		if (nested.length > 0) {
+			lines.push(
+				"",
+				this.head("Read more than once inside scripts"),
+				...nested.map((hint) => `  ${hint.tokens ? `up to ${size(hint.tokens)}` : "       size unknown"}  ${hint.label}`),
+				t.fg("dim", "  The sizes are upper bounds and are not in the total: a script may return only part of what it reads."),
+				t.fg("dim", "  These reads are part of the scripts' results and cannot be dropped alone."),
+			);
+		}
+		if (dropped.length > 0) {
+			lines.push("", this.head(`Dropped (${dropped.length})`));
+			dropped.forEach((row, i) => lines.push(entry(droppable.length + i, `${size(row.tokens)}  ${row.label}: ${t.fg("dim", row.preview)}`)));
+		}
+		const selected = this.item < droppable.length ? 2 + this.item : lines.length - dropped.length + this.item - droppable.length;
+		lines.push(
+			"",
+			...wrapped(
+				"d drops the selected item: from the next request on, the model gets a one-line stub in its place. u restores a dropped item. The session file keeps the original.",
+				this.width - 2,
+			).map((line) => t.fg("dim", `  ${line}`)),
+		);
+		return { lines, cursor: this.item === 0 || this.hintList.length === 0 ? 0 : selected };
+	}
+
+	private turns(): Body {
+		const t = this.theme;
+		const inputs = [...this.data.analysis.inputs].reverse();
+		if (inputs.length === 0) return { lines: ["No human inputs yet."] };
+		this.item = Math.min(this.item, inputs.length - 1);
+		const cells = (cells: (string | number)[]) =>
+			[3, 8, 5, 5, 7, 7, 9, 7].map((width, i) => (i === 1 ? String(cells[i]).padEnd(width) : String(cells[i]).padStart(width))).join(" ");
+		const top = [
+			this.head("Human inputs, newest first, and the work each one caused"),
+			t.fg("muted", `   ${cells(["#", "time", "reqs", "tools", "sent", "output", "cost", "took"])}  input`),
+		];
+		const lines = inputs.map((input, i) => {
+			const line = `${cells([input.n, fmtTime(input.time), input.requests, input.toolCalls, fmtTokens(input.sent), fmtTokens(input.output), fmtCost(input.cost), fmtDuration(input.ms)])}  ${t.fg("dim", input.preview)}`;
+			return i === this.item ? `${t.fg("accent", "▶")}  ${line}` : `   ${line}`;
+		});
+		return { lines: [...top, ...lines], cursor: this.item === 0 ? 0 : top.length + this.item };
 	}
 
 	private missText(miss: CacheMiss): string {
@@ -596,14 +825,38 @@ export class ContextOverlay {
 		}
 		const sums = request.rows ? sumByCategory(rows) : (request.sums ?? sumByCategory(rows));
 		const rebuilt = " (rebuilt from the session)";
-		top.push(
-			this.head(`Composition${request.rows || request.sums ? "" : rebuilt}`),
-			...this.composition(sums, request.context),
-			"",
-			this.head(`Assembled from${request.rows ? "" : rebuilt}`),
-		);
-		const list = this.list(rows, scaleOf(sumTokens(rows), request.context), top.length);
-		return { lines: [...top, ...list.lines], cursor: list.cursor };
+		const factor = scaleOf(sumTokens(rows), request.context);
+		const signed = (tokens: number) => `≈${tokens < 0 ? "−" : "+"}${fmtTokens(Math.abs(tokens) * factor)}`;
+		top.push(this.head(`Composition${request.rows || request.sums ? "" : rebuilt}`), ...this.composition(sums, request.context), "");
+		const previous = this.data.analysis.requests[this.request - 1];
+		const diff = previous ? diffRows(previous.rows ?? this.rebuiltRows(previous), rows) : undefined;
+		if (diff) {
+			const count = (mark: string) => diff.marks.filter((m) => m === mark).length;
+			top.push(
+				this.head(`Since request #${previous.n}`),
+				this.pairs([
+					["+ added", count("+")],
+					["~ changed", count("~")],
+					["− removed", diff.removed.length],
+				]),
+				...this.wrap(CATEGORIES.filter((cat) => diff.delta[cat] !== 0).map((cat) => `${this.theme.fg("muted", LABELS[cat])} ${signed(diff.delta[cat])}`)),
+				"",
+			);
+		}
+		top.push(this.head(`Assembled from${request.rows ? "" : rebuilt}`));
+		const list = this.list(rows, factor, top.length, diff?.marks);
+		const removed = diff?.removed ?? [];
+		const gone = removed.length
+			? [
+					"",
+					this.head(`No longer in the request (${removed.length})`),
+					...removed
+						.slice(0, MAX_REMOVED)
+						.map((row) => this.theme.fg("dim", `  − ${LABELS[row.cat].padEnd(17)} ≈${fmtTokens(row.tokens * factor).padStart(6)}  ${row.label}: ${row.preview}`)),
+					...(removed.length > MAX_REMOVED ? [this.theme.fg("dim", `  … and ${removed.length - MAX_REMOVED} more`)] : []),
+				]
+			: [];
+		return { lines: [...top, ...list.lines, ...gone], cursor: list.cursor };
 	}
 
 	private events(): string[] {
@@ -613,14 +866,14 @@ export class ContextOverlay {
 	}
 
 	private files(): string[] {
-		const files = [...this.data.analysis.files].sort(
-			(a, b) => b.reads + b.writes + b.edits - (a.reads + a.writes + a.edits),
-		);
+		const files = this.data.analysis.files
+			.filter((file) => this.matches(file.path))
+			.sort((a, b) => b.reads + b.writes + b.edits - (a.reads + a.writes + a.edits));
 		const unresolved = this.data.analysis.unresolvedEdits;
 		const note = unresolved
 			? [this.theme.fg("dim", `  ${unresolved} anchor-based edits are not listed: they were made before pi-context recorded their file.`)]
 			: [];
-		if (files.length === 0) return ["No file activity yet.", ...note];
+		if (files.length === 0) return [this.filterText ? "No file matches the filter." : "No file activity yet.", ...note];
 		const count = (n: number) => String(n).padStart(5);
 		return [
 			this.head(` ${"read".padStart(6)}${"write".padStart(6)}${"edit".padStart(6)}  path`),
@@ -642,14 +895,18 @@ export class ContextOverlay {
 			`  ${programs.map(([name, n]) => `${name} ×${n}`).join("   ")}`,
 			"",
 			this.head("Executions (newest first)"),
-			...[...commands].reverse().map((c) => `  ${mark(c.ok)} ${fmtTime(c.time)}  ${c.command.replace(/\s+/g, " ")}`),
+			...commands
+				.filter((c) => this.matches(c.command))
+				.reverse()
+				.map((c) => `  ${mark(c.ok)} ${fmtTime(c.time)}  ${c.command.replace(/\s+/g, " ")}`),
 		];
 	}
 
 	private tools(): string[] {
 		const { analysis, declared, factor } = this.data;
-		const { tools, skills } = analysis;
-		if (tools.length === 0) return ["No tool calls yet."];
+		const { skills } = analysis;
+		if (analysis.tools.length === 0) return ["No tool calls yet."];
+		const tools = analysis.tools.filter((tool) => this.matches(tool.name));
 		const flagged = tools.some((tool) => undeclared(tool, declared) > 0);
 		const count = (n: number) => String(n).padStart(7);
 		const size = (tokens: number) => (tokens ? `≈${fmtTokens(tokens * factor)}` : "–").padStart(9);
@@ -659,7 +916,7 @@ export class ContextOverlay {
 		};
 		const lines = [
 			this.head(`${"calls".padStart(9)}${"nested".padStart(8)}${"errors".padStart(8)}${"call".padStart(10)}${"result".padStart(10)}  tool`),
-			...[...tools]
+			...tools
 				.sort((a, b) => b.calls + b.nested - (a.calls + a.nested))
 				.map(
 					(tool) =>
@@ -672,13 +929,13 @@ export class ContextOverlay {
 			this.head("Skills loaded"),
 		];
 		if (skills.length === 0) lines.push("  None.");
-		for (const skill of skills) {
+		for (const skill of skills.filter((skill) => this.matches(skill.name))) {
 			lines.push(`  ${`×${skill.loads}`.padStart(5)} ${size(skill.tokens)}  ${skill.name}  ${this.theme.fg("dim", skill.path)}`);
 		}
 		return lines;
 	}
 
-	private agentLines(agent: AgentRec): string[] {
+	private agentLines(agent: AgentRec, selected: boolean): string[] {
 		const t = this.theme;
 		const mark =
 			agent.status === "running"
@@ -700,7 +957,7 @@ export class ContextOverlay {
 		if (agent.compactions) detail("Compactions", agent.compactions);
 		const indent = agent.parent ? "    " : "  ";
 		const lines = [
-			`${indent}${agent.parent ? "↳ " : ""}${mark} ${t.bold(agent.type)}  ${agent.description}  ${t.fg("dim", agent.id)}`,
+			`${selected ? t.fg("accent", "▶") + indent.slice(1) : indent}${agent.parent ? "↳ " : ""}${mark} ${t.bold(agent.type)}  ${agent.description}  ${t.fg("dim", agent.id)}`,
 			...this.wrap(details, `${indent}  `),
 		];
 		if (agent.error) lines.push(`${indent}  ${t.fg("error", agent.error.replace(/\s+/g, " "))}`);
@@ -724,7 +981,12 @@ export class ContextOverlay {
 		if (parentSession) lines.push(`  ${this.pairs([["Parent session", parentSession]])}`);
 		lines.push("", this.head(`Subagents (${agents.length})`));
 		if (agents.length === 0) lines.push("  None on this branch.");
-		for (const agent of agents) lines.push(...this.agentLines(agent));
+		this.item = Math.min(this.item, Math.max(0, agents.length - 1));
+		this.picks = [];
+		agents.forEach((agent, i) => {
+			this.picks.push({ line: lines.length, file: agent.sessionFile, title: `${agent.type}: ${agent.description}` });
+			lines.push(...this.agentLines(agent, i === this.item));
+		});
 		return lines;
 	}
 
@@ -740,7 +1002,9 @@ export class ContextOverlay {
 		const top = (list: [string, number][]) => this.wrap(list.map(([name, n]) => `${name} ×${n}`));
 		const max = Math.max(...s.week.map((day) => day.tokens), 1);
 		const peak = Math.max(...s.heat.flat(), 1);
-		return [
+		const sessions = s.sessions.filter((session) => this.matches(`${session.cwd} ${session.name}`));
+		this.item = Math.min(this.item, Math.max(0, sessions.length - 1));
+		const lines = [
 			this.head(`Last ${days} days, ${this.projectOnly ? `project ${basename(this.host.cwd)}` : "all projects"}`),
 			this.pairs([
 				["Sessions", s.sessions.length],
@@ -770,6 +1034,13 @@ export class ContextOverlay {
 					`  ${String(requests).padStart(7)} req ${fmtTokens(tokens).padStart(7)}  ${fmtCost(cost).padStart(9)}  ${name}`,
 			),
 			"",
+			this.head("Projects"),
+			...(s.projects.length === 0 ? ["  None."] : []),
+			...s.projects.map(
+				([cwd, count, requests, tokens, cost]) =>
+					`  ${String(count).padStart(4)} sessions ${String(requests).padStart(6)} req ${fmtTokens(tokens).padStart(7)}  ${fmtCost(cost).padStart(9)}  ${cwd}`,
+			),
+			"",
 			this.head("Top tools"),
 			...top(s.tools),
 			this.head("Top programs"),
@@ -778,11 +1049,19 @@ export class ContextOverlay {
 			...top(s.skills),
 			"",
 			this.head(`Sessions (${SORTS[this.sort][1]})`),
-			...s.sessions.map(
-				(session) =>
-					`  ${fmtDay(session.end).slice(5)} ${fmtTime(session.end).slice(0, 5)}  ${basename(session.cwd).slice(0, 24).padEnd(24)} ${String(session.requests).padStart(5)} req ${fmtTokens(session.tokens).padStart(7)}  ${fmtCost(session.cost).padStart(9)}  ${t.fg("dim", session.name)}`,
-			),
 		];
+		if (sessions.length === 0) lines.push(this.filterText ? "  No session matches the filter." : "  None.");
+		this.picks = sessions.map((session, i) => ({
+			line: lines.length + i,
+			file: session.file,
+			title: session.name || `${basename(session.cwd)} ${fmtDay(session.end)}`,
+		}));
+		sessions.forEach((session, i) =>
+			lines.push(
+				`${i === this.item ? t.fg("accent", "▶") : " "} ${fmtDay(session.end).slice(5)} ${fmtTime(session.end).slice(0, 5)}  ${basename(session.cwd).slice(0, 24).padEnd(24)} ${String(session.requests).padStart(5)} req ${fmtTokens(session.tokens).padStart(7)}  ${fmtCost(session.cost).padStart(9)}  ${t.fg("dim", session.name)}`,
+			),
+		);
+		return lines;
 	}
 
 	private settings(): string[] {
@@ -790,11 +1069,26 @@ export class ContextOverlay {
 		const t = this.theme;
 		const affix = (text?: string) => (text ? `${text.length} characters: ${text.replace(/\s+/g, " ").slice(0, 60)}` : "disabled");
 		const warn = config.warnPercent ?? DEFAULT_WARN_PERCENT;
-		const items = [
+		const items: { name: string; value: string; help: string; text?: string }[] = [
 			{
 				name: "Context warning",
 				value: config.warnPercent === undefined ? `${warn}% (default)` : warn ? `${warn}%` : "disabled",
 				help: "A notification appears when context use rises to this share of the window. Clearing restores the default.",
+			},
+			{
+				name: "Auto-compact",
+				value: config.compactPercent ? `${config.compactPercent}%` : "off",
+				help: "When the agent stops and context use is at this share of the window or above, pi-context starts pi's compaction. Clearing turns it off.",
+			},
+			{
+				name: "Cost budget",
+				value: config.budget ? fmtCost(config.budget) : "none",
+				help: "A warning appears once when the cost of the session reaches this amount, and the footer shows the cost. Clearing removes the budget.",
+			},
+			{
+				name: "Footer",
+				value: `${footerItems(config).join(", ")}${config.footer ? "" : " (default)"}`,
+				help: "What the footer shows, in order: context (context use), cost (session cost), cache (share of the sent tokens read from the prompt cache), ttl (estimated time until the prompt cache expires). Clearing restores the default.",
 			},
 			{
 				name: "System prompt prefix",
