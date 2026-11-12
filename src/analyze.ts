@@ -39,6 +39,8 @@ export interface Row {
 	id?: string;
 	/** The user dropped this tool result: the model gets a stub in its place. */
 	dropped?: boolean;
+	/** When the message of the row was created, in ms. The system prompt and the tool schemas have none. */
+	time?: number;
 }
 
 /** How the rows of a request differ from those of the request before it. */
@@ -49,6 +51,8 @@ export interface RowDiff {
 	removed: Row[];
 	/** Change of the estimated size of each category. */
 	delta: Record<Category, number>;
+	/** Change of the number of rows of each category. */
+	items: Record<Category, number>;
 }
 
 /** A request that read little of the previous request from the cache, so the provider billed that part again. */
@@ -341,11 +345,14 @@ export const sumTokens = (rows: Row[]) => rows.reduce((total, row) => total + ro
  */
 export function rowsOf(messages: any[], declared?: Record<string, number>, hidden: string[] = [], full = false): Row[] {
 	const rows: Row[] = [];
+	/** Time of the message being read. */
+	let time: number | undefined;
 	const push = (cat: Category, chars: number, label: string, text: string, content = text, id?: string) => {
 		if (chars <= 0) return;
 		const row: Row = { cat, tokens: estimate(chars), label, preview: text.slice(0, 640).replace(/\s+/g, " ").trim().slice(0, 160) };
 		if (full) row.text = content;
 		if (id) row.id = id;
+		if (time !== undefined) row.time = time;
 		rows.push(row);
 	};
 	// System messages replay in order: later ones append text, and replace or remove sections.
@@ -355,6 +362,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 	let systemText = "";
 	let headAt = -1;
 	for (const m of messages) {
+		time = typeof m?.timestamp === "number" ? m.timestamp : undefined;
 		switch (m?.role) {
 			case "system":
 				systemChars += contentChars(m.content);
@@ -414,6 +422,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 	const sectionChars = [...sections.values()].reduce((total, text) => total + text.length, 0);
 	const schemaChars = [...schemas.values()].reduce((total, size) => total + size, 0);
 	const tail = rows.splice(Math.max(0, headAt));
+	time = undefined;
 	push(
 		"system",
 		systemChars + sectionChars,
@@ -474,7 +483,37 @@ export function diffRows(previous: Row[], rows: Row[]): RowDiff {
 	const before = sumByCategory(previous);
 	const delta = sumByCategory(rows);
 	for (const cat of CATEGORIES) delta[cat] -= before[cat];
-	return { marks, removed: [...left.values()].flat(), delta };
+	const items = emptySums();
+	for (const row of rows) items[row.cat]++;
+	for (const row of previous) items[row.cat]--;
+	return { marks, removed: [...left.values()].flat(), delta, items };
+}
+
+/**
+ * Number of the first request that carried the row: the first one made after the message of the row was created.
+ * Undefined when the row has no time, or no request was made since.
+ */
+export function introducedAt(row: Row, requests: RequestRec[]): number | undefined {
+	const time = row.time;
+	return time === undefined ? undefined : requests.find((request) => request.time > time)?.n;
+}
+
+/**
+ * The rows as a strip of `width` cells in reading order: each cell has the category of the row at its middle.
+ * A row smaller than a cell can be left out. Empty when the rows have no tokens.
+ */
+export function bands(rows: Row[], width: number): Category[] {
+	const total = sumTokens(rows);
+	if (total <= 0) return [];
+	const cells: Category[] = [];
+	let index = 0;
+	let end = rows[0].tokens;
+	for (let cell = 0; cell < width; cell++) {
+		const middle = ((cell + 0.5) / width) * total;
+		while (end <= middle && index < rows.length - 1) end += rows[++index].tokens;
+		cells.push(rows[index].cat);
+	}
+	return cells;
 }
 
 /** Program a shell command runs: the first one that is not `cd`, ignoring env assignments, sudo and directories. */

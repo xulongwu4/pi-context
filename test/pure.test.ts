@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	analyze,
+	bands,
 	cacheStats,
 	declaredTools,
 	diffRows,
+	introducedAt,
 	programOf,
 	recordedDeclarations,
 	rowsOf,
@@ -740,4 +742,33 @@ test("the exports cover turns, dropped results and projects", () => {
 	expect(json.requests).toHaveLength(2);
 	expect(json.current.length).toBeGreaterThan(0);
 	expect(JSON.stringify(json.current)).not.toContain('"text"');
+});
+
+test("rowsOf keeps the time of each message, and introducedAt names the first request that carried a row", () => {
+	const rows = rowsOf([
+		{ role: "system", content: "s".repeat(40) },
+		{ role: "user", content: "go", timestamp: 1000 },
+		{ role: "assistant", timestamp: 2000, content: [{ type: "text", text: "ok" }, { type: "toolCall", id: "c1", name: "bash", arguments: {} }] },
+		{ role: "toolResult", toolCallId: "c1", toolName: "bash", content: [{ type: "text", text: "out" }], timestamp: 2500 },
+		{ role: "user", content: "more", timestamp: 9000 },
+	]);
+	expect(rows.map((row) => row.time)).toEqual([undefined, 1000, 2000, 2000, 2500, 9000]);
+	const requests: any[] = [{ n: 1, time: 2000 }, { n: 2, time: 3000 }];
+	// An answer is first sent by the request after the one that produced it.
+	expect(rows.map((row) => introducedAt(row, requests))).toEqual([undefined, 1, 2, 2, 2, undefined]);
+});
+
+test("diffRows counts the items each category gained or lost", () => {
+	const row = (cat: any, label: string) => ({ cat, tokens: 5, label, preview: label });
+	const diff = diffRows([row("user", "a"), row("answers", "b"), row("answers", "c")], [row("user", "a"), row("user", "d"), row("toolCalls", "e")]);
+	expect(diff.items).toMatchObject({ user: 1, answers: -2, toolCalls: 1, system: 0 });
+});
+
+test("bands maps the reading order to cells in proportion to the tokens", () => {
+	const row = (cat: any, tokens: number) => ({ cat, tokens, label: cat, preview: "" });
+	expect(bands([row("system", 50), row("user", 25), row("answers", 25)], 8)).toEqual(["system", "system", "system", "system", "user", "user", "answers", "answers"]);
+	// An item smaller than a cell can be hidden; the cells always cover the whole width.
+	expect(bands([row("system", 1), row("user", 99)], 4)).toEqual(["user", "user", "user", "user"]);
+	expect(bands([], 4)).toEqual([]);
+	expect(bands([row("user", 0)], 4)).toEqual([]);
 });

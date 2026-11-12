@@ -16,11 +16,11 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Tab | Content |
   | --- | --- |
   | Stats | Context window use, human inputs, requests, tool calls, cost, token totals, the tokens sent over the session by category, prompt cache use, requests and cost per model, timing |
-  | Current | Composition of the current context by category, and its items, largest first |
+  | Current | Composition of the current context by category, a strip of its items in reading order, and the items, largest first or in reading order |
   | Hints | What could be dropped from the context, the tokens that would free, and what was dropped |
   | Turns | One row per human input: its requests, tool calls, tokens, cost and duration |
   | Trend | Tokens sent by each request, the share read from the prompt cache, and cache misses |
-  | Browser | What one request was assembled from, and what changed since the request before it |
+  | Browser | What one request was assembled from, in reading order, and what changed since the request before it: items added, changed and removed, and the items and tokens each category gained or lost |
   | Events | Compactions, model switches, thinking level changes, branch summaries |
   | Files | Reads, writes and edits per file |
   | Commands | Shell commands, their result, and the programs they ran |
@@ -36,6 +36,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Turns | `enter` opens the first request of the selected input in Browser |
   | Trend | `enter` opens the selected request in Browser |
   | Current, Browser | `enter` shows the whole content of the selected item; `esc` goes back |
+  | Current | `o` switches the list between largest first and reading order |
   | Current, Hints | `d` drops the selected tool result from the context, `u` restores it |
   | Current, Browser, Files, Commands, Tools, Insights | `/` starts a filter: type text, `enter` keeps it, `esc` clears it. Only lines that contain the text stay |
   | Insights | `p` changes the period, `a` switches between all projects and the current one, `s` changes the order of the sessions, `enter` opens the selected session |
@@ -47,6 +48,8 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   A session opened from Insights or Fleet is read-only and shows the branch that ends at the last entry of its file. `esc` returns to the current session.
 
   In Insights and Fleet, `↑`/`↓` scroll the tab until the selected entry is in view, and then move the selection.
+
+  In Current and Browser, the strip shows the prompt from its first token to its last, colored by category, and `▲` marks the selected item. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 
 - Dropping tool results: `d` in Current or Hints replaces a tool result with a one-line stub in every later request. The session file keeps the original, and `u` restores it. The request after a change reads less from the prompt cache, because the context differs from the dropped result on.
 - Footer indicator: `ctx 42% 84.2k/200.0k`. It updates after each turn. `/context footer <items>` chooses what it shows, from `context`, `cost` (session cost), `cache` (share of the sent tokens read from the prompt cache) and `ttl` (estimated time until the prompt cache expires). Example: `/context footer context cost ttl`.
@@ -63,7 +66,8 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 
 - The Context page shows the current session in cards: Context Stats, Token Stats, Timing Stats, Current Context, Context Browser, Context Trend, Hints, Turns, Context Events, File Activity, Command Executions, and Tools, Skills and Models.
 - In Context Trend, each bar is one request, split by category. Click a bar to open the request in the Context Browser. `✂` marks the first request after a compaction, `!` a cache miss.
-- In the Context Browser, click a category to list its items and an item to show its whole content. The select and the `‹` `›` buttons change the request. A request shows what was added (`+`) or changed (`~`) since the request before it.
+- In the Context Browser, click a category to list its items and an item to show its whole content. The select and the `‹` `›` buttons change the request. A request shows what was added (`+`) or changed (`~`) since the request before it, and the items and tokens each category gained or lost.
+- The strip in the Context Browser has one band per item, in reading order. Click a band to show its item. `One list, in reading order` lists the items of all categories together. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 - `Drop` and `Restore` on a tool result, in the Context Browser or in Hints, do what `d` and `u` do in the overlay.
 - The Settings card changes the context warning, auto-compact, the cost budget, the footer, and the system prompt prefix and suffix. An empty number restores the default.
 - The Insights page shows the last 7, 30 or 90 days over all projects or the current one. Click a session to open its Context page. A saved session is read-only.
@@ -100,6 +104,7 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - In the web page, a grey bar in Context Trend is a request without a turn record: its split by category is not known. The Context Browser rebuilds such a request from the session when you open it.
 - Requests, events, file activity, commands and tool counts come from the session branch, so they cover a resumed session.
 - Timing and the recorded composition cover the turns that ran while the extension was loaded. For other requests, Browser rebuilds the composition from the session and says so. A rebuilt composition does not show changes that other extensions made to the context before the request was sent.
+- The first request that carried an item is the first request made after the message of the item was created. The system prompt and the tool schemas have no such time and show none. An item that no request has carried yet shows none either. In the overlay, the strip does not show an item smaller than one cell.
 - File activity counts tool calls named `read` or `write`, or matching `edit|replace|insert|patch`. Edit tools that address lines by anchor name the file only in their result, so their file is known only for turns that ran while the extension was loaded. The Files tab says how many such edits it cannot list.
 - The Tools tab marks a tool with `!` when the model called it directly although it is not declared to the model. This happens in codemode `only` mode: a hidden tool stays active, so a direct call by name still runs. Each call is judged by the declarations the extension recorded for the request that made it. Calls made before the first record are judged by the tools declared now.
 - Calls nested in another tool's result, for example from a script, are counted. Their tokens belong to the tool that made them. The size of a skill loaded by a nested call is the current size of its file.

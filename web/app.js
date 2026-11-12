@@ -240,11 +240,18 @@ function trendCard(d) {
 	return `<div class="trend"><div class="axis"><span>${tok(max)}</span><span>0</span></div><div class="cols" data-keep="trend">${requests.map(column).join("")}</div></div><div class="pills">${key}</div><p class="muted">${note}</p>`;
 }
 
-function itemHtml({ row, i, mark }, factor, canDrop) {
+/** Number of the first request that carried the row: the first one made after the message of the row was created. */
+const firstRequest = (row) => (row.time == null ? undefined : state.data.requests.find((request) => request.time > row.time)?.n);
+
+/** One item of the context. With `flat`, the item is in a list of all categories and shows its category. */
+function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const key = keyOf(row);
 	const open = state.openItems.has(key);
 	const button = canDrop && row.id ? dropButton([row.id], !row.dropped) : "";
-	const line = `<div class="item${row.dropped ? " dropped" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
+	const from = firstRequest(row);
+	const first = from == null ? "" : `<span class="from" title="Request #${from} was the first to carry this item">@${from}</span>`;
+	const category = flat ? `<i class="dot" style="background:${COLORS[row.cat]}" title="${esc(labels[row.cat])}"></i>` : "";
+	const line = `<div class="item${row.dropped ? " dropped" : ""}${flat ? " flat" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="pos" title="Position in the prompt">#${i + 1}</span>${category}<span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${first}${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
 	return open ? `${line}<pre>${esc(state.texts.get(key) ?? "Loading…")}</pre>` : line;
 }
 
@@ -275,11 +282,34 @@ function browserCard(d) {
 		head.push(`<p class="muted">${d.readOnly ? "The context after the last request." : "What the next request is assembled from."}</p>`);
 	}
 	const needle = $("filter").value.trim().toLowerCase();
-	const bySize = $("order").value === "size";
-	const items = view.rows
-		.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" }))
-		.filter(({ row }) => !needle || `${row.label} ${row.preview}`.toLowerCase().includes(needle));
+	const order = $("order").value;
+	const bySize = order === "size";
+	const passes = (row) => !needle || `${row.label} ${row.preview}`.toLowerCase().includes(needle);
+	const items = view.rows.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" })).filter(({ row }) => passes(row));
 	const all = totalOf(sumBy(view.rows));
+	const canDrop = !request && !d.readOnly;
+	// One band for each item, in reading order. Its width is the share of the item.
+	const band = (row, i) =>
+		`<i${passes(row) ? "" : ' class="off"'} data-act="band" data-i="${i}" style="flex-grow:${row.tokens};background:${COLORS[row.cat]}" title="#${i + 1} ${esc(labels[row.cat])} · ${esc(row.label)} · ≈${tok(row.tokens * view.factor)}"></i>`;
+	if (all > 0) head.push(`<div class="strip">${view.rows.map(band).join("")}</div>`);
+	// What the category gained or lost since the request before.
+	const badge = (cat) => {
+		const change = view.delta?.[cat] ?? 0;
+		const count = view.items?.[cat] ?? 0;
+		if (!change && !count) return "";
+		const size = change ? `≈${change > 0 ? "+" : "−"}${tok(Math.abs(change) * view.factor)}` : "";
+		const number = count ? `${count > 0 ? "+" : "−"}${Math.abs(count)} ${Math.abs(count) === 1 ? "item" : "items"} ` : "";
+		return `<span class="${change > 0 || (!change && count > 0) ? "warn" : "good"}">${number}${size}</span>`;
+	};
+	const gone = (row) =>
+		`<div class="item"><span class="mark bad">−</span><span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span><span class="tok">≈${tok(row.tokens * view.factor)}</span></div>`;
+	const removed = view.removed?.length ? `<h3>No longer in the request (${view.removed.length})</h3>${view.removed.slice(0, MAX_LIST).map(gone).join("")}` : "";
+	if (order === "flat") {
+		const badges = CATS.filter(badge).map((cat) => `<span class="pill"><i class="dot" style="background:${COLORS[cat]}"></i> ${esc(labels[cat])} ${badge(cat)}</span>`);
+		if (badges.length > 0) head.push(`<div class="pills">${badges.join("")}</div>`);
+		const list = items.map((item) => itemHtml(item, view.factor, canDrop, true)).join("");
+		return head.join("") + (list || `<p class="muted">Nothing matches.</p>`) + removed;
+	}
 	const groups = CATS.map((cat) => {
 		const own = items.filter((item) => item.row.cat === cat);
 		if (own.length === 0) return "";
@@ -287,14 +317,10 @@ function browserCard(d) {
 		const tokens = own.reduce((sum, item) => sum + item.row.tokens, 0);
 		// A filter shows what it found.
 		const open = needle ? true : state.openCats.has(cat);
-		const change = view.delta?.[cat] ?? 0;
-		const delta = change ? `<span class="${change > 0 ? "warn" : "good"}">≈${change > 0 ? "+" : "−"}${tok(Math.abs(change) * view.factor)}</span>` : "";
+		const delta = badge(cat);
 		const title = `<div class="cat" data-act="cat" data-cat="${cat}"><span>${open ? "▾" : "▸"}</span><i class="dot" style="background:${COLORS[cat]}"></i><b>${esc(labels[cat])} <small>${own.length} items</small></b>${delta}<span class="tok">≈${tok(tokens * view.factor)}</span><span class="share">${pct(tokens, all)}</span></div>`;
-		return open ? title + own.map((item) => itemHtml(item, view.factor, !request && !d.readOnly)).join("") : title;
+		return open ? title + own.map((item) => itemHtml(item, view.factor, canDrop)).join("") : title;
 	});
-	const gone = (row) =>
-		`<div class="item"><span class="mark bad">−</span><span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span><span class="tok">≈${tok(row.tokens * view.factor)}</span></div>`;
-	const removed = view.removed?.length ? `<h3>No longer in the request (${view.removed.length})</h3>${view.removed.slice(0, MAX_LIST).map(gone).join("")}` : "";
 	return head.join("") + (groups.join("") || `<p class="muted">Nothing matches.</p>`) + removed;
 }
 
@@ -606,6 +632,16 @@ const actions = {
 	},
 	cat: (el) => toggle(state.openCats, el.dataset.cat),
 	item: (el) => openItem(Number(el.dataset.i)),
+	/** Shows the item of a band of the strip: opens its category and its content, and scrolls to it. */
+	band(el) {
+		const i = Number(el.dataset.i);
+		const row = (state.request == null ? state.data.current : state.view?.rows)?.[i];
+		if (!row) return;
+		state.openCats.add(row.cat);
+		if (state.openItems.has(keyOf(row))) render();
+		else openItem(i);
+		document.querySelector(`#browser .item[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
+	},
 	async drop(el) {
 		try {
 			await api("drop", {}, { ids: JSON.parse(el.dataset.ids), dropped: el.dataset.dropped === "1" });

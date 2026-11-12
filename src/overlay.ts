@@ -3,11 +3,13 @@ import { matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi }
 import { basename } from "node:path";
 import {
 	type AgentRec,
+	bands,
 	type CacheMiss,
 	cacheStats,
 	CATEGORIES,
 	type Category,
 	diffRows,
+	introducedAt,
 	LABELS,
 	type RequestRec,
 	type Row,
@@ -58,6 +60,18 @@ const REFRESH_MS = 1000;
 const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Insights"];
 /** Removed items that the Browser tab lists at most. */
 const MAX_REMOVED = 30;
+/** Color of each category in the strip of the reading order. */
+const COLORS: Record<Category, Parameters<Theme["fg"]>[0]> = {
+	system: "syntaxKeyword",
+	tools: "syntaxType",
+	user: "success",
+	injected: "warning",
+	skills: "syntaxNumber",
+	toolCalls: "syntaxFunction",
+	toolResults: "accent",
+	reasoning: "thinkingText",
+	answers: "text",
+};
 
 /** What the overlay needs from the extension. */
 export interface OverlayHost {
@@ -127,6 +141,10 @@ export class ContextOverlay {
 	private back?: { tab: number; scroll: number; item: number };
 	/** Rows of the list in the Current or Browser tab, as of the last render. */
 	private rows: Row[] = [];
+	/** Position in the prompt of each of \`rows\`. */
+	private positions: number[] = [];
+	/** The Current tab lists the items in reading order, not largest first. */
+	private ordered = false;
 	/** Compositions rebuilt from the session, by request number. */
 	private rebuilt = new Map<number, Row[]>();
 	/** The item being inspected. `back` is the scroll position to return to. */
@@ -218,6 +236,11 @@ export class ContextOverlay {
 			return;
 		} else if (key === "/" && FILTERED.includes(this.name)) this.typing = true;
 		else if ((key === "d" || key === "u") && (this.name === "Current" || this.name === "Hints")) this.drop(key === "d");
+		else if (key === "o" && this.name === "Current") {
+			this.ordered = !this.ordered;
+			this.item = 0;
+			this.scroll = 0;
+		}
 		else if (key === "[") this.selectRequest(this.request - 1);
 		else if (key === "]") this.selectRequest(this.request + 1);
 		else if (key === "r") {
@@ -283,7 +306,7 @@ export class ContextOverlay {
 		if (this.typing) return `Filter: ${this.filterText}▏  enter keep  esc clear`;
 		if (this.inspect) return "↑/↓ scroll  esc back";
 		const keys: Partial<Record<Tab, string>> = {
-			Current: "↑/↓ select  enter inspect  d drop  u restore  / filter",
+			Current: "↑/↓ select  enter inspect  o order  d drop  u restore  / filter",
 			Hints: "↑/↓ select  d drop  u restore",
 			Turns: "↑/↓ select  enter browse",
 			Trend: "↑/↓ select  enter browse  [ ] request",
@@ -513,7 +536,7 @@ export class ContextOverlay {
 		const request = this.data.analysis.requests[this.request];
 		if (text === undefined && this.name === "Browser" && request) {
 			// A snapshot keeps no content. Find the item in the context rebuilt from the session.
-			text = textOf(row, this.item, this.rebuiltRows(request));
+			text = textOf(row, this.positions[this.item], this.rebuiltRows(request));
 		}
 		this.inspect = {
 			title: `${LABELS[row.cat]} · ${row.label}${text === undefined ? "" : ` · ${fmtTokens(text.length)} characters`}`,
@@ -689,36 +712,79 @@ export class ContextOverlay {
 	}
 
 	/**
-	 * A selectable list of the rows that pass the filter. It starts `above` lines into the tab.
-	 * `marks` holds one mark for each row: "+" added, "~" changed.
+	 * A section with the rows as one strip in reading order and a legend. Each cell has the color of the category at that place of the prompt.
+	 * A mark under the strip shows where the row at position `selected` is.
 	 */
-	private list(rows: Row[], factor: number, above: number, marks?: string[]): Body {
+	private strip(rows: Row[], selected?: number): string[] {
 		const t = this.theme;
+		const width = Math.max(1, this.width - 2);
+		const cells = bands(rows, width);
+		if (cells.length === 0) return [];
+		let mark = "";
+		if (selected !== undefined && rows[selected]) {
+			const middle = sumTokens(rows.slice(0, selected)) + rows[selected].tokens / 2;
+			mark = " ".repeat(Math.min(width - 1, Math.floor((middle / sumTokens(rows)) * width))) + t.fg("accent", "▲");
+		}
+		const present = new Set(rows.map((row) => row.cat));
+		return [
+			this.head("Reading order"),
+			`  ${cells.map((cat) => t.fg(COLORS[cat], "█")).join("")}`,
+			`  ${mark}`,
+			...this.wrap(CATEGORIES.filter((cat) => present.has(cat)).map((cat) => `${t.fg(COLORS[cat], "█")} ${t.fg("muted", LABELS[cat])}`)),
+			"",
+		];
+	}
+
+	/**
+	 * A selectable list of the rows that pass the filter. It starts `above` lines into the tab.
+	 * `marks` holds one mark for each row: "+" added, "~" changed. `positions` holds the position of each row in the prompt;
+	 * without it the rows are in reading order.
+	 */
+	private list(rows: Row[], factor: number, above: number, marks?: string[], positions?: number[]): Body {
+		const t = this.theme;
+		const requests = this.data.analysis.requests;
 		const shown = rows
-			.map((row, i) => ({ row, mark: marks?.[i] }))
+			.map((row, i) => ({ row, mark: marks?.[i], position: positions?.[i] ?? i, from: introducedAt(row, requests) }))
 			.filter(({ row }) => this.matches(`${LABELS[row.cat]} ${row.dropped ? "dropped " : ""}${row.label} ${row.preview}`));
 		this.rows = shown.map(({ row }) => row);
+		this.positions = shown.map(({ position }) => position);
 		this.item = Math.min(this.item, Math.max(0, shown.length - 1));
 		if (shown.length === 0) return { lines: [rows.length > 0 ? "  No item matches the filter." : "  None."] };
-		const lines = shown.map(({ row, mark }, i) => {
+		const positionWidth = String(rows.length).length + 1;
+		const fromWidth = Math.max(0, ...shown.map(({ from }) => (from === undefined ? 0 : String(from).length + 1)));
+		const lines = shown.map(({ row, mark, position, from }, i) => {
 			const change = mark === undefined ? "" : `${mark === "+" ? t.fg("success", "+") : mark === "~" ? t.fg("warning", "~") : " "} `;
 			const state = row.dropped ? t.fg("warning", "dropped  ") : "";
-			const line = `${change}${t.fg("muted", LABELS[row.cat].padEnd(17))} ≈${fmtTokens(row.tokens * factor).padStart(6)}  ${state}${row.label}: ${t.fg("dim", row.preview)}`;
+			const where = t.fg("dim", `#${position + 1}`.padStart(positionWidth));
+			const first = fromWidth ? ` ${t.fg("dim", (from === undefined ? "" : `@${from}`).padEnd(fromWidth))}` : "";
+			const category = `${t.fg(COLORS[row.cat], "█")} ${t.fg("muted", LABELS[row.cat].padEnd(17))}`;
+			const line = `${change}${where} ${category} ≈${fmtTokens(row.tokens * factor).padStart(6)}${first}  ${state}${row.label}: ${t.fg("dim", row.preview)}`;
 			return i === this.item ? `${t.fg("accent", "▶")} ${line}` : `  ${line}`;
 		});
 		// With the first item selected, the tab shows from its top.
 		return { lines, cursor: this.item === 0 ? 0 : above + this.item };
 	}
 
+	/** Explains the columns that the list of items shows before the content. */
+	private legend(): string {
+		return this.theme.fg("dim", "  # position in the prompt   @ first request that carried the item");
+	}
+
 	private current(): Body {
 		const { current, usage, factor } = this.data;
-		const top = [this.head("Composition"), ...this.composition(sumByCategory(current), usage?.tokens), "", this.head("Items, largest first")];
+		const top = [this.head("Composition"), ...this.composition(sumByCategory(current), usage?.tokens), ""];
+		// The strip marks the selected item, which is known only after the list is built.
+		const strip = (selected?: number) => [...this.strip(current, selected), this.head(this.ordered ? "Items in reading order" : "Items, largest first"), this.legend()];
+		const order = current.map((_, i) => i);
+		if (!this.ordered) order.sort((a, b) => current[b].tokens - current[a].tokens);
 		const list = this.list(
-			[...current].sort((a, b) => b.tokens - a.tokens),
+			order.map((i) => current[i]),
 			factor,
-			top.length,
+			top.length + strip().length,
+			undefined,
+			order,
 		);
-		return { lines: [...top, ...list.lines], cursor: list.cursor };
+		return { lines: [...top, ...strip(this.positions[this.item]), ...list.lines], cursor: list.cursor };
 	}
 
 	private hintsTab(): Body {
@@ -839,12 +905,20 @@ export class ContextOverlay {
 					["~ changed", count("~")],
 					["− removed", diff.removed.length],
 				]),
-				...this.wrap(CATEGORIES.filter((cat) => diff.delta[cat] !== 0).map((cat) => `${this.theme.fg("muted", LABELS[cat])} ${signed(diff.delta[cat])}`)),
+				...this.wrap(
+					CATEGORIES.filter((cat) => diff.delta[cat] !== 0 || diff.items[cat] !== 0).map((cat) => {
+						const items = diff.items[cat];
+						const count = items ? ` ${items < 0 ? "−" : "+"}${Math.abs(items)} ${Math.abs(items) === 1 ? "item" : "items"}` : "";
+						return `${this.theme.fg("muted", LABELS[cat])}${count} ${signed(diff.delta[cat])}`;
+					}),
+				),
 				"",
 			);
 		}
-		top.push(this.head(`Assembled from${request.rows ? "" : rebuilt}`));
-		const list = this.list(rows, factor, top.length, diff?.marks);
+		const strip = (selected?: number) => [...this.strip(rows, selected), this.head(`Assembled from${request.rows ? "" : rebuilt}`), this.legend()];
+		const above = top.length + strip().length;
+		const list = this.list(rows, factor, above, diff?.marks);
+		top.push(...strip(this.positions[this.item]));
 		const removed = diff?.removed ?? [];
 		const gone = removed.length
 			? [

@@ -159,6 +159,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				marks: diff?.marks,
 				removed: diff?.removed.map(strip),
 				delta: diff?.delta,
+				items: diff?.items,
 			};
 		},
 		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. */

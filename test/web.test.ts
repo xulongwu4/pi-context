@@ -128,6 +128,7 @@ test("web shows what a request was assembled from and what changed since the req
 	expect(body.rows.map((row: any) => row.cat)).toEqual(["user", "toolCalls", "toolResults"]);
 	expect(body.marks).toEqual(["", "+", "+"]);
 	expect(body.removed).toEqual([]);
+	expect(body.items).toMatchObject({ user: 0, toolCalls: 1, toolResults: 1 });
 	expect(body.factor).toBeGreaterThan(1);
 	expect((await get("text", { n: 2, i: 2 })).body.text).toBe("a.txt\nb.txt");
 	expect((await get("request", { n: 1 })).body.marks).toBeUndefined();
