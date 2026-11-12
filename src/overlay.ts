@@ -24,7 +24,7 @@ import { DEFAULT_WARN_PERCENT } from "./config.ts";
 import { footerItems } from "./footer.ts";
 import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
 import { hintTotal } from "./hints.ts";
-import { aggregate, type Insights, type SessionSort, type SessionSummary } from "./insights.ts";
+import { aggregate, calendar, type Insights, type SessionSort, type SessionSummary } from "./insights.ts";
 
 const TABS = [
 	"Stats",
@@ -44,8 +44,9 @@ const TABS = [
 export type Tab = (typeof TABS)[number];
 const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 const SHADES = "░▒▓█";
-/** Periods of the Insights tab, in days. */
-const PERIODS = [7, 30, 90];
+/** Periods of the Insights tab, in days. The last one has no start. */
+const PERIODS = [7, 30, 90, Number.POSITIVE_INFINITY];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const SORTS: [SessionSort, string][] = [
 	["recent", "newest first"],
 	["cost", "by cost"],
@@ -154,6 +155,8 @@ export class ContextOverlay {
 	private loadedDays = 0;
 	private insights?: Insights;
 	private period = 1;
+	/** The day that the Insights tab is narrowed to. */
+	private day?: string;
 	private projectOnly = false;
 	private sort = 0;
 	private loading = false;
@@ -241,6 +244,7 @@ export class ContextOverlay {
 			this.item = 0;
 			this.scroll = 0;
 		}
+		else if ((key === "[" || key === "]") && this.name === "Insights") this.stepDay(key === "[" ? -1 : 1);
 		else if (key === "[") this.selectRequest(this.request - 1);
 		else if (key === "]") this.selectRequest(this.request + 1);
 		else if (key === "r") {
@@ -315,7 +319,7 @@ export class ContextOverlay {
 			Commands: "↑/↓ scroll  / filter",
 			Tools: "↑/↓ scroll  / filter",
 			Fleet: "↑/↓ select  enter open",
-			Insights: "↑/↓ select  enter open  p period  a project  s sort  / filter",
+			Insights: "↑/↓ select  enter open  p period  [ ] day  a project  s sort  / filter",
 			Settings: "↑/↓ select  enter edit  x clear",
 		};
 		const filter = this.filterText ? `filter "${this.filterText}" (esc clears)  ` : "";
@@ -398,12 +402,66 @@ export class ContextOverlay {
 
 	/** Handles the keys that change what the Insights tab covers. */
 	private filter(key: string): void {
-		if (key === "p") this.period = (this.period + 1) % PERIODS.length;
-		else if (key === "a") this.projectOnly = !this.projectOnly;
+		if (key === "p") {
+			this.period = (this.period + 1) % PERIODS.length;
+			this.day = undefined;
+		} else if (key === "a") this.projectOnly = !this.projectOnly;
 		else if (key === "s") this.sort = (this.sort + 1) % SORTS.length;
 		else return;
 		this.insights = undefined;
 		if (PERIODS[this.period] > this.loadedDays) this.readInsights();
+	}
+
+	/**
+	 * Narrows the Insights tab to the day before or after the selected one. Without a selected day, it selects today.
+	 * A step past today returns to the whole period.
+	 */
+	private stepDay(delta: number): void {
+		const days = this.insights?.daily ?? [];
+		if (days.length === 0) return;
+		const index = days.findIndex((stat) => stat.day === this.day);
+		const next = index < 0 ? days.length - 1 : index + delta;
+		this.day = next >= days.length ? undefined : days[Math.max(0, next)].day;
+		this.insights = undefined;
+		this.item = 0;
+	}
+
+	/** The days of the period as a calendar: one column per week, shaded by the tokens of the day. */
+	private days(s: Insights): string[] {
+		const t = this.theme;
+		const rows = calendar(s.daily);
+		// Show the most recent weeks that fit.
+		const weeks = Math.min(rows[0].length, Math.max(1, Math.floor((this.width - 6) / 2)));
+		const shown = rows.map((row) => row.slice(-weeks));
+		const peak = Math.max(...s.daily.map((stat) => stat.tokens), 1);
+		// Name a month above the first week that starts in it.
+		const months = new Array<string>(weeks * 2).fill(" ");
+		let last = "";
+		for (let week = 0; week < weeks; week++) {
+			const month = shown.map((row) => row[week]).find((stat) => stat)?.day.slice(5, 7) ?? last;
+			if (month !== last && week * 2 + 3 <= months.length) months.splice(week * 2, 3, ...MONTHS[Number(month) - 1]);
+			last = month;
+		}
+		const cell = (stat?: { day: string; tokens: number }) =>
+			!stat
+				? "  "
+				: stat.day === s.day
+					? t.bold(t.fg("warning", "[]"))
+					: stat.tokens
+						? t.fg("accent", SHADES[Math.min(3, Math.floor((stat.tokens / peak) * 4))].repeat(2))
+						: t.fg("dim", "· ");
+		const chosen = s.daily.find((stat) => stat.day === s.day);
+		const hidden = rows[0].length - weeks;
+		return [
+			t.fg("muted", `      ${months.join("")}`.trimEnd()),
+			...shown.map((row, i) => `  ${WEEKDAYS[i]} ${row.map(cell).join("")}`),
+			t.fg(
+				"dim",
+				chosen
+					? `  [] ${chosen.day}: ${chosen.requests} requests, ${fmtTokens(chosen.tokens)} tokens, ${fmtCost(chosen.cost)}. [ ] change the day; ] on today shows the whole period.`
+					: `  Shaded by the tokens of the day. [ selects today, then [ ] change the day.${hidden > 0 ? ` ${hidden} earlier weeks do not fit.` : ""}`,
+			),
+		];
 	}
 
 	private selectRequest(index: number): void {
@@ -1071,22 +1129,30 @@ export class ContextOverlay {
 		this.insights ??= aggregate(this.summaries, Date.now(), days, {
 			cwd: this.projectOnly ? this.host.cwd : undefined,
 			sort: SORTS[this.sort][0],
+			day: this.day,
 		});
 		const s = this.insights;
+		const period = Number.isFinite(days) ? `Last ${days} days` : "All time";
+		const [year, month, date] = (s.day ?? "").split("-").map(Number);
+		const span = s.day ? `${s.day} (${WEEKDAYS[(new Date(year, month - 1, date).getDay() + 6) % 7]}) of ${period.toLowerCase()}` : period;
+		const recorded = s.composition.requests;
 		const top = (list: [string, number][]) => this.wrap(list.map(([name, n]) => `${name} ×${n}`));
 		const max = Math.max(...s.week.map((day) => day.tokens), 1);
 		const peak = Math.max(...s.heat.flat(), 1);
 		const sessions = s.sessions.filter((session) => this.matches(`${session.cwd} ${session.name}`));
 		this.item = Math.min(this.item, Math.max(0, sessions.length - 1));
 		const lines = [
-			this.head(`Last ${days} days, ${this.projectOnly ? `project ${basename(this.host.cwd)}` : "all projects"}`),
+			this.head(`${span}, ${this.projectOnly ? `project ${basename(this.host.cwd)}` : "all projects"}`),
 			this.pairs([
 				["Sessions", s.sessions.length],
 				["Requests", s.requests],
 				["Tokens", fmtTokens(s.tokens)],
 				["Cost", fmtCost(s.cost)],
-				["Active days", s.activeDays],
+				...(s.day ? [] : ([["Active days", s.activeDays]] as [string, number][])),
 			]),
+			"",
+			this.head("Tokens by day"),
+			...this.days(s),
 			"",
 			this.head("Last 7 days"),
 			...s.week.map(
@@ -1100,6 +1166,9 @@ export class ContextOverlay {
 				(row, i) =>
 					`  ${WEEKDAYS[i]} ${row.map((n) => (n ? t.fg("accent", SHADES[Math.min(3, Math.floor((n / peak) * 4))].repeat(2)) : t.fg("dim", "· "))).join("")}`,
 			),
+			"",
+			this.head(`Sent, by category (${recorded} of ${s.requests} requests recorded by pi-context)`),
+			...(recorded ? this.shares(s.composition.sums) : ["  None."]),
 			"",
 			this.head("Models"),
 			...(s.models.length === 0 ? ["  None."] : []),

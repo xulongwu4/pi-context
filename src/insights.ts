@@ -1,12 +1,14 @@
 import { readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { analyze } from "./analyze.ts";
+import { analyze, CATEGORIES, type Category } from "./analyze.ts";
 import { fmtDay } from "./format.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 3;
 const TOP = 10;
+/** Days that the list of days covers at most: 53 weeks. */
+const MAX_DAYS = 371;
 /** Cached summaries of files older than this are dropped. */
 const KEEP_DAYS = 120;
 
@@ -28,6 +30,11 @@ export interface SessionSummary {
 	tools: Record<string, number>;
 	programs: Record<string, number>;
 	skills: Record<string, number>;
+	/**
+	 * Hours since the epoch, to the requests that pi-context recorded in that hour,
+	 * followed by the tokens they sent in each category, in the order of CATEGORIES.
+	 */
+	composition: Record<string, number[]>;
 	/** Path of the session file. `scan` sets it; it is not cached. */
 	file?: string;
 }
@@ -46,11 +53,15 @@ export interface InsightsFilter {
 	cwd?: string;
 	/** Order of the sessions. Default: the most recent first. */
 	sort?: SessionSort;
+	/** Count only this day of the period, as `fmtDay` writes it. `daily`, `week` and `activeDays` still cover the period. */
+	day?: string;
 }
 
 export interface Insights {
-	/** Length of the period in days. */
+	/** Length of the period in days. Infinite when the period has no start. */
 	days: number;
+	/** The day that the figures are narrowed to. */
+	day?: string;
 	/** Sessions with a request in the period. */
 	sessions: SessionSummary[];
 	requests: number;
@@ -59,6 +70,10 @@ export interface Insights {
 	activeDays: number;
 	/** The last seven days, oldest first. */
 	week: DayStat[];
+	/** Every day that the period touches, oldest first. At most the last 53 weeks. */
+	daily: DayStat[];
+	/** Tokens sent by category, for the requests that pi-context recorded. */
+	composition: { requests: number; sums: Record<Category, number> };
 	/** Requests by weekday (Monday first) and hour of day. */
 	heat: number[][];
 	/** Model, requests, tokens and cost in the period; the most expensive first. */
@@ -116,9 +131,18 @@ export function summarize(entries: any[]): SessionSummary {
 		tools: {},
 		programs: {},
 		skills: {},
+		composition: {},
 	};
 	for (const request of analysis.requests) {
 		const tokens = request.context + request.output;
+		const estimated = request.sums ? CATEGORIES.reduce((sum, cat) => sum + (request.sums?.[cat] ?? 0), 0) : 0;
+		if (request.sums && estimated > 0 && request.context > 0) {
+			const sent = (summary.composition[Math.floor(request.time / HOUR)] ??= new Array<number>(CATEGORIES.length + 1).fill(0));
+			sent[0]++;
+			CATEGORIES.forEach((cat, i) => {
+				sent[i + 1] += Math.round(((request.sums?.[cat] ?? 0) * request.context) / estimated);
+			});
+		}
 		const bucket = ((summary.models[request.model] ??= {})[Math.floor(request.time / HOUR)] ??= [0, 0, 0]);
 		bucket[0]++;
 		bucket[1] += tokens;
@@ -133,18 +157,23 @@ export function summarize(entries: any[]): SessionSummary {
 	return summary;
 }
 
-/** Combines session summaries into the figures for the `days` days that end at `now`. */
+/** Combines session summaries into the figures for the `days` days that end at `now`. With infinite `days`, the period has no start. */
 export function aggregate(summaries: SessionSummary[], now: number, days: number, filter: InsightsFilter = {}): Insights {
 	const since = now - days * DAY;
 	const byDay = new Map<string, DayStat>();
+	/** Start of the first counted hour. */
+	let first = now;
 	const insights: Insights = {
 		days,
+		day: filter.day,
 		sessions: [],
 		requests: 0,
 		tokens: 0,
 		cost: 0,
 		activeDays: 0,
 		week: [],
+		daily: [],
+		composition: { requests: 0, sums: Object.fromEntries(CATEGORIES.map((cat) => [cat, 0])) as Record<Category, number> },
 		heat: Array.from({ length: 7 }, () => new Array<number>(24).fill(0)),
 		models: [],
 		projects: [],
@@ -163,21 +192,23 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 			for (const [hour, [requests, tokens, cost]] of Object.entries(hours)) {
 				const time = Number(hour) * HOUR;
 				if (time + HOUR <= since) continue;
-				active = true;
 				const date = new Date(time);
 				const day = fmtDay(time);
 				const stat = byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 };
-				const model = models.get(name) ?? [name, 0, 0, 0];
 				stat.requests += requests;
 				stat.tokens += tokens;
 				stat.cost += cost;
+				byDay.set(day, stat);
+				first = Math.min(first, time);
+				if (filter.day && day !== filter.day) continue;
+				active = true;
+				const model = models.get(name) ?? [name, 0, 0, 0];
 				model[1] += requests;
 				model[2] += tokens;
 				model[3] += cost;
 				project[2] += requests;
 				project[3] += tokens;
 				project[4] += cost;
-				byDay.set(day, stat);
 				models.set(name, model);
 				insights.requests += requests;
 				insights.tokens += tokens;
@@ -189,6 +220,14 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		project[1]++;
 		projects.set(summary.cwd, project);
 		insights.sessions.push(summary);
+		for (const [hour, sent] of Object.entries(summary.composition ?? {})) {
+			const time = Number(hour) * HOUR;
+			if (time + HOUR <= since || (filter.day && fmtDay(time) !== filter.day)) continue;
+			insights.composition.requests += sent[0];
+			CATEGORIES.forEach((cat, i) => {
+				insights.composition.sums[cat] += sent[i + 1];
+			});
+		}
 		for (const key of ["tools", "programs", "skills"] as const) {
 			for (const [name, n] of Object.entries(summary[key])) counts[key].set(name, (counts[key].get(name) ?? 0) + n);
 		}
@@ -207,10 +246,30 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		const day = fmtDay(now - i * DAY);
 		insights.week.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 });
 	}
+	// Step by calendar day, so that a day of 23 or 25 hours counts once.
+	const last = new Date(now);
+	const date = new Date(Number.isFinite(since) ? since : first);
+	date.setHours(0, 0, 0, 0);
+	for (; date <= last; date.setDate(date.getDate() + 1)) {
+		const day = fmtDay(date.getTime());
+		insights.daily.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 });
+	}
+	insights.daily = insights.daily.slice(-MAX_DAYS);
 	for (const key of ["tools", "programs", "skills"] as const) {
 		insights[key] = [...counts[key]].sort((a, b) => b[1] - a[1]).slice(0, TOP);
 	}
 	return insights;
+}
+
+/** The days as a calendar: one row per weekday, Monday first, and one column per week. A cell outside the days is undefined. */
+export function calendar(daily: DayStat[]): (DayStat | undefined)[][] {
+	const rows: (DayStat | undefined)[][] = Array.from({ length: 7 }, () => []);
+	if (daily.length === 0) return rows;
+	const [year, month, date] = daily[0].day.split("-").map(Number);
+	const offset = (new Date(year, month - 1, date).getDay() + 6) % 7;
+	const weeks = Math.ceil((offset + daily.length) / 7);
+	for (let i = 0; i < weeks * 7; i++) rows[i % 7].push(daily[i - offset]);
+	return rows;
 }
 
 /**

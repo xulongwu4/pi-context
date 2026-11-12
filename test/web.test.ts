@@ -45,6 +45,7 @@ const summary: SessionSummary = {
 	tools: { bash: 1 },
 	programs: { ls: 1 },
 	skills: {},
+	composition: {},
 	file: "/sessions/s1.jsonl",
 };
 
@@ -152,6 +153,16 @@ test("web opens only the saved sessions that Insights listed, read-only", async 
 	expect(insights.days).toBe(7);
 	expect(insights.sessions).toEqual([expect.objectContaining({ name: "Saved one", file: "/sessions/s1.jsonl", requests: 2 })]);
 	expect(insights.sessions[0].models).toBeUndefined();
+	expect(insights.sessions[0].composition).toBeUndefined();
+	expect(insights.daily).toHaveLength(8);
+	// "all" has no start, and a day narrows the figures to that day.
+	const today = insights.daily.at(-1).day;
+	const all = (await get("insights", { days: "all", day: today })).body;
+	expect(all.day).toBe(today);
+	expect(all.requests).toBe(2);
+	expect(all.daily.at(-1)).toMatchObject({ day: today, requests: 2 });
+	expect((await get("insights", { days: "all", day: "2000-01-01" })).body.requests).toBe(0);
+	expect((await get("insights", { days: 7, day: "today; drop" })).body.day).toBeUndefined();
 	const saved = (await get("data", { session: "/sessions/s1.jsonl" })).body;
 	expect(saved.title).toBe("Saved one");
 	expect(saved.readOnly).toBe(true);

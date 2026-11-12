@@ -26,7 +26,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Commands | Shell commands, their result, and the programs they ran |
   | Tools | Calls, errors and estimated tokens per tool, and the skills that were loaded |
   | Fleet | The main agent and its subagents: status, time, model, requests, tokens, cost |
-  | Insights | The last 7, 30 or 90 days, over all projects or the current one: totals, a 7-day chart, activity by weekday and hour, requests and cost per model, cost per project, top tools, programs and skills, and the sessions |
+  | Insights | The last 7, 30 or 90 days or all time, over all projects or the current one, or one day of that period: totals, a calendar of the tokens by day, a 7-day chart, activity by weekday and hour, the tokens sent by category, requests and cost per model, cost per project, top tools, programs and skills, and the sessions |
   | Settings | The context warning, auto-compact, the cost budget, the footer, and the system prompt prefix and suffix |
 
   Keys: `←`/`→` tab, `↑`/`↓` scroll or select, `[`/`]` previous or next request, `r` refresh, `q` close.
@@ -39,7 +39,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Current | `o` switches the list between largest first and reading order |
   | Current, Hints | `d` drops the selected tool result from the context, `u` restores it |
   | Current, Browser, Files, Commands, Tools, Insights | `/` starts a filter: type text, `enter` keeps it, `esc` clears it. Only lines that contain the text stay |
-  | Insights | `p` changes the period, `a` switches between all projects and the current one, `s` changes the order of the sessions, `enter` opens the selected session |
+  | Insights | `p` changes the period, `[`/`]` narrow the tab to one day, `a` switches between all projects and the current one, `s` changes the order of the sessions, `enter` opens the selected session |
   | Fleet | `enter` opens the session of the selected subagent |
   | Settings | `enter` edits the selected setting, `x` clears it |
 
@@ -48,6 +48,8 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   A session opened from Insights or Fleet is read-only and shows the branch that ends at the last entry of its file. `esc` returns to the current session.
 
   In Insights and Fleet, `↑`/`↓` scroll the tab until the selected entry is in view, and then move the selection.
+
+  In Insights, the first `[` selects today. Then `[` and `]` select the day before or after, and `]` on today shows the whole period again. The calendar marks the selected day with `[]`.
 
   In Current and Browser, the strip shows the prompt from its first token to its last, colored by category, and `▲` marks the selected item. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 
@@ -70,7 +72,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 - The strip in the Context Browser has one band per item, in reading order. Click a band to show its item. `One list, in reading order` lists the items of all categories together. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 - `Drop` and `Restore` on a tool result, in the Context Browser or in Hints, do what `d` and `u` do in the overlay.
 - The Settings card changes the context warning, auto-compact, the cost budget, the footer, and the system prompt prefix and suffix. An empty number restores the default.
-- The Insights page shows the last 7, 30 or 90 days over all projects or the current one. Click a session to open its Context page. A saved session is read-only.
+- The Insights page shows the last 7, 30 or 90 days or all time, over all projects or the current one. `Today` or a click on a day in the calendar narrows the page to that day; a second click shows the whole period again. Click a session to open its Context page. A saved session is read-only.
 - The page loads the data again after each request and each turn of the current session, at most every 2 seconds.
 
 The server listens on `127.0.0.1` only, on a free port. Every request for data must carry the token of the address, so keep the address to yourself: it gives read access to the content of the session and of the sessions that Insights lists, and it can drop tool results and change the settings. To use the page from another machine, forward the port, for example with `ssh -L`.
@@ -84,7 +86,7 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - Settings are in `pi-context.json` in the pi agent directory.
 - At the end of each turn, the extension appends one `pi-context:turn` entry to the session. It holds the duration of the request, the tool time, the composition by category, the file of each anchor-based edit, and the tool declarations when they changed. Pi does not send these entries to the model.
 - Each time a tool result is dropped or restored, the extension appends one `pi-context:prune` entry with the ids of the dropped tool calls. The last entry on the branch applies, so the dropped results follow the branch and survive a resume.
-- Insights caches one summary per session file in `pi-context-cache.json` in the pi agent directory. Only new or changed session files are read again. Summaries of files unchanged for 120 days are dropped.
+- Insights caches one summary per session file in `pi-context-cache.json` in the pi agent directory. Only new or changed session files are read again. Summaries of files unchanged for 120 days are dropped, so the period `All` reads those files again.
 
 ## Accuracy
 
@@ -110,6 +112,9 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - Calls nested in another tool's result, for example from a script, are counted. Their tokens belong to the tool that made them. The size of a skill loaded by a nested call is the current size of its file.
 - Fleet needs [pi-subagents](https://github.com/tintinweb/pi-subagents). Finished subagents come from the records it saves in the session. Model, requests, tokens and cost come from its live events, or from the subagent's saved session when there is one.
 - The Insights project filter counts sessions that ran in the working directory or below it. The per-session figures in its session list cover the whole session, also the part before the period.
+- With one day selected in Insights, the totals, the hours, the categories, the models, the projects and the top lists cover that day. The calendar and the 7-day chart still cover the period. The top tools, programs and skills count the whole of each session that has a request on the day or in the period.
+- The Insights calendar shows the last 53 weeks at most. The totals of `All` also count what is older. A day is a day in the local time zone.
+- The Insights tokens by category cover the requests that pi-context recorded, like the same figure in Stats.
 - Insights counts each session's own requests. A subagent's work is included when its session was saved.
 
 ## Development

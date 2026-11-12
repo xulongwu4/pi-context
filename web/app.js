@@ -14,7 +14,8 @@ const COLORS = {
 	answers: "#ec4899",
 };
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const INSIGHT_CARDS = ["i-kpi", "i-week", "i-heat", "i-models", "i-projects", "i-tools", "i-programs", "i-sessions"];
+const INSIGHT_CARDS = ["i-kpi", "i-days", "i-week", "i-heat", "i-composition", "i-models", "i-projects", "i-tools", "i-programs", "i-sessions"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 /** Most rows a table shows, and most removed items the browser lists. */
 const MAX_LIST = 200;
 /** Most item contents kept after they were opened. */
@@ -34,7 +35,10 @@ const state = {
 	openItems: new Set(),
 	texts: new Map(),
 	insights: null,
+	/** Length of the Insights period in days, or "all". */
 	days: 30,
+	/** The day that Insights is narrowed to, as YYYY-MM-DD. Null: the whole period. */
+	day: null,
 	shown: SESSIONS_STEP,
 };
 let labels = {};
@@ -401,8 +405,44 @@ const rank = (items, empty) =>
 		? `<div class="rank">${items.map(([name, count]) => `<span style="--w:${(count / items[0][1]) * 100}%" title="${esc(name)}">${esc(name)}</span><b class="tok">${count}</b>`).join("")}</div>`
 		: `<p class="muted">${empty}</p>`;
 
+/** The local day as YYYY-MM-DD. */
+const today = () => {
+	const now = new Date();
+	return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+};
+
+/** The days of the period as a calendar: one column per week, Monday first, shaded by the tokens of the day. */
+function daysCard(ins) {
+	const days = ins.daily;
+	if (days.length === 0) return `<p class="muted">No day in the period.</p>`;
+	const [year, month, date] = days[0].day.split("-").map(Number);
+	const offset = (new Date(year, month - 1, date).getDay() + 6) % 7;
+	const weeks = Math.ceil((offset + days.length) / 7);
+	const peak = Math.max(...days.map((day) => day.tokens), 1);
+	const cell = (day) => {
+		if (!day) return "<span></span>";
+		const tip = `${day.day}: ${day.requests} requests, ${tok(day.tokens)} tokens, ${cost(day.cost)}`;
+		const shade = day.tokens ? `<b style="opacity:${0.2 + (0.8 * day.tokens) / peak}"></b>` : "";
+		return `<i${day.day === ins.day ? ' class="on"' : ""} data-act="day" data-day="${day.day}" title="${tip}">${shade}</i>`;
+	};
+	// The grid fills by column: a column of labels, then one column per week.
+	const cells = DAYS.map((name) => `<span>${name}</span>`);
+	const months = ["<span></span>"];
+	let last = "";
+	for (let week = 0; week < weeks; week++) {
+		const column = Array.from({ length: 7 }, (_, weekday) => days[week * 7 + weekday - offset]);
+		const name = column.find(Boolean)?.day.slice(5, 7) ?? last;
+		months.push(`<span>${name === last ? "" : MONTHS[Number(name) - 1]}</span>`);
+		last = name;
+		cells.push(...column.map(cell));
+	}
+	const note = "Click a day to narrow the page to it. Click it again to show the whole period.";
+	return `<div class="scroll-x" data-keep="days"><div class="cal months" style="--weeks:${weeks}">${months.join("")}</div><div class="cal" style="--weeks:${weeks}">${cells.join("")}</div></div><p class="muted">${note}</p>`;
+}
+
 function renderInsights() {
-	for (const button of document.querySelectorAll('[data-act="days"]')) button.classList.toggle("on", Number(button.dataset.days) === state.days);
+	for (const button of document.querySelectorAll('[data-act="days"]')) button.classList.toggle("on", button.dataset.days === String(state.days));
+	document.querySelector('[data-act="today"]').classList.toggle("on", state.day === today());
 	const ins = state.insights;
 	if (!ins) {
 		for (const id of INSIGHT_CARDS) paint(id, `<p class="muted">Reading the sessions…</p>`);
@@ -415,8 +455,16 @@ function renderInsights() {
 			[ins.requests, "Requests"],
 			[tok(ins.tokens), "Tokens"],
 			[cost(ins.cost), "Cost"],
-			[ins.activeDays, "Active days"],
-		]),
+			ins.day ? [ins.day, "Day"] : [ins.activeDays, "Active days"],
+		]) + (ins.day ? `<p>The figures cover ${ins.day} only. <a data-act="day" data-day="${ins.day}">Show the whole period</a></p>` : ""),
+	);
+	paint("i-days", daysCard(ins));
+	const sent = totalOf(ins.composition.sums);
+	const parts = catParts(ins.composition.sums);
+	const recorded = `${ins.composition.requests} of ${ins.requests} requests, those recorded by pi-context. Each request sends the whole context again.`;
+	paint(
+		"i-composition",
+		sent ? `<div class="split">${donut(parts, tok(sent), "sent")}${legend(parts)}</div><p class="muted">${recorded}</p>` : `<p class="muted">pi-context recorded no request ${ins.day ? "on this day" : "in the period"}.</p>`,
 	);
 	const most = Math.max(...ins.week.map((day) => day.tokens), 1);
 	const column = (day) =>
@@ -607,7 +655,7 @@ async function loadInsights() {
 	state.shown = SESSIONS_STEP;
 	render();
 	try {
-		const insights = await api("insights", { days: state.days, project: $("project").checked ? 1 : 0, sort: $("sort").value });
+		const insights = await api("insights", { days: state.days, day: state.day ?? "", project: $("project").checked ? 1 : 0, sort: $("sort").value });
 		if (mine === reading) state.insights = insights;
 	} catch (error) {
 		setError(error.message);
@@ -651,7 +699,16 @@ const actions = {
 		load();
 	},
 	days(el) {
-		state.days = Number(el.dataset.days);
+		state.days = el.dataset.days === "all" ? "all" : Number(el.dataset.days);
+		state.day = null;
+		loadInsights();
+	},
+	today() {
+		state.day = state.day === today() ? null : today();
+		loadInsights();
+	},
+	day(el) {
+		state.day = state.day === el.dataset.day ? null : el.dataset.day;
 		loadInsights();
 	},
 	session: (el) => openSession(el.dataset.file, el.dataset.title),

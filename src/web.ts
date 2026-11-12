@@ -175,12 +175,19 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			return { text: row && textOf(row, index, rebuilt(v, request)) };
 		},
 		async insights(query) {
-			const days = Math.min(365, Math.max(1, Math.round(Number(query.get("days")) || 30)));
-			const filter = { cwd: query.get("project") === "1" ? host.cwd : undefined, sort: SORTS.find((sort) => sort === query.get("sort")) };
+			// "all" is a period without a start.
+			const all = query.get("days") === "all";
+			const days = all ? Number.POSITIVE_INFINITY : Math.min(365, Math.max(1, Math.round(Number(query.get("days")) || 30)));
+			const day = query.get("day") ?? "";
+			const filter = {
+				cwd: query.get("project") === "1" ? host.cwd : undefined,
+				sort: SORTS.find((sort) => sort === query.get("sort")),
+				day: /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined,
+			};
 			const insights = aggregate(await host.loadSummaries(days, () => {}), Date.now(), days, filter);
-			const sessions = insights.sessions.map(({ models, tools, programs, skills, ...session }) => session);
+			const sessions = insights.sessions.map(({ models, tools, programs, skills, composition, ...session }) => session);
 			for (const session of sessions) if (session.file) known.set(session.file, session.name || session.cwd);
-			return { ...insights, sessions };
+			return { ...insights, days: all ? "all" : days, sessions };
 		},
 	};
 

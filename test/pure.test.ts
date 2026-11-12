@@ -24,7 +24,7 @@ import { exportJson, exportMarkdown } from "../src/export.ts";
 import { footerItems, footerText } from "../src/footer.ts";
 import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
 import { hintsOf, hintTotal } from "../src/hints.ts";
-import { aggregate, branchOf, parseEntries, scan, summarize } from "../src/insights.ts";
+import { aggregate, branchOf, calendar, parseEntries, scan, summarize } from "../src/insights.ts";
 import { droppedOf, isStub, PRUNE_ENTRY, prune, prunedOf } from "../src/prune.ts";
 import { report } from "../src/report.ts";
 
@@ -409,6 +409,7 @@ test("exportMarkdown writes every section", () => {
 	expect(text).toContain("| a1 | Explore | look \\| see | completed | 1m0s | 3 | 1.2k | $0.1000 |");
 	expect(text).toContain("2 anchor-based edits are not listed");
 	expect(text).toContain("- Top programs: git ×1");
+	expect(text).toContain("Tokens sent, by category (0 of 2 requests recorded by pi-context):");
 	expect(text).toContain("## Events\n\nNone.");
 });
 test("declaredTools reads the declarations of each provider payload shape", () => {
@@ -771,4 +772,75 @@ test("bands maps the reading order to cells in proportion to the tokens", () => 
 	expect(bands([row("system", 1), row("user", 99)], 4)).toEqual(["user", "user", "user", "user"]);
 	expect(bands([], 4)).toEqual([]);
 	expect(bands([row("user", 0)], 4)).toEqual([]);
+});
+
+test("aggregate lists every day of the period and narrows the figures to one day", () => {
+	const now = new Date(2026, 5, 10, 12).getTime(); // a Wednesday
+	const monday = summarize(session(now - 50 * HOUR, "monday"));
+	const tuesday = { ...summarize(session(now - 26 * HOUR, "tuesday")), cwd: "/work/other" };
+	const insights = aggregate([monday, tuesday], now, 7);
+	// The period starts at noon, so it touches eight days.
+	expect(insights.daily.map((stat) => stat.day)).toEqual(["2026-06-03", "2026-06-04", "2026-06-05", "2026-06-06", "2026-06-07", "2026-06-08", "2026-06-09", "2026-06-10"]);
+	expect(insights.daily.map((stat) => stat.requests)).toEqual([0, 0, 0, 0, 0, 2, 2, 0]);
+	expect(insights.day).toBeUndefined();
+	expect(insights.requests).toBe(4);
+
+	const day = aggregate([monday, tuesday], now, 7, { day: "2026-06-09" });
+	expect(day).toMatchObject({ day: "2026-06-09", requests: 2, tokens: 2020, cost: 0.75 });
+	expect(day.sessions.map((s) => s.id)).toEqual(["tuesday"]);
+	expect(day.projects).toEqual([["/work/other", 1, 2, 2020, 0.75]]);
+	expect(day.models).toEqual([["m1", 2, 2020, 0.75]]);
+	expect(day.heat[1].slice(9, 13)).toEqual([0, 1, 1, 0]);
+	expect(day.heat[0].every((n) => n === 0)).toBe(true);
+	// The days and the week stay those of the period, so that another day can be chosen.
+	expect(day.daily).toEqual(insights.daily);
+	expect(day.week).toEqual(insights.week);
+	expect(day.activeDays).toBe(2);
+});
+
+test("aggregate covers every session when the period has no start", () => {
+	const now = new Date(2026, 5, 10, 12).getTime();
+	const recent = summarize(session(now - 26 * HOUR, "recent"));
+	const old = summarize(session(now - 40 * 24 * HOUR, "old"));
+	const all = aggregate([old, recent], now, Number.POSITIVE_INFINITY);
+	expect(all.sessions.map((s) => s.id)).toEqual(["recent", "old"]);
+	expect(all.requests).toBe(4);
+	// From the first day with a request to today.
+	expect(all.daily).toHaveLength(41);
+	expect(all.daily[0]).toMatchObject({ day: "2026-05-01", requests: 2 });
+	expect(all.daily.at(-1)?.day).toBe("2026-06-10");
+	expect(aggregate([], now, Number.POSITIVE_INFINITY).daily.map((stat) => stat.day)).toEqual(["2026-06-10"]);
+	// The days go back 53 weeks at most; the totals still count what is older.
+	const ancient = summarize(session(now - 500 * 24 * HOUR, "ancient"));
+	const long = aggregate([ancient, recent], now, Number.POSITIVE_INFINITY);
+	expect(long.daily).toHaveLength(371);
+	expect(long.requests).toBe(4);
+});
+
+test("summarize keeps the recorded composition by hour, and aggregate sums it for the period", () => {
+	const now = new Date(2026, 5, 10, 12).getTime();
+	const start = now - 26 * HOUR;
+	const turn = { type: "custom", customType: TURN_ENTRY, data: { time: start + 1000, ms: 10, toolMs: 0, activeMs: 10, sums: { system: 300, user: 100 } } };
+	const summary = summarize([...session(start), turn]);
+	// One of the two requests was recorded. Its estimate of 400 tokens is scaled to the 1000 tokens that the request sent.
+	expect(Object.values(summary.composition)).toEqual([[1, 750, 0, 250, 0, 0, 0, 0, 0, 0]]);
+	const insights = aggregate([summary, summary], now, 7);
+	expect(insights.composition.requests).toBe(2);
+	expect(insights.composition.sums).toMatchObject({ system: 1500, user: 500, tools: 0 });
+	expect(aggregate([summary], now, 7, { day: "2026-06-10" }).composition.requests).toBe(0);
+	// A summary cached by an older version has no composition.
+	const { composition, ...legacy } = summary;
+	expect(aggregate([legacy as any], now, 7).composition.requests).toBe(0);
+});
+
+test("calendar lays the days out by weekday and week", () => {
+	const now = new Date(2026, 5, 10, 12).getTime(); // a Wednesday
+	const rows = calendar(aggregate([], now, 7).daily);
+	const days = (row: number) => rows[row].map((stat) => stat?.day.slice(5));
+	expect(rows).toHaveLength(7);
+	expect(days(0)).toEqual([undefined, "06-08"]);
+	expect(days(2)).toEqual(["06-03", "06-10"]);
+	expect(days(3)).toEqual(["06-04", undefined]);
+	expect(days(6)).toEqual(["06-07", undefined]);
+	expect(calendar([]).every((row) => row.length === 0)).toBe(true);
 });

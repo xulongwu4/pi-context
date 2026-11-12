@@ -192,6 +192,9 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		`- Top programs: ${top(insights.programs)}`,
 		`- Top skills: ${top(insights.skills)}`,
 		"",
+		`Tokens sent, by category (${insights.composition.requests} of ${insights.requests} requests recorded by pi-context):`,
+		"",
+		...composition(insights.composition.sums),
 		...table(
 			["Model", "Requests", "Tokens", "Cost"],
 			insights.models.map(([name, requests, tokens, cost]) => [name, requests, fmtTokens(tokens), fmtCost(cost)]),
