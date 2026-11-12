@@ -121,6 +121,8 @@ export interface EventRec {
 	detail: string;
 	/** Requests made before the event. */
 	after: number;
+	/** For an injection: the extension message type or the skill that put content into the context. */
+	producer?: string;
 	/** Tokens that the event added to the context, or took from it when negative. Undefined when the event changes no size or the size is not known. */
 	delta?: number;
 }
@@ -741,6 +743,19 @@ export function eventKinds(events: EventRec[]): [string, number][] {
 	return [...counts];
 }
 
+/** The injections summed by producer, largest first. */
+export function injectors(events: EventRec[]): { producer: string; count: number; tokens: number }[] {
+	const sums = new Map<string, { producer: string; count: number; tokens: number }>();
+	for (const event of events) {
+		if (event.producer === undefined) continue;
+		const sum = sums.get(event.producer) ?? { producer: event.producer, count: 0, tokens: 0 };
+		sum.count++;
+		sum.tokens += event.delta ?? 0;
+		sums.set(event.producer, sum);
+	}
+	return [...sums.values()].sort((a, b) => b.tokens - a.tokens);
+}
+
 /** Program a shell command runs: the first one that is not `cd`, ignoring env assignments, sudo and directories. */
 export function programOf(command: string): string {
 	let fallback = "";
@@ -953,6 +968,10 @@ export function analyze(entries: any[]): Analysis {
 			analysis.events.push(rec);
 			return rec;
 		};
+		/** Content that an extension or a skill put into the context. */
+		const inject = (producer: string, chars: number) => {
+			event("injection", `${producer}, ≈${fmtTokens(estimate(chars))} tokens`, estimate(chars)).producer = producer;
+		};
 		if (entry.type === "compaction") {
 			const rec = event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
 			compacted = typeof entry.tokensBefore === "number" ? { event: rec, before: entry.tokensBefore } : undefined;
@@ -990,7 +1009,10 @@ export function analyze(entries: any[]): Analysis {
 			const { id, type, description, status, startedAt, completedAt, sessionFile, error } = entry.data;
 			agents.set(id, { id, type, description, status, startedAt, completedAt, sessionFile, error });
 		}
-		if (entry.type === "custom_message") add(entry.customType ?? "custom", contentChars(entry.content));
+		if (entry.type === "custom_message") {
+			add(entry.customType ?? "custom", contentChars(entry.content));
+			inject(entry.customType ?? "custom", contentChars(entry.content));
+		}
 		if (entry.type !== "message") continue;
 
 		const m = entry.message;
@@ -1001,6 +1023,7 @@ export function analyze(entries: any[]): Analysis {
 			if (skill) {
 				loadSkill(skill.path).tokens = estimate(skill.block.length);
 				add(`skill ${skill.name}`, skill.block.length);
+				inject(`skill ${skill.name}`, skill.block.length);
 			}
 			if (!skill || skill.rest) add("user message", skill ? skill.rest.length : contentChars(m.content));
 			input = inputAt(time, preview(skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content)));
@@ -1029,7 +1052,10 @@ export function analyze(entries: any[]): Analysis {
 				if (typeof m.durationMs === "number") command.ms = m.durationMs;
 			}
 			const skill = skillsById.get(m.toolCallId);
-			if (skill) skill.tokens = estimate(contentChars(m.content));
+			if (skill) {
+				skill.tokens = estimate(contentChars(m.content));
+				inject(`skill ${skill.name}`, contentChars(m.content));
+			}
 			// Calls that this tool made to other tools (for example from a script).
 			for (const nested of m.nestedCalls?.calls ?? []) {
 				recordCall(nested, time, nested.status ?? "ok", m.toolCallId);

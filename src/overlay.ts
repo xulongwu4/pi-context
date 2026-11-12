@@ -14,6 +14,7 @@ import {
 	eventKinds,
 	type FileOp,
 	type FileRec,
+	injectors,
 	introducedAt,
 	LABELS,
 	type RequestRec,
@@ -1123,7 +1124,7 @@ export class ContextOverlay {
 	private events(): string[] {
 		const t = this.theme;
 		const events = this.data.analysis.events;
-		if (events.length === 0) return ["No compaction, drop, model or branch events on this branch."];
+		if (events.length === 0) return ["No injection, compaction, drop, model or branch events on this branch."];
 		const kinds = eventKinds(events);
 		if (!kinds.some(([kind]) => kind === this.kind)) this.kind = "";
 		const shown = events.filter((e) => !this.kind || e.kind === this.kind);
@@ -1134,10 +1135,15 @@ export class ContextOverlay {
 		const sized = shown.filter((e) => e.delta !== undefined);
 		const where = (e: { after: number }) => (e.after ? `after #${e.after}` : "at the start");
 		const width = Math.max(...shown.map((e) => where(e).length));
+		const by = injectors(shown);
+		const name = Math.max(...by.map((sum) => sum.producer.length));
 		return [
 			this.head("Events by kind"),
 			...this.wrap([chip("all", events.length, !this.kind), ...kinds.map(([kind, count]) => chip(kind, count, kind === this.kind))]),
 			this.pairs([["Net change of the context", sized.length ? change(sized.reduce((sum, e) => sum + (e.delta ?? 0), 0)) : "not known"]]),
+			...(by.length
+				? ["", this.head("Injected by"), ...by.map((sum) => `  ${sum.producer.padEnd(name)}  ${`${sum.count}×`.padStart(5)}  ≈${fmtTokens(sum.tokens).padStart(6)}`)]
+				: []),
 			"",
 			...shown.map((e) => `  ${fmtTime(e.time)}  ${t.fg("muted", where(e).padEnd(width))}  ${t.fg("accent", e.kind.padEnd(14))} ${change(e.delta, 8)}  ${e.detail}`),
 		];

@@ -394,7 +394,7 @@ function turnsCard(d) {
 }
 
 function eventsCard(d) {
-	if (d.events.length === 0) return `<p class="muted">No compaction, drop, model or branch events on this branch.</p>`;
+	if (d.events.length === 0) return `<p class="muted">No injection, compaction, drop, model or branch events on this branch.</p>`;
 	const counts = new Map();
 	for (const event of d.events) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
 	const kind = counts.has(state.kind) ? state.kind : "";
@@ -406,8 +406,17 @@ function eventsCard(d) {
 	const sized = shown.filter((event) => event.delta != null);
 	const net = sized.length ? change(sized.reduce((sum, event) => sum + event.delta, 0)) : "not known";
 	const where = (event) => (event.after ? `<a data-act="request" data-n="${event.after}" title="Open the request in the Context Browser">#${event.after}</a>` : "start");
+	// The injections by the extension message type or the skill that made them, largest first.
+	const sums = new Map();
+	for (const event of shown) {
+		if (event.producer == null) continue;
+		const sum = sums.get(event.producer) ?? [0, 0];
+		sums.set(event.producer, [sum[0] + 1, sum[1] + (event.delta ?? 0)]);
+	}
+	const by = [...sums].sort((a, b) => b[1][1] - a[1][1]).map(([producer, [count, tokens]]) => [esc(producer), count, "≈" + tok(tokens)]);
 	return (
 		`<div class="controls">${chips.join("")}</div><p>Net change of the context: ${net}</p>` +
+		(by.length ? table(["Injected by", ">Events", ">Tokens"], by) : "") +
 		table(
 			["Time", "After", "Kind", ">Change", "Detail"],
 			shown.map((event) => [clock(event.time), where(event), esc(event.kind), change(event.delta), esc(event.detail)]),

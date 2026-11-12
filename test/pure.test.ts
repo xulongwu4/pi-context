@@ -12,6 +12,7 @@ import {
 	diffLines,
 	diffRows,
 	eventKinds,
+	injectors,
 	introducedAt,
 	programOf,
 	recordedDeclarations,
@@ -257,7 +258,11 @@ test("analyze derives requests, events, files and commands", () => {
 	expect(a.userInputs).toBe(1);
 	expect(a.toolCalls).toBe(4);
 	expect(a.toolErrors).toBe(1);
-	expect(a.events.map((e) => [e.kind, e.detail])).toEqual([["model", "p/m1"], ["compaction", "12.3k tokens before compaction"]]);
+	expect(a.events.map((e) => [e.kind, e.detail])).toEqual([
+		["model", "p/m1"],
+		["injection", "skill x, ≈100 tokens"],
+		["compaction", "12.3k tokens before compaction"],
+	]);
 	expect(a.files).toMatchObject([
 		{ path: "/skills/x/SKILL.md", reads: 1, writes: 0, edits: 0 },
 		{ path: "/a.ts", reads: 0, writes: 1, edits: 1 },
@@ -537,7 +542,7 @@ test("exportMarkdown writes every section", () => {
 	expect(text).toContain("2 anchor-based edits are not listed");
 	expect(text).toContain("- Top programs: git ×1");
 	expect(text).toContain("Tokens sent, by category (0 of 2 requests recorded by pi-context):");
-	expect(text).toContain("## Events\n\nNone.");
+	expect(text).toContain("| 1 | injection | ≈+100 | skill x, ≈100 tokens |");
 });
 test("declaredTools reads the declarations of each provider payload shape", () => {
 	const size = (value: unknown) => JSON.stringify(value).length;
@@ -1096,6 +1101,38 @@ test("expiryWarnAt gives the time of the cache expiry warning", () => {
 	expect(expiryWarnAt({ expiryWarnSeconds: 60 }, { ...stats, cacheUntil: undefined }, now)).toBeUndefined();
 	expect(expiryText(stats, now + 240_000)).toBe("The prompt cache expires in about 1m0s. A request after that sends the 84.2k tokens of the context without the cache.");
 	expect(expiryText({ ...stats, usage: undefined }, now + 240_000)).toBe("The prompt cache expires in about 1m0s. A request after that sends the whole context without the cache.");
+});
+
+test("analyze lists what extensions and skills put into the context, and injectors sums it by producer", () => {
+	const stamp = new Date(0).toISOString();
+	const recall = (chars: number) => ({ type: "custom_message", customType: "wiki-recall", content: "w".repeat(chars), display: false, timestamp: stamp });
+	const block = `<skill name="tdd" location="/skills/tdd/SKILL.md">\n${"k".repeat(400)}\n</skill>`;
+	const a = analyze([
+		recall(400),
+		{ type: "message", timestamp: stamp, message: { role: "user", content: `${block}\n\nfix it`, timestamp: 1 } },
+		{ type: "message", timestamp: stamp, message: { ...messages[3], timestamp: 2, usage: usage(100, 10) } },
+		// The result of the read of /skills/x/SKILL.md.
+		{ type: "message", timestamp: stamp, message: { ...messages[4], timestamp: 3 } },
+		recall(800),
+		{ type: "custom_message", content: [{ type: "text", text: "n".repeat(40) }], display: true, timestamp: stamp },
+	]);
+	const skill = Math.ceil(block.length / 4);
+	expect(a.events.map((e) => [e.kind, e.producer, e.after, e.delta])).toEqual([
+		["injection", "wiki-recall", 0, 100],
+		["injection", "skill tdd", 0, skill],
+		["injection", "skill x", 1, 100],
+		["injection", "wiki-recall", 1, 200],
+		["injection", "custom", 1, 10],
+	]);
+	expect(a.events[0].detail).toBe("wiki-recall, ≈100 tokens");
+	expect(injectors(a.events)).toEqual([
+		{ producer: "wiki-recall", count: 2, tokens: 300 },
+		{ producer: "skill tdd", count: 1, tokens: skill },
+		{ producer: "skill x", count: 1, tokens: 100 },
+		{ producer: "custom", count: 1, tokens: 10 },
+	]);
+	// An event of another kind has no producer.
+	expect(injectors([{ time: 0, kind: "model", detail: "p/m1", after: 0 }])).toEqual([]);
 });
 
 test("exportMarkdown lists the request that each event followed and what the event changed", () => {
