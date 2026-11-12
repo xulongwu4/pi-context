@@ -21,13 +21,13 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Turns | One row per human input: its requests, tool calls, tokens, cost and duration |
   | Trend | Tokens sent by each request, the share read from the prompt cache, and cache misses |
   | Browser | What one request was assembled from, in reading order, and what changed since the request before it: items added, changed and removed, and the items and tokens each category gained or lost |
-  | Events | Compactions, model switches, thinking level changes, branch summaries |
+  | Events | Compactions, dropped and restored tool results, model switches, thinking level changes and branch summaries: the number of events of each kind, the request each event followed, and the tokens it added to the context or took from it |
   | Files | Reads, writes and edits per file |
   | Commands | Shell commands, their result, and the programs they ran |
   | Tools | Calls, errors and estimated tokens per tool, and the skills that were loaded |
   | Fleet | The main agent and its subagents: status, time, model, requests, tokens, cost |
   | Insights | The last 7, 30 or 90 days or all time, over all projects or the current one, or one day of that period: totals, a calendar of the tokens by day, a 7-day chart, activity by weekday and hour, the tokens sent by category, requests and cost per model, cost per project, top tools, programs and skills, and the sessions |
-  | Settings | The context warning, auto-compact, the cost budget, the footer, and the system prompt prefix and suffix |
+  | Settings | The context warning, auto-compact, the cost budget, the cache expiry warning, the footer, and the system prompt prefix and suffix |
 
   Keys: `←`/`→` tab, `↑`/`↓` scroll or select, `[`/`]` previous or next request, `r` refresh, `q` close.
 
@@ -39,6 +39,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Current | `o` switches the list between largest first and reading order |
   | Current, Hints | `d` drops the selected tool result from the context, `u` restores it |
   | Current, Browser, Files, Commands, Tools, Insights | `/` starts a filter: type text, `enter` keeps it, `esc` clears it. Only lines that contain the text stay |
+  | Events | `k` lists one kind of event, then the next kind, then all again |
   | Insights | `p` changes the period, `[`/`]` narrow the tab to one day, `a` switches between all projects and the current one, `s` changes the order of the sessions, `enter` opens the selected session |
   | Fleet | `enter` opens the session of the selected subagent |
   | Settings | `enter` edits the selected setting, `x` clears it |
@@ -56,6 +57,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 - Dropping tool results: `d` in Current or Hints replaces a tool result with a one-line stub in every later request. The session file keeps the original, and `u` restores it. The request after a change reads less from the prompt cache, because the context differs from the dropped result on.
 - Footer indicator: `ctx 42% 84.2k/200.0k`. It updates after each turn. `/context footer <items>` chooses what it shows, from `context`, `cost` (session cost), `cache` (share of the sent tokens read from the prompt cache) and `ttl` (estimated time until the prompt cache expires). Example: `/context footer context cost ttl`.
 - Cost budget: `/context budget <dollars>` gives one warning when the cost of the session reaches the amount, and adds the cost to the footer. `/context budget 0` removes it.
+- Cache expiry warning: `/context expiry <seconds>` gives one warning that many seconds before the prompt cache expires, when the agent is idle at that time. A request sent after the expiry sends the whole context without the cache. `/context expiry 0` turns the warning off, which is the default.
 - Auto-compact: `/context compact <percent>` starts pi's compaction when the agent stops and context use is at that percentage or above. `/context compact 0` turns it off. It is off by default.
 - Context warning: one notification each time context use rises to 80%. It names the largest category. `/context warn <percent>` changes the percentage, `/context warn 0` disables the warning, and `/context warn` shows the setting.
 - `/context prefix [text]` and `/context suffix [text]` set text joined to the start or end of the system prompt. Without text, an editor opens. An empty value disables the setting. The change applies from the next turn.
@@ -71,7 +73,8 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 - In the Context Browser, click a category to list its items and an item to show its whole content. The select and the `‹` `›` buttons change the request. A request shows what was added (`+`) or changed (`~`) since the request before it, and the items and tokens each category gained or lost.
 - The strip in the Context Browser has one band per item, in reading order. Click a band to show its item. `One list, in reading order` lists the items of all categories together. Each item shows `#`, its position in the prompt, and `@`, the first request that carried it.
 - `Drop` and `Restore` on a tool result, in the Context Browser or in Hints, do what `d` and `u` do in the overlay.
-- The Settings card changes the context warning, auto-compact, the cost budget, the footer, and the system prompt prefix and suffix. An empty number restores the default.
+- In Context Events, the buttons list one kind of event or all. The number in the After column opens that request in the Context Browser.
+- The Settings card changes the context warning, auto-compact, the cost budget, the cache expiry warning, the footer, and the system prompt prefix and suffix. An empty number restores the default.
 - The Insights page shows the last 7, 30 or 90 days or all time, over all projects or the current one. `Today` or a click on a day in the calendar narrows the page to that day; a second click shows the whole period again. Click a session to open its Context page. A saved session is read-only.
 - The page loads the data again after each request and each turn of the current session, at most every 2 seconds.
 
@@ -101,7 +104,8 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - "Sent over the session, by category" in Stats covers the requests that have a turn record. It scales the recorded composition of each request to the size the provider reported for it.
 - In Turns, the duration is the time from the input to the last message it caused. It includes time spent waiting for the user inside a tool.
 - The Browser comparison matches items by content. The system prompt, the tool schemas and a tool result keep their identity, so they show as changed (`~`) and not as removed and added.
-- The time until the prompt cache expires is an estimate: 5 minutes after the last request, or 1 hour when a request of the session wrote to the 1-hour cache. It is shown only for models that have used the cache in the session.
+- The time until the prompt cache expires is an estimate: 5 minutes after the last request, or 1 hour when a request of the session wrote to the 1-hour cache. It is shown only for models that have used the cache in the session. The cache expiry warning uses the same estimate, and it does not appear while the agent runs or when pi has no UI.
+- The change that Events shows for a compaction is the size of the request after it minus the size before the compaction, so it includes what was added in between. A compaction without a later request shows no change. The change of a drop or a restore is the estimated size of the tool results at 4 characters per token; the stub that replaces a dropped result is not counted.
 - Auto-compact acts when the agent stops, not between the requests of one run. Pi refuses to compact a session that is too small.
 - In the web page, a grey bar in Context Trend is a request without a turn record: its split by category is not known. The Context Browser rebuilds such a request from the session when you open it.
 - Requests, events, file activity, commands and tool counts come from the session branch, so they cover a resumed session.

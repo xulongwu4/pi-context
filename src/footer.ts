@@ -17,6 +17,22 @@ export function footerItems(config: Config): FooterItem[] {
 	return config.budget && !items.includes("cost") ? [...items, "cost"] : items;
 }
 
+/**
+ * When to warn that the prompt cache is about to expire. Undefined when no warning is due:
+ * none is configured, the model does not cache, or the cache has expired.
+ */
+export function expiryWarnAt(config: Config, stats: FooterStats, now: number): number | undefined {
+	const { cacheUntil } = stats;
+	if (!config.expiryWarnSeconds || cacheUntil === undefined || cacheUntil <= now) return undefined;
+	return Math.max(now, cacheUntil - config.expiryWarnSeconds * 1000);
+}
+
+/** The warning that the prompt cache is about to expire. */
+export function expiryText(stats: FooterStats, now: number): string {
+	const size = stats.usage?.tokens ? `the ${fmtTokens(stats.usage.tokens)} tokens of the context` : "the whole context";
+	return `The prompt cache expires in about ${fmtDuration(Math.max(0, (stats.cacheUntil ?? now) - now))}. A request after that sends ${size} without the cache.`;
+}
+
 /** Text of the footer status. An item without data is left out. */
 export function footerText(config: Config, stats: FooterStats, now: number): string {
 	const { usage } = stats;

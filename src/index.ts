@@ -33,7 +33,7 @@ import {
 } from "./analyze.ts";
 import { applyAffixes, type Config, DEFAULT_WARN_PERCENT, FOOTER_ITEMS, type FooterItem, loadConfig, saveConfig } from "./config.ts";
 import { exportJson, exportMarkdown } from "./export.ts";
-import { type FooterStats, footerItems, footerText } from "./footer.ts";
+import { expiryText, expiryWarnAt, type FooterStats, footerItems, footerText } from "./footer.ts";
 import { fmtCost, fmtPercent, fmtTokens } from "./format.ts";
 import { hintsOf } from "./hints.ts";
 import { aggregate, branchOf, parseEntries, type SessionSummary, scan, summarize } from "./insights.ts";
@@ -68,6 +68,12 @@ const NUMBERS = {
 		prompt: "Cost budget of a session, in dollars (0 = none)",
 		error: "Give an amount in dollars. 0 removes the budget.",
 	},
+	expiry: {
+		key: "expiryWarnSeconds",
+		max: 3600,
+		prompt: "Cache expiry warning, in seconds before the prompt cache expires (0 = off)",
+		error: "Give a number of seconds from 0 to 3600. 0 turns the warning off.",
+	},
 } as const;
 type NumberSetting = keyof typeof NUMBERS;
 
@@ -82,6 +88,9 @@ function describe(setting: NumberSetting, config: Config): string {
 		return percent === 0 ? "Context warning disabled." : `Context warning at ${percent}% of the window.`;
 	}
 	if (setting === "compact") return config.compactPercent ? `Auto-compact at ${config.compactPercent}% of the window.` : "Auto-compact is off.";
+	if (setting === "expiry") {
+		return config.expiryWarnSeconds ? `Cache expiry warning ${config.expiryWarnSeconds}s before the prompt cache expires.` : "The cache expiry warning is off.";
+	}
 	return config.budget ? `Cost budget: ${fmtCost(config.budget)} for a session.` : "No cost budget.";
 }
 
@@ -118,6 +127,9 @@ export default function (pi: ExtensionAPI) {
 	/** What the footer was last drawn from. */
 	let footer: FooterStats = { cost: 0, requests: 0, cacheRate: 0 };
 	let footerTimer: ReturnType<typeof setInterval> | undefined;
+	let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+	/** The expiry of the prompt cache that the user was last warned about. */
+	let expiryWarned = 0;
 	/** Subagents seen through pi-subagents events in this run. */
 	const liveAgents = new Map<string, AgentRec>();
 	const fileUsageCache = new Map<string, { mtimeMs: number; usage: AgentUsage }>();
@@ -341,7 +353,7 @@ export default function (pi: ExtensionAPI) {
 	function applySetting(ctx: ExtensionContext, setting: string, value: string): Outcome {
 		if (setting === "prefix" || setting === "suffix") return saveAffix(setting, value);
 		if (setting === "footer") return setFooter(ctx, value);
-		if (setting === "warn" || setting === "compact" || setting === "budget") return setNumber(ctx, setting, value.trim() ? value : undefined);
+		if (setting === "warn" || setting === "compact" || setting === "budget" || setting === "expiry") return setNumber(ctx, setting, value.trim() ? value : undefined);
 		return { message: `There is no setting "${setting}".`, level: "error" };
 	}
 
@@ -364,7 +376,7 @@ export default function (pi: ExtensionAPI) {
 		const usage = ctx.getContextUsage();
 		footer = { usage, cost: 0, requests: 0, cacheRate: 0 };
 		// The figures of the session are needed only for the items that show them.
-		if (footerItems(config).some((item) => item !== "context")) {
+		if (footerItems(config).some((item) => item !== "context") || config.expiryWarnSeconds) {
 			const analysis = analyze(ctx.sessionManager.getBranch());
 			footer = { usage, cost: analysis.totals.cost, requests: analysis.requests.length, cacheRate: cacheStats(analysis).rate, cacheUntil: analysis.cacheUntil };
 		}
@@ -386,6 +398,25 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.notify(`The session cost ${fmtCost(footer.cost)} has reached the budget of ${fmtCost(config.budget ?? 0)}.`, "warning");
 		}
 		overBudget = spent;
+		warnOfExpiry(ctx, config);
+	}
+
+	/** Warns once before the prompt cache expires, when the agent is idle by then. */
+	function warnOfExpiry(ctx: ExtensionContext, config: Config): void {
+		clearTimeout(expiryTimer);
+		const until = footer.cacheUntil;
+		const at = expiryWarnAt(config, footer, Date.now());
+		if (at === undefined || until === undefined || running || until === expiryWarned) return;
+		expiryTimer = setTimeout(() => {
+			if (running) return;
+			expiryWarned = until;
+			try {
+				ctx.ui.notify(expiryText(footer, Date.now()), "warning");
+			} catch {
+				// The session is gone.
+			}
+		}, at - Date.now());
+		expiryTimer.unref?.();
 	}
 
 	/** Starts compaction when the agent has stopped and context use is at the configured percentage. */
@@ -432,6 +463,8 @@ export default function (pi: ExtensionAPI) {
 		warned = false;
 		overBudget = false;
 		compacting = false;
+		expiryWarned = 0;
+		clearTimeout(expiryTimer);
 		clearInterval(footerTimer);
 		if (ctx.hasUI) {
 			footerTimer = setInterval(() => {
@@ -482,6 +515,7 @@ export default function (pi: ExtensionAPI) {
 		for (const off of unsubscribe) off();
 		unsubscribe = [];
 		clearInterval(footerTimer);
+		clearTimeout(expiryTimer);
 		web?.close();
 		web = undefined;
 	});
@@ -504,6 +538,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		running = true;
+		clearTimeout(expiryTimer);
 		web?.changed();
 	});
 
@@ -579,14 +614,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("context", {
 		description:
-			"Show context insights. Subcommands: prefix [text] and suffix [text] set the system prompt prefix/suffix; warn [percent], compact [percent], budget [dollars] and footer [items] change settings; export [file] writes a Markdown report, or JSON when the file ends in .json; web opens the context page in the browser, web stop stops its server",
+			"Show context insights. Subcommands: prefix [text] and suffix [text] set the system prompt prefix/suffix; warn [percent], compact [percent], budget [dollars], expiry [seconds] and footer [items] change settings; export [file] writes a Markdown report, or JSON when the file ends in .json; web opens the context page in the browser, web stop stops its server",
 		handler: async (args, ctx) => {
 			hidden = ctx.getSystemPromptOptions().hiddenTools ?? [];
-			const [, sub, rest = ""] = /^(prefix|suffix|warn|compact|budget|footer|export|web)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
+			const [, sub, rest = ""] = /^(prefix|suffix|warn|compact|budget|expiry|footer|export|web)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
 			if (sub === "prefix" || sub === "suffix") return setAffix(ctx, sub, rest || undefined);
-			if (sub === "warn" || sub === "compact" || sub === "budget") {
+			if (sub === "warn" || sub === "compact" || sub === "budget" || sub === "expiry") {
 				if (rest) return say(ctx, setNumber(ctx, sub, rest));
-				const unit = sub === "budget" ? "dollars" : "percent";
+				const unit = sub === "budget" ? "dollars" : sub === "expiry" ? "seconds" : "percent";
 				ctx.ui.notify(`${describe(sub, loadConfig(configPath))} Set it with /context ${sub} <${unit}>; 0 turns it off.`, "info");
 				return;
 			}

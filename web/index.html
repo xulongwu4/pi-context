@@ -85,7 +85,8 @@
 				<label>Context warning, in percent of the window (0 = off)<input name="warn" type="number" min="0" max="100" step="any"></label>
 				<label>Auto-compact, in percent of the window (0 = off)<input name="compact" type="number" min="0" max="100" step="any"></label>
 				<label>Cost budget of a session, in dollars (0 = none)<input name="budget" type="number" min="0" step="any"></label>
-				<label>Footer items, in order: context, cost, cache, ttl<input name="footer"></label>
+				<label>Cache expiry warning, in seconds before the prompt cache expires (0 = off)<input name="expiry" type="number" min="0" max="3600" step="any"></label>
+				<label class="full">Footer items, in order: context, cost, cache, ttl<input name="footer"></label>
 				<label class="full">System prompt prefix (empty = disabled)<textarea name="prefix" rows="3"></textarea></label>
 				<label class="full">System prompt suffix (empty = disabled)<textarea name="suffix" rows="3"></textarea></label>
 				<div class="full"><button type="submit" class="on">Save</button> <span id="settings-note" class="muted"></span></div>

@@ -108,6 +108,10 @@ export interface EventRec {
 	time: number;
 	kind: string;
 	detail: string;
+	/** Requests made before the event. */
+	after: number;
+	/** Tokens that the event added to the context, or took from it when negative. Undefined when the event changes no size or the size is not known. */
+	delta?: number;
 }
 
 export interface FileRec {
@@ -180,6 +184,9 @@ export interface Timing {
 	modelMs: number;
 	toolMs: number;
 }
+
+/** Session entry type that lists the tool calls whose results the user dropped. The last entry on the branch applies. */
+export const PRUNE_ENTRY = "pi-context:prune";
 
 /** Session entry type that pi-context appends at the end of each turn. */
 export const TURN_ENTRY = "pi-context:turn";
@@ -516,6 +523,13 @@ export function bands(rows: Row[], width: number): Category[] {
 	return cells;
 }
 
+/** The kinds of the events with the number of events of each, in the order in which they first occur. */
+export function eventKinds(events: EventRec[]): [string, number][] {
+	const counts = new Map<string, number>();
+	for (const event of events) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+	return [...counts];
+}
+
 /** Program a shell command runs: the first one that is not `cd`, ignoring env assignments, sudo and directories. */
 export function programOf(command: string): string {
 	let fallback = "";
@@ -610,6 +624,12 @@ export function analyze(entries: any[]): Analysis {
 		return rec;
 	};
 	const models = new Map<string, ModelRec>();
+	/** Estimated size of each tool result, by tool call id. */
+	const resultTokens = new Map<string, number>();
+	/** Tool calls whose results are dropped, as of the entry being read. */
+	let dropped = new Set<string>();
+	/** The last compaction, until the request after it shows what it left. */
+	let compacted: { event: EventRec; before: number } | undefined;
 	/** Cost per cache-read token, by model. */
 	const readRates = new Map<string, number>();
 	/** Models that have used the prompt cache on this branch. */
@@ -660,17 +680,43 @@ export function analyze(entries: any[]): Analysis {
 	};
 	for (const entry of entries) {
 		const entryTime = Date.parse(entry.timestamp) || 0;
-		const event = (kind: string, detail: string) => analysis.events.push({ time: entryTime, kind, detail });
+		const event = (kind: string, detail: string, delta?: number) => {
+			const rec: EventRec = { time: entryTime, kind, detail, after: analysis.requests.length };
+			if (delta !== undefined) rec.delta = delta;
+			analysis.events.push(rec);
+			return rec;
+		};
 		if (entry.type === "compaction") {
-			event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
+			const rec = event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
+			compacted = typeof entry.tokensBefore === "number" ? { event: rec, before: entry.tokensBefore } : undefined;
 			// The compacted context is new to the cache; the next request is not a miss.
 			cached = undefined;
 			analysis.cacheUntil = undefined;
 			addUsage(analysis.totals, entry.usage);
 		} else if (entry.type === "model_change") event("model", `${entry.provider}/${entry.modelId}`);
 		else if (entry.type === "thinking_level_change") event("thinking", String(entry.thinkingLevel));
-		else if (entry.type === "branch_summary") event("branch summary", `${fmtTokens(estimate(entry.summary?.length ?? 0))} tokens`);
-		else if (entry.type === "usage") addUsage(analysis.totals, entry.usage);
+		else if (entry.type === "branch_summary") {
+			const tokens = estimate(entry.summary?.length ?? 0);
+			event("branch summary", `${fmtTokens(tokens)} tokens`, tokens);
+		} else if (entry.type === "custom" && entry.customType === PRUNE_ENTRY) {
+			const ids = new Set<string>(Array.isArray(entry.data?.ids) ? entry.data.ids : []);
+			const change = (kind: string, list: string[], sign: number) => {
+				if (list.length === 0) return;
+				const tokens = list.reduce((sum, id) => sum + (resultTokens.get(id) ?? 0), 0);
+				event(kind, `${list.length} tool ${list.length === 1 ? "result" : "results"}, ≈${fmtTokens(tokens)} tokens`, sign * tokens);
+			};
+			change(
+				"drop",
+				[...ids].filter((id) => !dropped.has(id)),
+				-1,
+			);
+			change(
+				"restore",
+				[...dropped].filter((id) => !ids.has(id)),
+				1,
+			);
+			dropped = ids;
+		} else if (entry.type === "usage") addUsage(analysis.totals, entry.usage);
 		else if (entry.type === "custom" && entry.customType === "subagents:record" && typeof entry.data?.id === "string") {
 			const { id, type, description, status, startedAt, completedAt, sessionFile, error } = entry.data;
 			agents.set(id, { id, type, description, status, startedAt, completedAt, sessionFile, error });
@@ -688,6 +734,7 @@ export function analyze(entries: any[]): Analysis {
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
 			rec.resultTokens += estimate(contentChars(m.content));
+			resultTokens.set(m.toolCallId, estimate(contentChars(m.content)));
 			if (m.isError) {
 				analysis.toolErrors++;
 				rec.errors++;
@@ -724,6 +771,10 @@ export function analyze(entries: any[]): Analysis {
 				ms: turn?.ms,
 			};
 			analysis.requests.push(request);
+			if (compacted) {
+				compacted.event.delta = request.context - compacted.before;
+				compacted = undefined;
+			}
 			input ??= inputAt(time, "");
 			if (input.first < 0) input.first = request.n - 1;
 			input.requests++;

@@ -8,6 +8,7 @@ import {
 	cacheStats,
 	declaredTools,
 	diffRows,
+	eventKinds,
 	introducedAt,
 	programOf,
 	recordedDeclarations,
@@ -21,7 +22,7 @@ import {
 } from "../src/analyze.ts";
 import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
 import { exportJson, exportMarkdown } from "../src/export.ts";
-import { footerItems, footerText } from "../src/footer.ts";
+import { expiryText, expiryWarnAt, footerItems, footerText } from "../src/footer.ts";
 import { bar, fmtDay, fmtDuration, fmtTokens } from "../src/format.ts";
 import { hintsOf, hintTotal } from "../src/hints.ts";
 import { aggregate, branchOf, calendar, parseEntries, scan, summarize } from "../src/insights.ts";
@@ -843,4 +844,55 @@ test("calendar lays the days out by weekday and week", () => {
 	expect(days(3)).toEqual(["06-04", undefined]);
 	expect(days(6)).toEqual(["06-07", undefined]);
 	expect(calendar([]).every((row) => row.length === 0)).toBe(true);
+});
+
+test("analyze places each event among the requests and estimates what it changed", () => {
+	const stamp = (ms: number) => new Date(ms).toISOString();
+	const result = (id: string, chars: number, timestamp: number) =>
+		at({ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "z".repeat(chars) }], isError: false, timestamp });
+	const entries = [
+		at({ role: "user", content: "hi", timestamp: 1000 }),
+		at(assistant(2000)),
+		result("r1", 800, 3000),
+		result("r2", 400, 3500),
+		{ type: "custom", customType: PRUNE_ENTRY, timestamp: stamp(4000), data: { ids: ["r1", "r2"] } },
+		{ type: "custom", customType: PRUNE_ENTRY, timestamp: stamp(4500), data: { ids: ["r2"] } },
+		{ type: "compaction", timestamp: stamp(5000), tokensBefore: 5000 },
+		{ type: "branch_summary", timestamp: stamp(5500), summary: "s".repeat(400) },
+		at(assistant(6000)),
+		{ type: "model_change", timestamp: stamp(7000), provider: "p", modelId: "m2" },
+		{ type: "compaction", timestamp: stamp(8000), tokensBefore: 7000 },
+	];
+	const events = analyze(entries).events;
+	// A compaction is measured by the request after it: 5000 tokens before, 1000 sent after. The last one has no such request.
+	expect(events.map((e) => [e.kind, e.after, e.delta])).toEqual([
+		["drop", 1, -300],
+		["restore", 1, 200],
+		["compaction", 1, -4000],
+		["branch summary", 1, 100],
+		["model", 2, undefined],
+		["compaction", 2, undefined],
+	]);
+	expect(events[0].detail).toBe("2 tool results, ≈300 tokens");
+	expect(events[1].detail).toBe("1 tool result, ≈200 tokens");
+	expect(eventKinds(events)).toEqual([["drop", 1], ["restore", 1], ["compaction", 2], ["branch summary", 1], ["model", 1]]);
+});
+
+test("expiryWarnAt gives the time of the cache expiry warning", () => {
+	const now = 1_000_000;
+	const stats = { usage: { tokens: 84200, contextWindow: 200000, percent: 42.1 }, cost: 0, requests: 3, cacheRate: 0.9, cacheUntil: now + 300_000 };
+	expect(expiryWarnAt({}, stats, now)).toBeUndefined();
+	expect(expiryWarnAt({ expiryWarnSeconds: 60 }, stats, now)).toBe(now + 240_000);
+	// Less time is left than the setting asks for: the warning is due now.
+	expect(expiryWarnAt({ expiryWarnSeconds: 600 }, stats, now)).toBe(now);
+	expect(expiryWarnAt({ expiryWarnSeconds: 60 }, stats, now + 300_000)).toBeUndefined();
+	expect(expiryWarnAt({ expiryWarnSeconds: 60 }, { ...stats, cacheUntil: undefined }, now)).toBeUndefined();
+	expect(expiryText(stats, now + 240_000)).toBe("The prompt cache expires in about 1m0s. A request after that sends the 84.2k tokens of the context without the cache.");
+	expect(expiryText({ ...stats, usage: undefined }, now + 240_000)).toBe("The prompt cache expires in about 1m0s. A request after that sends the whole context without the cache.");
+});
+
+test("exportMarkdown lists the request that each event followed and what the event changed", () => {
+	const entries = [...session(0), { type: "compaction", timestamp: new Date(2 * HOUR).toISOString(), tokensBefore: 5000 }, at(assistant(3 * HOUR))];
+	const text = exportMarkdown(view(entries), aggregate([], HOUR, 30));
+	expect(text).toContain("| 2 | compaction | ≈−4.0k | 5.0k tokens before compaction |");
 });

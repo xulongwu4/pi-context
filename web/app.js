@@ -34,6 +34,8 @@ const state = {
 	openCats: new Set(),
 	openItems: new Set(),
 	texts: new Map(),
+	/** The kind of event that Context Events lists. Empty: every kind. */
+	kind: "",
 	insights: null,
 	/** Length of the Insights period in days, or "all". */
 	days: 30,
@@ -358,12 +360,27 @@ function turnsCard(d) {
 	return table(["", "Time", "Input", ">Requests", ">Tools", ">Sent", ">Output", ">Cost", ">Took"], rows, "No input yet.");
 }
 
-const eventsCard = (d) =>
-	table(
-		["Time", "Kind", "Detail"],
-		d.events.map((event) => [clock(event.time), esc(event.kind), esc(event.detail)]),
-		"No compaction, model or branch events on this branch.",
+function eventsCard(d) {
+	if (d.events.length === 0) return `<p class="muted">No compaction, drop, model or branch events on this branch.</p>`;
+	const counts = new Map();
+	for (const event of d.events) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+	const kind = counts.has(state.kind) ? state.kind : "";
+	const chip = (name, count, value) => `<button${value === kind ? ' class="on"' : ""} data-act="kind" data-kind="${esc(value)}">${esc(name)} ${count}</button>`;
+	const chips = [chip("all", d.events.length, ""), ...[...counts].map(([name, count]) => chip(name, count, name))];
+	const shown = d.events.filter((event) => !kind || event.kind === kind);
+	// A negative change frees context.
+	const change = (delta) => (delta == null ? "" : `<span class="${delta < 0 ? "good" : "warn"}">≈${delta < 0 ? "−" : "+"}${tok(Math.abs(delta))}</span>`);
+	const sized = shown.filter((event) => event.delta != null);
+	const net = sized.length ? change(sized.reduce((sum, event) => sum + event.delta, 0)) : "not known";
+	const where = (event) => (event.after ? `<a data-act="request" data-n="${event.after}" title="Open the request in the Context Browser">#${event.after}</a>` : "start");
+	return (
+		`<div class="controls">${chips.join("")}</div><p>Net change of the context: ${net}</p>` +
+		table(
+			["Time", "After", "Kind", ">Change", "Detail"],
+			shown.map((event) => [clock(event.time), where(event), esc(event.kind), change(event.delta), esc(event.detail)]),
+		)
 	);
+}
 
 function filesCard(d) {
 	const ops = (file) => file.reads + file.writes + file.edits;
@@ -518,6 +535,7 @@ function fillSettings(d) {
 		warn: d.config.warnPercent ?? d.warnDefault,
 		compact: d.config.compactPercent ?? 0,
 		budget: d.config.budget ?? 0,
+		expiry: d.config.expiryWarnSeconds ?? 0,
 		footer: d.footer.join(" "),
 		prefix: d.config.systemPromptPrefix ?? "",
 		suffix: d.config.systemPromptSuffix ?? "",
@@ -713,6 +731,10 @@ const actions = {
 	},
 	session: (el) => openSession(el.dataset.file, el.dataset.title),
 	back: () => openSession(null),
+	kind(el) {
+		state.kind = el.dataset.kind;
+		render();
+	},
 	more() {
 		state.shown += SESSIONS_STEP;
 		render();

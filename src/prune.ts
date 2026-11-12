@@ -1,7 +1,6 @@
-import { contentChars, contentText, type Row, rowsOf } from "./analyze.ts";
+import { contentChars, contentText, PRUNE_ENTRY, type Row, rowsOf } from "./analyze.ts";
 
-/** Session entry type that lists the tool calls whose results the user dropped. The last entry on the branch applies. */
-export const PRUNE_ENTRY = "pi-context:prune";
+export { PRUNE_ENTRY };
 
 const STUB = "[pi-context: the user dropped this tool result from the context";
 

@@ -9,6 +9,7 @@ import {
 	CATEGORIES,
 	type Category,
 	diffRows,
+	eventKinds,
 	introducedAt,
 	LABELS,
 	type RequestRec,
@@ -52,7 +53,7 @@ const SORTS: [SessionSort, string][] = [
 	["cost", "by cost"],
 	["tokens", "by tokens"],
 ];
-export const SETTINGS = ["warn", "compact", "budget", "footer", "prefix", "suffix"] as const;
+export const SETTINGS = ["warn", "compact", "budget", "expiry", "footer", "prefix", "suffix"] as const;
 export type Setting = (typeof SETTINGS)[number];
 /** Characters of an item that the inspector shows at most. */
 const MAX_INSPECT_CHARS = 200_000;
@@ -155,6 +156,8 @@ export class ContextOverlay {
 	private loadedDays = 0;
 	private insights?: Insights;
 	private period = 1;
+	/** The kind of event that the Events tab lists. Empty: every kind. */
+	private kind = "";
 	/** The day that the Insights tab is narrowed to. */
 	private day?: string;
 	private projectOnly = false;
@@ -239,7 +242,11 @@ export class ContextOverlay {
 			return;
 		} else if (key === "/" && FILTERED.includes(this.name)) this.typing = true;
 		else if ((key === "d" || key === "u") && (this.name === "Current" || this.name === "Hints")) this.drop(key === "d");
-		else if (key === "o" && this.name === "Current") {
+		else if (key === "k" && this.name === "Events") {
+			const kinds = ["", ...eventKinds(this.data.analysis.events).map(([kind]) => kind)];
+			this.kind = kinds[(kinds.indexOf(this.kind) + 1) % kinds.length];
+			this.scroll = 0;
+		} else if (key === "o" && this.name === "Current") {
 			this.ordered = !this.ordered;
 			this.item = 0;
 			this.scroll = 0;
@@ -315,6 +322,7 @@ export class ContextOverlay {
 			Turns: "↑/↓ select  enter browse",
 			Trend: "↑/↓ select  enter browse  [ ] request",
 			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
+			Events: "↑/↓ scroll  k kind",
 			Files: "↑/↓ scroll  / filter",
 			Commands: "↑/↓ scroll  / filter",
 			Tools: "↑/↓ scroll  / filter",
@@ -992,9 +1000,26 @@ export class ContextOverlay {
 	}
 
 	private events(): string[] {
+		const t = this.theme;
 		const events = this.data.analysis.events;
-		if (events.length === 0) return ["No compaction, model or branch events on this branch."];
-		return events.map((e) => `  ${fmtTime(e.time)}  ${this.theme.fg("accent", e.kind.padEnd(14))} ${e.detail}`);
+		if (events.length === 0) return ["No compaction, drop, model or branch events on this branch."];
+		const kinds = eventKinds(events);
+		if (!kinds.some(([kind]) => kind === this.kind)) this.kind = "";
+		const shown = events.filter((e) => !this.kind || e.kind === this.kind);
+		const chip = (name: string, count: number, on: boolean) => (on ? t.bold(t.fg("accent", `[${name} ${count}]`)) : t.fg("muted", `${name} ${count}`));
+		// A negative change frees context.
+		const change = (delta: number | undefined, width = 0) =>
+			delta === undefined ? " ".repeat(width) : t.fg(delta < 0 ? "success" : "warning", `≈${delta < 0 ? "−" : "+"}${fmtTokens(Math.abs(delta))}`.padStart(width));
+		const sized = shown.filter((e) => e.delta !== undefined);
+		const where = (e: { after: number }) => (e.after ? `after #${e.after}` : "at the start");
+		const width = Math.max(...shown.map((e) => where(e).length));
+		return [
+			this.head("Events by kind"),
+			...this.wrap([chip("all", events.length, !this.kind), ...kinds.map(([kind, count]) => chip(kind, count, kind === this.kind))]),
+			this.pairs([["Net change of the context", sized.length ? change(sized.reduce((sum, e) => sum + (e.delta ?? 0), 0)) : "not known"]]),
+			"",
+			...shown.map((e) => `  ${fmtTime(e.time)}  ${t.fg("muted", where(e).padEnd(width))}  ${t.fg("accent", e.kind.padEnd(14))} ${change(e.delta, 8)}  ${e.detail}`),
+		];
 	}
 
 	private files(): string[] {
@@ -1227,6 +1252,11 @@ export class ContextOverlay {
 				name: "Cost budget",
 				value: config.budget ? fmtCost(config.budget) : "none",
 				help: "A warning appears once when the cost of the session reaches this amount, and the footer shows the cost. Clearing removes the budget.",
+			},
+			{
+				name: "Cache expiry warning",
+				value: config.expiryWarnSeconds ? `${config.expiryWarnSeconds}s before the expiry` : "off",
+				help: "While the agent is idle, a warning appears this many seconds before the estimated expiry of the prompt cache. Clearing turns it off.",
 			},
 			{
 				name: "Footer",

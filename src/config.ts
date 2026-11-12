@@ -9,6 +9,8 @@ export interface Config {
 	compactPercent?: number;
 	/** Session cost, in dollars, at which a warning is shown. Unset: none. */
 	budget?: number;
+	/** Seconds before the estimated expiry of the prompt cache at which a warning is shown while the agent is idle. Unset: none. */
+	expiryWarnSeconds?: number;
 	/** What the footer shows, in order. Unset: the context use. */
 	footer?: FooterItem[];
 }

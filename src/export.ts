@@ -125,8 +125,14 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		"## Events",
 		"",
 		...table(
-			["Time", "Event", "Detail"],
-			analysis.events.map((event) => [stamp(event.time), event.kind, event.detail]),
+			["Time", "After request", "Event", "Change", "Detail"],
+			analysis.events.map((event) => [
+				stamp(event.time),
+				event.after || "",
+				event.kind,
+				event.delta === undefined ? "" : `≈${event.delta < 0 ? "−" : "+"}${fmtTokens(Math.abs(event.delta))}`,
+				event.detail,
+			]),
 		),
 		"## Files",
 		"",
