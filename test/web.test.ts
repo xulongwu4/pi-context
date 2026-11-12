@@ -155,6 +155,13 @@ test("web shows what a request was assembled from and what changed since the req
 	expect((await get("request", { n: 9 })).status).toBe(400);
 });
 
+test("web data names the request and the tool call of each command, and the next request carries the result of that call", async () => {
+	const command = (await get("data")).body.commands[0];
+	expect(command).toMatchObject({ program: "ls", request: 1, id: "c1", ok: true });
+	const rows = (await get("request", { n: command.request + 1 })).body.rows;
+	expect(rows.find((row: any) => row.id === command.id)?.cat).toBe("toolResults");
+});
+
 test("web drops tool results and changes settings through the host", async () => {
 	expect((await post("drop", { ids: ["c1"], dropped: true })).status).toBe(200);
 	expect((await post("drop", { ids: ["c1"], dropped: false })).status).toBe(200);

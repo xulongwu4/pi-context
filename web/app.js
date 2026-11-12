@@ -444,8 +444,20 @@ function commandsCard(d) {
 	const programs = new Map();
 	for (const command of d.commands) programs.set(command.program, (programs.get(command.program) ?? 0) + 1);
 	const status = (ok) => (ok == null ? "" : ok ? `<span class="good">ok</span>` : `<span class="bad">failed</span>`);
-	const rows = [...d.commands].reverse().map((command) => [clock(command.time), status(command.ok), esc(command.program), clip(command.command, "mono")]);
-	return pills(`${d.commands.length} runs of ${programs.size} programs`, [...programs]) + table(["Time", "", "Program", "Command"], rows, "No command yet.");
+	// A short command shows tenths of a second.
+	const took = (ms) => (ms == null ? "" : ms < 10_000 ? (ms / 1000).toFixed(1) + "s" : dur(ms));
+	const by = (command) =>
+		command.id
+			? `<a data-act="result" data-n="${command.request}" data-id="${esc(command.id)}" title="Show the tool result in the Context Browser">#${command.request}</a>`
+			: `<span class="muted">user</span>`;
+	const rows = [...d.commands]
+		.reverse()
+		.map((command) => [clock(command.time), by(command), status(command.ok), took(command.ms), esc(command.program), clip(command.command, "mono")]);
+	const timed = d.commands.filter((command) => command.ms != null);
+	const failed = d.commands.filter((command) => command.ok === false).length;
+	const time = timed.length ? `, ${dur(timed.reduce((sum, command) => sum + command.ms, 0))}` : "";
+	const title = `${d.commands.length} runs of ${programs.size} programs, ${failed} failed${time}`;
+	return pills(title, [...programs]) + table(["Time", "Request", "", ">Took", "Program", "Command"], rows, "No command yet.");
 }
 
 function toolsCard(d) {

@@ -155,6 +155,12 @@ export interface CommandRec {
 	time: number;
 	command: string;
 	program: string;
+	/** Requests made before the command ran: the number of the request that ran it, for a command of the model. */
+	request: number;
+	/** Tool call whose result tells the outcome. For a nested call, the call that made it. Undefined for a command of the user. */
+	id?: string;
+	/** Wall time, when the session tells it. */
+	ms?: number;
 	ok?: boolean;
 }
 
@@ -896,7 +902,7 @@ export function analyze(entries: any[]): Analysis {
 		return skill;
 	};
 	/** Counts a tool call. A call nested in the result of another one comes with its status and the id of that other call. */
-	const recordCall = (call: { id: string; name: string; arguments?: any }, time: number, nestedStatus?: string, outer?: string) => {
+	const recordCall = (call: { id: string; name: string; arguments?: any; durationMs?: number }, time: number, nestedStatus?: string, outer?: string) => {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
 		const rec = tool(call.name);
@@ -927,7 +933,14 @@ export function analyze(entries: any[]): Analysis {
 		} else if (op === "edits" && nestedStatus !== "error" && hasAnchor(call.arguments)) analysis.unresolvedEdits++;
 		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path));
 		if (call.name === "bash" && typeof call.arguments?.command === "string") {
-			const command: CommandRec = { time, command: call.arguments.command, program: programOf(call.arguments.command) };
+			const command: CommandRec = {
+				time,
+				command: call.arguments.command,
+				program: programOf(call.arguments.command),
+				request: analysis.requests.length,
+				id: outer ?? call.id,
+			};
+			if (typeof call.durationMs === "number") command.ms = call.durationMs;
 			commandsById.set(call.id, command);
 			analysis.commands.push(command);
 		}
@@ -993,7 +1006,7 @@ export function analyze(entries: any[]): Analysis {
 			input = inputAt(time, preview(skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content)));
 		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
 		if (m.role === "bashExecution") {
-			analysis.commands.push({ time, command: m.command, program: programOf(m.command), ok: m.exitCode === 0 });
+			analysis.commands.push({ time, command: m.command, program: programOf(m.command), request: analysis.requests.length, ok: m.exitCode === 0 });
 			if (!m.excludeFromContext) add("bash", (m.command?.length ?? 0) + (m.output?.length ?? 0));
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
@@ -1011,7 +1024,10 @@ export function analyze(entries: any[]): Analysis {
 				op.added = op.removed = undefined;
 			} else if (op && op.op !== "reads" && typeof m.details?.diff === "string") [op.added, op.removed] = diffLines(m.details.diff);
 			const command = commandsById.get(m.toolCallId);
-			if (command) command.ok = !m.isError;
+			if (command) {
+				command.ok = !m.isError;
+				if (typeof m.durationMs === "number") command.ms = m.durationMs;
+			}
 			const skill = skillsById.get(m.toolCallId);
 			if (skill) skill.tokens = estimate(contentChars(m.content));
 			// Calls that this tool made to other tools (for example from a script).

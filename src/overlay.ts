@@ -9,6 +9,7 @@ import {
 	cacheStats,
 	CATEGORIES,
 	type Category,
+	type CommandRec,
 	diffRows,
 	eventKinds,
 	type FileOp,
@@ -174,6 +175,8 @@ export class ContextOverlay {
 	/** The files or operations that the Files tab lists. */
 	private fileList: FileRec[] = [];
 	private ops: FileOp[] = [];
+	/** The commands that the Commands tab lists. */
+	private commandList: CommandRec[] = [];
 	/** Tool call whose result the list of items selects when it is next shown. */
 	private toResult?: string;
 	/** Position in TOOL_ORDERS of the order of the Tools tab. */
@@ -272,6 +275,11 @@ export class ContextOverlay {
 			}
 			else if (this.name === "Turns") this.openTurn();
 			else if (this.name === "Files") this.openFile();
+			else if (this.name === "Commands") {
+				const command = this.commandList[this.item];
+				if (command?.id) this.openResult(command.request, command.id);
+				else if (command) this.notice = "The user ran this command: it has no tool result.";
+			}
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
 			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
 			else if (this.name === "Settings") {
@@ -368,7 +376,7 @@ export class ContextOverlay {
 			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
 			Events: "↑/↓ scroll  k kind",
 			Files: this.opened ? "↑/↓ select  enter result  esc files" : "↑/↓ select  enter operations  / filter",
-			Commands: "↑/↓ scroll  / filter",
+			Commands: "↑/↓ select  enter result  / filter",
 			Tools: "↑/↓ scroll  / filter  s sort",
 			Fleet: "↑/↓ select  enter open",
 			Insights: "↑/↓ select  enter open  p period  [ ] day  a project  s sort  / filter",
@@ -529,7 +537,7 @@ export class ContextOverlay {
 		return at < 0 ? bars.length - 1 : at;
 	}
 	private move(delta: number): void {
-		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Files", "Settings"];
+		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Files", "Commands", "Settings"];
 		if (this.name === "Trend") {
 			const bars = trendBars(this.data.analysis, this.byTurn, false);
 			const next = Math.max(0, Math.min(bars.length - 1, this.barAt(bars) + delta));
@@ -743,7 +751,7 @@ export class ContextOverlay {
 			case "Files":
 				return this.files();
 			case "Commands":
-				return { lines: this.commands() };
+				return this.commands();
 			case "Tools":
 				return { lines: this.tools() };
 			case "Fleet":
@@ -1187,24 +1195,38 @@ export class ContextOverlay {
 		);
 	}
 
-	private commands(): string[] {
+	private commands(): Body {
+		const t = this.theme;
 		const commands = this.data.analysis.commands;
-		if (commands.length === 0) return ["No commands yet."];
+		if (commands.length === 0) return { lines: ["No commands yet."] };
 		const counts = new Map<string, number>();
 		for (const c of commands) counts.set(c.program, (counts.get(c.program) ?? 0) + 1);
 		const programs = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 10);
-		const mark = (ok?: boolean) =>
-			ok === undefined ? this.theme.fg("dim", "…") : ok ? this.theme.fg("success", "✓") : this.theme.fg("error", "✗");
-		return [
+		const mark = (ok?: boolean) => (ok === undefined ? t.fg("dim", "…") : ok ? t.fg("success", "✓") : t.fg("error", "✗"));
+		const timed = commands.filter((c) => c.ms !== undefined);
+		// Newest first.
+		this.commandList = commands.filter((c) => this.matches(c.command)).reverse();
+		this.item = Math.max(0, Math.min(this.item, this.commandList.length - 1));
+		const top = [
+			this.pairs([
+				["Commands", commands.length],
+				["Failed", commands.filter((c) => c.ok === false).length],
+				["Time", timed.length ? fmtDuration(timed.reduce((sum, c) => sum + (c.ms ?? 0), 0)) : "not known"],
+			]),
+			"",
 			this.head("Programs"),
 			`  ${programs.map(([name, n]) => `${name} ×${n}`).join("   ")}`,
 			"",
 			this.head("Executions (newest first)"),
-			...commands
-				.filter((c) => this.matches(c.command))
-				.reverse()
-				.map((c) => `  ${mark(c.ok)} ${fmtTime(c.time)}  ${c.command.replace(/\s+/g, " ")}`),
+			t.fg("muted", `    ${"time".padEnd(8)}  ${"request".padEnd(7)}  ${"took".padStart(6)}  command`),
 		];
+		const lines = this.commandList.map((c, i) => {
+			const request = (c.id ? `#${c.request}` : "user").padEnd(7);
+			// A short command shows tenths of a second.
+			const took = (c.ms === undefined ? "" : c.ms < 10_000 ? `${(c.ms / 1000).toFixed(1)}s` : fmtDuration(c.ms)).padStart(6);
+			return `${i === this.item ? t.fg("accent", "▶") : " "} ${mark(c.ok)} ${fmtTime(c.time)}  ${t.fg("muted", request)}  ${took}  ${c.command.replace(/\s+/g, " ")}`;
+		});
+		return { lines: [...top, ...lines], cursor: this.item === 0 ? 0 : top.length + this.item };
 	}
 
 	private tools(): string[] {

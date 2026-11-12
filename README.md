@@ -23,7 +23,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | Browser | What one request was assembled from, in reading order, and what changed since the request before it: items added, changed and removed, and the items and tokens each category gained or lost |
   | Events | Compactions, dropped and restored tool results, model switches, thinking level changes and branch summaries: the number of events of each kind, the request each event followed, and the tokens it added to the context or took from it |
   | Files | Reads, writes and edits per file, and the lines the writes and edits added and removed. A file opens into its operations, newest first: the time, the request that made the call, the tool, and the lines it changed |
-  | Commands | Shell commands, their result, and the programs they ran |
+  | Commands | Shell commands, newest first: the result of each, the request that ran it and the time it took. Above the list: the number of commands, the failed ones, the time they took together, and the programs they ran |
   | Tools | Calls, errors and estimated tokens per tool, the size of its schema and who provides it (pi, an MCP server, a package or an extension file), the tool schemas summed by source, and the skills that were loaded. Declared tools that were never called are listed too |
   | Fleet | The main agent and its subagents: status, time, model, requests, tokens, cost |
   | Insights | The last 7, 30 or 90 days or all time, over all projects or the current one, or one day of that period: totals, a calendar of the tokens by day, a 7-day chart, activity by weekday and hour, the tokens sent by category, requests and cost per model, cost per project, top tools, programs and skills, and the sessions |
@@ -35,6 +35,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
   | --- | --- |
   | Turns | `enter` opens the first request of the selected input in Browser |
   | Files | `enter` lists the operations on the selected file; `enter` on an operation selects its tool result in Browser, or in Current when no request followed; `esc` goes back to the files |
+  | Commands | `enter` selects the tool result of the selected command in Browser, or in Current when no request followed |
 | Trend | `enter` opens the selected request in Browser, at the first item added since the request before; `g` switches between one bar for each request and one for each human input; `m` switches between totals and changes |
   | Current, Browser | `enter` shows the whole content of the selected item; `esc` goes back |
   | Current | `o` switches the list between largest first and reading order |
@@ -79,6 +80,7 @@ pi -e /path/to/pi-context/src/index.ts   # one run
 - `Drop` and `Restore` on a tool result, in the Context Browser or in Hints, do what `d` and `u` do in the overlay.
 - In Context Events, the buttons list one kind of event or all. The number in the After column opens that request in the Context Browser.
 - In File Activity, click a file to list the operations on it. The request number of an operation shows the tool result of that operation in the Context Browser.
+- In Command Executions, the request number of a command shows the tool result of that command in the Context Browser.
 - In Tools, Skills and Models, each tool shows the size of its schema and who provides it. `Calls`, `Schema` and `Name` change the order. A second table sums the tool schemas by source.
 - The Settings card changes the context warning, auto-compact, the cost budget, the cache expiry warning, the footer, and the system prompt prefix and suffix. An empty number restores the default.
 - The Insights page shows the last 7, 30 or 90 days or all time, over all projects or the current one. `Today` or a click on a day in the calendar narrows the page to that day; a second click shows the whole period again. Click a session to open its Context page. A saved session is read-only.
@@ -122,7 +124,8 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 - The first request that carried an item is the first request made after the message of the item was created. The system prompt and the tool schemas have no such time and show none. An item that no request has carried yet shows none either. In the overlay, the strip does not show an item smaller than one cell.
 - File activity counts tool calls named `read` or `write`, or matching `edit|replace|insert|patch`. Edit tools that address lines by anchor name the file only in their result, so their file is known only for turns that ran while the extension was loaded. The Files tab says how many such edits it cannot list.
 - The lines an edit added and removed are counted in the diff that the edit tool returns. An edit made by a script returns its diff only to the script, so its lines are known only for turns that ran while the extension was loaded. Without a diff, the lines are estimated from the `oldText` and `newText` arguments. A write counts every line of its content as added, and nothing as removed: the session does not tell what the file held before. The totals of a file sum the operations whose lines are known. A failed operation counts as an operation and changes no line.
-- The result of an operation made by a script is the result of the script: the session keeps no result for the nested call.
+- The result of a file operation or a command made by a script is the result of the script: the session keeps no result for the nested call.
+- The time a command took is the time pi saved with its tool result, or with the nested call of a script. A session that has no such time shows none. A command that the user ran with `!` shows `user` in place of a request, and no time.
 - The Tools tab marks a tool with `!` when the model called it directly although it is not declared to the model. This happens in codemode `only` mode: a hidden tool stays active, so a direct call by name still runs. Each call is judged by the declarations the extension recorded for the request that made it. Calls made before the first record are judged by the tools declared now.
 - The source of a tool is `mcp:<server>` when its name is `mcp__<server>__<tool>`, `pi` for a built-in tool, the package for a tool of a package, and the name of the extension file otherwise. Pi tells the source only of the tools that are loaded now. For a saved session, the sources are those recorded with the tool declarations; a session recorded by an earlier version shows only MCP servers. The whole content of the tool schemas item in Current and Browser lists each schema with its size and source.
 - The Schema column shows the declarations of the last request, not those of the request that made a call. A tool that was called and is no longer declared shows no schema.

@@ -209,6 +209,26 @@ test("analyze logs the operations on each file with the lines they changed", () 
 	expect(argLines({ anchor: "aaaaa", text: "x" })).toBeUndefined();
 });
 
+test("analyze tells how long each command took and which request ran it", () => {
+	const at = (message: any, i: number) => ({ type: "message", timestamp: new Date(1000 * i).toISOString(), message: { ...message, timestamp: i } });
+	const bash = (id: string, command: string, more: any = {}) => ({ id, name: "bash", arguments: { command }, ...more });
+	const result = (id: string, toolName: string, more: any) => ({ role: "toolResult", toolCallId: id, toolName, content: [], isError: false, ...more });
+	const a = analyze([
+		at({ role: "bashExecution", command: "git status", output: "", exitCode: 0 }, 1),
+		at({ role: "assistant", usage: usage(10, 1), content: [{ type: "toolCall", ...bash("b", "bun test") }, { type: "toolCall", id: "s", name: "codemode", arguments: {} }] }, 2),
+		at(result("b", "bash", { durationMs: 2300 }), 3),
+		at(result("s", "codemode", { durationMs: 900, nestedCalls: { calls: [bash("s/1", "ls", { status: "ok", durationMs: 80 }), bash("s/2", "pwd", { status: "ok" })] } }), 4),
+	]);
+	expect(a.commands.map((c) => [c.program, c.request, c.id, c.ms])).toEqual([
+		// The user ran it before the first request; it has no tool call.
+		["git", 0, undefined, undefined],
+		["bun", 1, "b", 2300],
+		// A nested command is found through the call that made it, and has its own time.
+		["ls", 1, "s", 80],
+		["pwd", 1, "s", undefined],
+	]);
+});
+
 test("analyze derives requests, events, files and commands", () => {
 	const entry = (message: any, i: number) => ({ type: "message", timestamp: new Date(1000 * i).toISOString(), message });
 	const entries = [

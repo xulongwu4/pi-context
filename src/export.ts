@@ -146,8 +146,14 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		`Programs: ${top([...programs].sort((a, b) => b[1] - a[1]))}`,
 		"",
 		...table(
-			["Time", "Result", "Command"],
-			analysis.commands.map((c) => [stamp(c.time), c.ok === undefined ? "" : c.ok ? "ok" : "failed", `\`${c.command}\``]),
+			["Time", "Request", "Result", "Took", "Command"],
+			analysis.commands.map((c) => [
+				stamp(c.time),
+				c.id ? `#${c.request}` : "user",
+				c.ok === undefined ? "" : c.ok ? "ok" : "failed",
+				c.ms === undefined ? "" : fmtDuration(c.ms),
+				`\`${c.command}\``,
+			]),
 		),
 		"## Tools",
 		"",
