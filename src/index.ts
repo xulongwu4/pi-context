@@ -647,6 +647,23 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("context", {
 		description:
 			"Show context insights. Subcommands: prefix [text] and suffix [text] set the system prompt prefix/suffix; warn [percent], compact [percent], budget [dollars], expiry [seconds] and footer [items] change settings; export [file] writes a Markdown report, or JSON when the file ends in .json; web opens the context page in the browser, web stop stops its server",
+		getArgumentCompletions: (prefix) => {
+			const [sub, ...rest] = prefix.trimStart().split(/\s+/);
+			if (sub === "web" && rest.length === 1) return "stop".startsWith(rest[0]) ? [{ value: "web stop", label: "stop" }] : null;
+			if (sub === "footer" && rest.length > 0) {
+				const text = prefix.trimStart();
+				const last = /[^\s,]*$/.exec(text)?.[0] ?? "";
+				const head = text.slice(0, text.length - last.length);
+				const used = head.split(/[\s,]+/);
+				const items = FOOTER_ITEMS.filter((item) => item.startsWith(last) && !used.includes(item)).map((item) => ({ value: `${head}${item} `, label: item }));
+				return items.length > 0 ? items : null;
+			}
+			if (rest.length > 0) return null;
+			const items = ["prefix", "suffix", "warn", "compact", "budget", "expiry", "footer", "export", "web"]
+				.filter((name) => name.startsWith(sub))
+				.map((name) => ({ value: `${name} `, label: name }));
+			return items.length > 0 ? items : null;
+		},
 		handler: async (args, ctx) => {
 			hidden = ctx.getSystemPromptOptions().hiddenTools ?? [];
 			const [, sub, rest = ""] = /^(prefix|suffix|warn|compact|budget|expiry|footer|export|web)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
