@@ -1,4 +1,4 @@
-import { cacheStats, CATEGORIES, LABELS, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
+import { cacheStats, CATEGORIES, FILE_KINDS, fileRows, LABELS, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
 import { hintTotal } from "./hints.ts";
 
@@ -74,12 +74,11 @@ export function report(data: ViewData, section: Section = "summary"): string {
 			].join("\n");
 		case "files":
 			return [
-				"Files (reads, writes, edits):",
+				"Files (reads, writes, edits, searches, images):",
 				...none(
-					[...analysis.files]
-						.sort((a, b) => b.reads + b.writes + b.edits - (a.reads + a.writes + a.edits))
+					fileRows(analysis.files)
 						.slice(0, MAX_ROWS)
-						.map((file) => `  ${file.reads} ${file.writes} ${file.edits}  ${file.path}`),
+						.map((file) => `  ${FILE_KINDS.map((kind) => file[kind]).join(" ")}  ${file.path}`),
 					"None.",
 				),
 			].join("\n");

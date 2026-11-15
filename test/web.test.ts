@@ -26,6 +26,8 @@ const view = (other?: string): ViewData => ({
 	dropped: [],
 	config: { budget: 5 },
 	agents: [],
+	timeline: [],
+	tasks: [],
 	running: false,
 	other,
 	// The context of a request: the messages before its answer.
@@ -48,6 +50,10 @@ const summary: SessionSummary = {
 	programs: { ls: 1 },
 	skills: {},
 	composition: {},
+	activity: { [Math.floor(Date.now() / 3_600_000)]: [1, 1, 900, 250, 50] },
+	context: 150,
+	profile: [40, 0, 110],
+	lastUsed: { tools: { bash: Date.now() - 1500 }, programs: {}, skills: {} },
 	file: "/sessions/s1.jsonl",
 };
 
@@ -196,6 +202,45 @@ test("web opens only the saved sessions that Insights listed, read-only", async 
 	expect((await get("data", { session: "/etc/passwd" })).status).toBe(400);
 });
 
+test("web compares a request with the request before it, or with the last request before its human input", async () => {
+	const before = (await get("request", { n: 2 })).body;
+	expect(before.since).toBe(1);
+	expect(before.replies).toEqual({ reasoning: 0, toolCalls: 1, answers: 0 });
+	// Both requests answer the same human input: no request came before it.
+	const input = (await get("request", { n: 2, base: "input" })).body;
+	expect(input.since).toBeUndefined();
+	expect(input.marks).toBeUndefined();
+});
+
+test("web gives the content of a tool result with its call", async () => {
+	const rows = (await get("request", { n: 2 })).body.rows;
+	const call = { tool: "bash", status: "ok", lines: 2, args: '{\n  "command": "ls"\n}' };
+	expect((await get("text", { n: 2, i: rows.findIndex((row: any) => row.id === "c1") })).body).toEqual({ text: "a.txt\nb.txt", call });
+	expect((await get("text", { n: 2, i: rows.findIndex((row: any) => row.call === "c1") })).body.call).toBeUndefined();
+	const data = (await get("data")).body;
+	expect((await get("text", { v: data.version, i: data.current.findIndex((row: any) => row.id === "c1") })).body.call).toEqual(call);
+});
+
+test("web data carries the view defaults, the reply kinds and the fleet", async () => {
+	const body = (await get("data")).body;
+	expect(body.view).toEqual({ period: "30", trend: "request", mode: "total", tools: "calls", files: "ops", diff: "request" });
+	expect(body.choices.diff).toMatchObject({ label: "Diff baseline", values: ["request", "input"] });
+	expect(body.replies).toEqual({ reasoning: 0, toolCalls: 1, answers: 1 });
+	expect(body).toMatchObject({ timeline: [], tasks: [], board: [] });
+});
+
+test("web lists the sessions that used a tool, with the figures of all sessions", async () => {
+	const used = (await get("insights", { days: 7, uses: "tools:bash", sort: "context" })).body;
+	expect(used.sessions).toEqual([expect.objectContaining({ name: "Saved one", context: 150, profile: [40, 0, 110] })]);
+	expect(used.sessions[0].activity).toBeUndefined();
+	expect(used.sessions[0].lastUsed).toBeUndefined();
+	expect(used).toMatchObject({ userInputs: 1, toolCalls: 1, activeMs: 900, cacheRate: 0.2 });
+	expect(used.tools).toEqual([["bash", 1, summary.lastUsed.tools.bash]]);
+	const unused = (await get("insights", { days: 7, uses: "tools:read" })).body;
+	expect(unused).toMatchObject({ sessions: [], requests: 2 });
+	// A use that names no kind of the tallies is ignored.
+	expect((await get("insights", { days: 7, uses: "models:m1" })).body.sessions).toHaveLength(1);
+});
 test("web tells an open page that the session changed", async () => {
 	const response = await fetch(address("api/events"));
 	const reader = response.body!.getReader();

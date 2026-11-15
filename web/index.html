@@ -47,6 +47,10 @@
 					<option value="size">By category, largest first</option>
 					<option value="flat">One list, in reading order</option>
 				</select>
+				<select id="base" title="What the diff of a request compares with">
+					<option value="request">Diff: request before</option>
+					<option value="input">Diff: human input</option>
+				</select>
 				<input id="filter" type="search" placeholder="Filter items">
 			</div>
 			<div class="body"></div>
@@ -74,6 +78,11 @@
 		</section>
 		<section class="card" id="files">
 			<h2>File Activity</h2>
+			<div class="controls">
+				<button data-act="files" data-order="ops" title="Most operations first">Operations</button>
+				<button data-act="files" data-order="recent" title="Last used first">Last used</button>
+				<button data-act="files" data-order="name" title="By path">Path</button>
+			</div>
 			<div class="body"></div>
 		</section>
 		<section class="card" id="commands">
@@ -89,6 +98,22 @@
 			</div>
 			<div class="body"></div>
 		</section>
+		<section class="card wide" id="agents">
+			<h2>Agents</h2>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="timeline">
+			<h2>Collaboration Timeline</h2>
+			<div class="controls">
+				<button data-act="earliest" title="Earliest event first. Off: latest first">Earliest first</button>
+				<input id="fleet-search" type="search" placeholder="Search events">
+			</div>
+			<div class="body"></div>
+		</section>
+		<section class="card" id="board">
+			<h2>Tasks Board</h2>
+			<div class="body"></div>
+		</section>
 		<section class="card wide" id="settings">
 			<h2>Settings</h2>
 			<form id="settings-form">
@@ -101,6 +126,10 @@
 				<label class="full">System prompt suffix (empty = disabled)<textarea name="suffix" rows="3"></textarea></label>
 				<div class="full"><button type="submit" class="on">Save</button> <span id="settings-note" class="muted"></span></div>
 			</form>
+			<h3>View defaults</h3>
+			<p class="muted">What the views show when they open. A change is saved at once and applies to this page.</p>
+			<div id="choices" class="choices"></div>
+			<p id="choices-note" class="muted"></p>
 		</section>
 	</main>
 
@@ -158,7 +187,9 @@
 					<option value="recent">Most recent first</option>
 					<option value="cost">Highest cost first</option>
 					<option value="tokens">Most tokens first</option>
+					<option value="context">Largest context first</option>
 				</select>
+				<label><input id="group" type="checkbox"> Group by project</label>
 			</div>
 			<div class="body"></div>
 		</section>

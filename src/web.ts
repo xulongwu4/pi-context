@@ -4,10 +4,14 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
+	baselineOf,
 	briefOf,
+	callOf,
+	callView,
 	diffRows,
 	LABELS,
 	type RequestRec,
+	replyCounts,
 	type Row,
 	scaleOf,
 	schemaSources,
@@ -18,8 +22,9 @@ import {
 	trendBars,
 	type ViewData,
 } from "./analyze.ts";
-import { DEFAULT_WARN_PERCENT } from "./config.ts";
+import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
 import { viewJson } from "./export.ts";
+import { boardOf } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
 import { aggregate, type SessionSort } from "./insights.ts";
 import type { OverlayHost } from "./overlay.ts";
@@ -56,7 +61,8 @@ const NOTIFY_MS = 2000;
 const MAX_BODY = 1_000_000;
 /** Requests whose rebuilt context is kept, so that opening items of a request does not rebuild it each time. */
 const MAX_REBUILT = 4;
-const SORTS: SessionSort[] = ["recent", "cost", "tokens"];
+const SORTS: SessionSort[] = ["recent", "cost", "tokens", "context"];
+const USE_KINDS = ["tools", "programs", "skills"] as const;
 
 type Route = (query: URLSearchParams, body: any) => unknown;
 
@@ -138,6 +144,11 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 		return index;
 	}
 
+	/** The content of an item. A tool result comes with what {@link callView} tells about its call. */
+	function described(row: Row | undefined, text: string | undefined, rows: Row[]) {
+		if (!row?.id || text === undefined) return { text };
+		return { text, call: callView(row, text, callOf(row, rows)?.text) };
+	}
 	const get: Record<string, Route> = {
 		data(query) {
 			const file = query.get("session");
@@ -155,16 +166,20 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				footer: footerItems(data.config),
 				warnDefault: DEFAULT_WARN_PERCENT,
 				labels: LABELS,
+				replies: replyCounts(data.current),
+				board: boardOf(data.tasks, data.agents),
+				choices: CHOICES,
+				view: Object.fromEntries(CHOICE_SETTINGS.map((setting) => [setting, choiceOf(data.config, setting)])),
 			};
 		},
-		/** What one request was assembled from, and what changed since the request before it. */
+		/** What one request was assembled from, and what changed since the request before it, or with `base=input` since the last request before its human input. */
 		request(query) {
 			const v = view(query.get("session"));
 			const requests = v.data.analysis.requests;
 			const index = indexOf(v, query.get("n"));
 			const request = requests[index];
 			const rows = request.rows ?? rebuilt(v, request);
-			const previous = requests[index - 1];
+			const previous = requests[baselineOf(v.data.analysis, index, query.get("base") === "input" ? "input" : "request")];
 			const diff = previous ? diffRows(previous.rows ?? rebuilt(v, previous), rows) : undefined;
 			return {
 				n: request.n,
@@ -178,32 +193,38 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				delta: diff?.delta,
 				items: diff?.items,
 				brief: briefOf(v.data.analysis, index, query.get("turn") === "1"),
+				replies: replyCounts(rows),
 			};
 		},
-		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. */
+		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. A tool result comes with its call. */
 		text(query) {
 			const v = view(query.get("session"));
 			const index = Number(query.get("i"));
 			if (!query.has("n")) {
 				if (Number(query.get("v")) !== v.version) throw new Error("The context has changed.");
-				return { text: v.data.current[index]?.text };
+				return described(v.data.current[index], v.data.current[index]?.text, v.data.current);
 			}
 			const request = v.data.analysis.requests[indexOf(v, query.get("n"))];
-			const row = (request.rows ?? rebuilt(v, request))[index];
-			return { text: row && textOf(row, index, rebuilt(v, request)) };
+			const full = rebuilt(v, request);
+			const row = (request.rows ?? full)[index];
+			return described(row, row && textOf(row, index, full), full);
 		},
 		async insights(query) {
 			// "all" is a period without a start.
 			const all = query.get("days") === "all";
 			const days = all ? Number.POSITIVE_INFINITY : Math.min(365, Math.max(1, Math.round(Number(query.get("days")) || 30)));
 			const day = query.get("day") ?? "";
+			// "tools:read" lists only the sessions that used the tool read.
+			const [, usedKind, name] = /^(\w+):(.+)$/.exec(query.get("uses") ?? "") ?? [];
+			const kind = USE_KINDS.find((each) => each === usedKind);
 			const filter = {
 				cwd: query.get("project") === "1" ? host.cwd : undefined,
 				sort: SORTS.find((sort) => sort === query.get("sort")),
 				day: /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined,
+				uses: kind && name ? { kind, name } : undefined,
 			};
 			const insights = aggregate(await host.loadSummaries(days, () => {}), Date.now(), days, filter);
-			const sessions = insights.sessions.map(({ models, tools, programs, skills, composition, ...session }) => session);
+			const sessions = insights.sessions.map(({ models, tools, programs, skills, composition, activity, lastUsed, ...session }) => session);
 			for (const session of sessions) if (session.file) known.set(session.file, session.name || session.cwd);
 			return { ...insights, days: all ? "all" : days, sessions };
 		},

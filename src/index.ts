@@ -7,6 +7,7 @@ import {
 	type ExtensionCommandContext,
 	type ExtensionContext,
 	getAgentDir,
+	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -34,8 +35,22 @@ import {
 	type TurnData,
 	type ViewData,
 } from "./analyze.ts";
-import { applyAffixes, type Config, DEFAULT_WARN_PERCENT, FOOTER_ITEMS, type FooterItem, loadConfig, saveConfig } from "./config.ts";
+import {
+	applyAffixes,
+	CHOICE_SETTINGS,
+	CHOICES,
+	type ChoiceSetting,
+	type Config,
+	choiceOf,
+	DEFAULT_WARN_PERCENT,
+	FOOTER_ITEMS,
+	type FooterItem,
+	loadConfig,
+	saveConfig,
+	setChoice,
+} from "./config.ts";
 import { exportJson, exportMarkdown } from "./export.ts";
+import { readTasks, taskFile, timelineOf } from "./fleet.ts";
 import { expiryText, expiryWarnAt, type FooterStats, footerItems, footerText } from "./footer.ts";
 import { fmtCost, fmtPercent, fmtTokens } from "./format.ts";
 import { hintsOf } from "./hints.ts";
@@ -97,7 +112,9 @@ function describe(setting: NumberSetting, config: Config): string {
 	return config.budget ? `Cost budget: ${fmtCost(config.budget)} for a session.` : "No cost budget.";
 }
 
-type AgentUsage = Pick<AgentRec, "requests" | "tokens" | "cost">;
+type AgentUsage = Pick<AgentRec, "requests" | "tokens" | "cost" | "context" | "sums" | "model">;
+
+const isChoice = (name: string): name is ChoiceSetting => Object.hasOwn(CHOICES, name);
 
 export default function (pi: ExtensionAPI) {
 	const configPath = join(getAgentDir(), "pi-context.json");
@@ -180,16 +197,21 @@ export default function (pi: ExtensionAPI) {
 		return Object.fromEntries([...schemas].map(([name, chars]) => [name, estimate(chars)]));
 	}
 
-	/** Requests, tokens and cost of a finished subagent, read from its saved session. */
+	/** Requests, tokens, cost and last context of a finished subagent, read from its saved session. */
 	function fileUsage(file: string | undefined): AgentUsage {
 		if (!file) return {};
 		try {
 			const mtimeMs = statSync(file).mtimeMs;
 			const hit = fileUsageCache.get(file);
 			if (hit?.mtimeMs === mtimeMs) return hit.usage;
-			const { requests, tokens, cost } = summarize(parseEntries(readFileSync(file, "utf8")));
-			fileUsageCache.set(file, { mtimeMs, usage: { requests, tokens, cost } });
-			return { requests, tokens, cost };
+			const all = parseEntries(readFileSync(file, "utf8"));
+			const { requests, tokens, cost, context } = summarize(all);
+			const entries = all.filter((entry) => entry.type !== "session");
+			const last = entries.findLast((entry) => entry.type === "message" && entry.message?.role === "assistant")?.message;
+			const usage: AgentUsage = { requests, tokens, cost, context, sums: sumByCategory(rowsOf(buildSessionProjection(entries, entries.at(-1)?.id).messages)) };
+			if (last?.model) usage.model = last.provider ? `${last.provider}/${last.model}` : last.model;
+			fileUsageCache.set(file, { mtimeMs, usage });
+			return usage;
 		} catch {
 			return {};
 		}
@@ -202,19 +224,44 @@ export default function (pi: ExtensionAPI) {
 			const live = liveAgents.get(saved.id);
 			// A resumed agent runs again after its record was saved.
 			const rec: AgentRec = live && !live.completedAt ? { ...saved, ...live } : { ...live, ...saved };
-			merged.set(saved.id, rec.requests == null ? { ...rec, ...fileUsage(rec.sessionFile) } : rec);
+			// What this run of pi saw of the agent goes before what its saved session tells.
+			merged.set(saved.id, rec.status === "running" ? rec : { ...fileUsage(rec.sessionFile), ...rec });
 		}
 		for (const live of liveAgents.values()) if (!merged.has(live.id)) merged.set(live.id, live);
 		const all = [...merged.values()];
-		const family = (agent: AgentRec): AgentRec[] => [agent, ...all.filter((child) => child.parent === agent.id).flatMap(family)];
+		const family = (agent: AgentRec, depth = 0): AgentRec[] => [
+			{ ...agent, depth },
+			...all.filter((child) => child.parent === agent.id).flatMap((child) => family(child, depth + 1)),
+		];
 		return all
 			.filter((agent) => !agent.parent || !merged.has(agent.parent))
 			.sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))
-			.flatMap(family);
+			.flatMap((agent) => family(agent));
 	}
 
+	/** The context window of a model, named "provider/id" or by its id alone. */
+	function windowOf(ctx: ExtensionContext, model?: string): number | undefined {
+		if (!model) return undefined;
+		const slash = model.indexOf("/");
+		const named = slash > 0 ? ctx.modelRegistry.find(model.slice(0, slash), model.slice(slash + 1)) : undefined;
+		return (named ?? ctx.modelRegistry.getAll().find((each) => each.id === model))?.contextWindow;
+	}
+
+	/** The tokens of the window that pi keeps free: before it compacts, and for the reply of the model. */
+	function reserveOf(ctx: ExtensionContext): ViewData["reserve"] {
+		const reserve: NonNullable<ViewData["reserve"]> = { output: ctx.model?.maxTokens };
+		try {
+			const settings = SettingsManager.create(ctx.cwd, getAgentDir()).getCompactionSettings(ctx.model);
+			if (settings.enabled) reserve.compaction = settings.reserveTokens;
+		} catch {
+			// Without readable settings, only the output limit is known.
+		}
+		return reserve;
+	}
 	function collect(ctx: ExtensionContext): ViewData {
-		const analysis = analyze(ctx.sessionManager.getBranch());
+		const branch = ctx.sessionManager.getBranch();
+		const analysis = analyze(branch);
+		const agents = agentsOf(analysis).map((agent) => ({ ...agent, window: windowOf(ctx, agent.model) }));
 		for (const request of analysis.requests) request.rows = snapshots.get(request.time);
 		// A skill read by a nested call leaves no result in the session; use the size of its file.
 		for (const skill of analysis.skills) {
@@ -250,8 +297,11 @@ export default function (pi: ExtensionAPI) {
 			hints: hintsOf(messages, fileSize),
 			dropped: droppedOf(projection, pruned),
 			config: loadConfig(configPath),
-			agents: agentsOf(analysis),
+			agents,
 			running,
+			reserve: reserveOf(ctx),
+			timeline: timelineOf(branch, agents),
+			tasks: readTasks(taskFile(ctx.cwd, ctx.sessionManager.getSessionId(), getAgentDir())),
 			parentSession: ctx.sessionManager.getHeader()?.parentSession,
 			reconstruct: (request) =>
 				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
@@ -262,6 +312,7 @@ export default function (pi: ExtensionAPI) {
 	function collectFile(file: string, title: string): ViewData {
 		const all = parseEntries(readFileSync(file, "utf8"));
 		const entries = all.filter((entry) => entry.type !== "session");
+		const header = all.find((entry) => entry.type === "session");
 		const leaf: string | undefined = entries.at(-1)?.id;
 		const branch = branchOf(entries, leaf);
 		const analysis = analyze(branch);
@@ -287,10 +338,12 @@ export default function (pi: ExtensionAPI) {
 			hints: hintsOf(messages),
 			dropped: droppedOf(projection, ids),
 			config: loadConfig(configPath),
-			agents: analysis.agents.map((agent) => ({ ...agent, ...fileUsage(agent.sessionFile) })),
+			agents: analysis.agents.map((agent) => ({ ...fileUsage(agent.sessionFile), ...agent, depth: 0 })),
 			running: false,
-			parentSession: all.find((entry) => entry.type === "session")?.parentSession,
+			parentSession: header?.parentSession,
 			other: title,
+			timeline: timelineOf(branch, analysis.agents),
+			tasks: header?.cwd && header?.id ? readTasks(taskFile(header.cwd, header.id, getAgentDir())) : [],
 			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true, sources) : []),
 		};
 	}
@@ -359,8 +412,19 @@ export default function (pi: ExtensionAPI) {
 		return { message: `The footer shows: ${footerItems(config).join(", ")}.`, level: "info" };
 	}
 
+	/** Sets a view default. Without `value`, its next value; with an empty value, its first one. */
+	function setView(setting: ChoiceSetting, value?: string): Outcome {
+		const config = loadConfig(configPath);
+		const values: readonly string[] = CHOICES[setting].values;
+		const next = value ?? values[(values.indexOf(choiceOf(config, setting)) + 1) % values.length];
+		if (!setChoice(config, setting, next || values[0])) return { message: `Give one of: ${values.join(", ")}.`, level: "error" };
+		saveConfig(configPath, config);
+		web?.changed();
+		return { message: `${CHOICES[setting].label}: ${choiceOf(config, setting)}.`, level: "info" };
+	}
 	/** Makes the change the user asked for in the Settings tab. */
 	async function changeSetting(ctx: ExtensionCommandContext, { setting, clear }: SettingRequest): Promise<void> {
+		if (isChoice(setting)) return say(ctx, setView(setting, clear ? "" : undefined));
 		if (setting === "prefix" || setting === "suffix") return setAffix(ctx, setting, clear ? "" : undefined);
 		const config = loadConfig(configPath);
 		if (setting === "footer") {
@@ -375,6 +439,7 @@ export default function (pi: ExtensionAPI) {
 
 	/** Makes a change that the context page asked for. An empty number restores the default. */
 	function applySetting(ctx: ExtensionContext, setting: string, value: string): Outcome {
+		if (isChoice(setting)) return setView(setting, value);
 		if (setting === "prefix" || setting === "suffix") return saveAffix(setting, value);
 		if (setting === "footer") return setFooter(ctx, value);
 		if (setting === "warn" || setting === "compact" || setting === "budget" || setting === "expiry") return setNumber(ctx, setting, value.trim() ? value : undefined);
@@ -519,6 +584,8 @@ export default function (pi: ExtensionAPI) {
 				agent.tokens = (agent.tokens ?? 0) + (data.usage?.totalTokens ?? 0);
 				agent.cost = (agent.cost ?? 0) + (data.usage?.cost?.total ?? 0);
 				if (data.model) agent.model = data.model;
+				const sent = (data.usage?.input ?? 0) + (data.usage?.cacheRead ?? 0) + (data.usage?.cacheWrite ?? 0);
+				if (sent > 0) agent.context = sent;
 			}),
 			pi.events.on("subagents:compacted", (data: any) => {
 				liveAgent(data).compactions = data.compactionCount;
@@ -530,6 +597,7 @@ export default function (pi: ExtensionAPI) {
 					agent.completedAt = Date.now();
 					agent.toolUses = data.toolUses;
 					agent.error = data.error;
+					agent.result = data.result;
 				}),
 			),
 		];
@@ -646,10 +714,18 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("context", {
 		description:
-			"Show context insights. Subcommands: prefix [text] and suffix [text] set the system prompt prefix/suffix; warn [percent], compact [percent], budget [dollars], expiry [seconds] and footer [items] change settings; export [file] writes a Markdown report, or JSON when the file ends in .json; web opens the context page in the browser, web stop stops its server",
+			"Show context insights. Subcommands: prefix [text] and suffix [text] set the system prompt prefix/suffix; warn [percent], compact [percent], budget [dollars], expiry [seconds] and footer [items] change settings; view [name] [value] sets a view default; export [file] writes a Markdown report, or JSON when the file ends in .json; web opens the context page in the browser, web stop stops its server",
 		getArgumentCompletions: (prefix) => {
 			const [sub, ...rest] = prefix.trimStart().split(/\s+/);
 			if (sub === "web" && rest.length === 1) return "stop".startsWith(rest[0]) ? [{ value: "web stop", label: "stop" }] : null;
+			if (sub === "view" && rest.length === 1) {
+				const names = CHOICE_SETTINGS.filter((name) => name.startsWith(rest[0])).map((name) => ({ value: `view ${name} `, label: name }));
+				return names.length > 0 ? names : null;
+			}
+			if (sub === "view" && rest.length === 2 && isChoice(rest[0])) {
+				const values = CHOICES[rest[0]].values.filter((value) => value.startsWith(rest[1])).map((value) => ({ value: `view ${rest[0]} ${value}`, label: value }));
+				return values.length > 0 ? values : null;
+			}
 			if (sub === "footer" && rest.length > 0) {
 				const text = prefix.trimStart();
 				const last = /[^\s,]*$/.exec(text)?.[0] ?? "";
@@ -659,14 +735,14 @@ export default function (pi: ExtensionAPI) {
 				return items.length > 0 ? items : null;
 			}
 			if (rest.length > 0) return null;
-			const items = ["prefix", "suffix", "warn", "compact", "budget", "expiry", "footer", "export", "web"]
+			const items = ["prefix", "suffix", "warn", "compact", "budget", "expiry", "footer", "view", "export", "web"]
 				.filter((name) => name.startsWith(sub))
 				.map((name) => ({ value: `${name} `, label: name }));
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
 			hidden = ctx.getSystemPromptOptions().hiddenTools ?? [];
-			const [, sub, rest = ""] = /^(prefix|suffix|warn|compact|budget|expiry|footer|export|web)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
+			const [, sub, rest = ""] = /^(prefix|suffix|warn|compact|budget|expiry|footer|view|export|web)\b\s*([\s\S]*)$/.exec(args.trim()) ?? [];
 			if (sub === "prefix" || sub === "suffix") return setAffix(ctx, sub, rest || undefined);
 			if (sub === "warn" || sub === "compact" || sub === "budget" || sub === "expiry") {
 				if (rest) return say(ctx, setNumber(ctx, sub, rest));
@@ -678,6 +754,14 @@ export default function (pi: ExtensionAPI) {
 				if (rest) return say(ctx, setFooter(ctx, rest));
 				const items = footerItems(loadConfig(configPath)).join(", ");
 				ctx.ui.notify(`The footer shows: ${items}. Set it with /context footer <items>, from: ${FOOTER_ITEMS.join(", ")}.`, "info");
+				return;
+			}
+			if (sub === "view") {
+				const [name, value] = rest.split(/\s+/);
+				if (isChoice(name)) return say(ctx, setView(name, value));
+				const config = loadConfig(configPath);
+				const lines = CHOICE_SETTINGS.map((each) => `${each}: ${choiceOf(config, each)} (${CHOICES[each].values.join(", ")})`);
+				ctx.ui.notify(`View defaults. Set one with /context view <name> <value>; without a value, the next one.\n${lines.join("\n")}`, "info");
 				return;
 			}
 			if (sub === "export") {

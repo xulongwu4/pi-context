@@ -23,7 +23,7 @@ function composition(sums: Record<Category, number>, reported?: number | null): 
 	);
 }
 
-const top = (list: [string, number][]) => list.map(([name, n]) => `${name} ×${n}`).join(", ") || "None.";
+const top = (list: [string, number, number?][]) => list.map(([name, n]) => `${name} ×${n}`).join(", ") || "None.";
 
 /** The whole dashboard as a Markdown document. */
 export function exportMarkdown(data: ViewData, insights: Insights): string {
@@ -137,8 +137,8 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		"## Files",
 		"",
 		...table(
-			["Path", "Reads", "Writes", "Edits", "Lines added", "Lines removed"],
-			analysis.files.map((file) => [file.path, file.reads, file.writes, file.edits, file.added, file.removed]),
+			["Path", "Reads", "Writes", "Edits", "Searches", "Images", "Lines added", "Lines removed"],
+			analysis.files.map((file) => [file.path, file.reads, file.writes, file.edits, file.searches, file.images, file.added, file.removed]),
 		),
 		...(analysis.unresolvedEdits ? [`${analysis.unresolvedEdits} anchor-based edits are not listed: their file was not recorded.`, ""] : []),
 		"## Commands",
@@ -200,6 +200,10 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		`- Tokens: ${fmtTokens(insights.tokens)}`,
 		`- Cost: ${fmtCost(insights.cost)}`,
 		`- Active days: ${insights.activeDays}`,
+		`- Human inputs: ${insights.userInputs}`,
+		`- Tool calls: ${insights.toolCalls}`,
+		`- Active time of the recorded turns: ${fmtDuration(insights.activeMs)}`,
+		`- Cache-hit rate: ${fmtPercent(insights.cacheRate, 1)}`,
 		`- Top tools: ${top(insights.tools)}`,
 		`- Top programs: ${top(insights.programs)}`,
 		`- Top skills: ${top(insights.skills)}`,
@@ -244,6 +248,9 @@ export function viewJson(data: ViewData) {
 		hints: data.hints,
 		dropped: data.dropped.map(item),
 		agents: data.agents,
+		reserve: data.reserve,
+		timeline: data.timeline,
+		tasks: data.tasks,
 	};
 }
 

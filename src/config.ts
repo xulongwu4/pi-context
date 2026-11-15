@@ -13,12 +13,53 @@ export interface Config {
 	expiryWarnSeconds?: number;
 	/** What the footer shows, in order. Unset: the context use. */
 	footer?: FooterItem[];
+	/** View defaults: see {@link CHOICES}. */
+	insightsPeriod?: "30" | "7" | "90" | "all";
+	trendBy?: "request" | "input";
+	trendMode?: "total" | "change";
+	toolOrder?: "calls" | "schema" | "name";
+	fileOrder?: "ops" | "recent" | "name";
+	diffBase?: "request" | "input";
 }
 
 export const FOOTER_ITEMS = ["context", "cost", "cache", "ttl"] as const;
 export type FooterItem = (typeof FOOTER_ITEMS)[number];
 
 export const DEFAULT_WARN_PERCENT = 80;
+
+/**
+ * The view defaults: what the tabs and the context page show when they open.
+ * Each is one of a few values; the first value applies when none is stored.
+ */
+export const CHOICES = {
+	period: { key: "insightsPeriod", label: "Insights period", values: ["30", "7", "90", "all"], help: "Days that the Insights tab covers when it opens." },
+	trend: { key: "trendBy", label: "Trend bars", values: ["request", "input"], help: "One bar of the Context Trend for each request, or for each human input." },
+	mode: { key: "trendMode", label: "Trend values", values: ["total", "change"], help: "The Context Trend shows the size of the context, or its change since the bar before." },
+	tools: { key: "toolOrder", label: "Tool order", values: ["calls", "schema", "name"], help: "Order of the tool list." },
+	files: { key: "fileOrder", label: "File order", values: ["ops", "recent", "name"], help: "Order of the file list: most operations first, last used first, or by path." },
+	diff: {
+		key: "diffBase",
+		label: "Diff baseline",
+		values: ["request", "input"],
+		help: "The Context Browser compares a request with the request before it, or with the last request before the human input it belongs to.",
+	},
+} as const;
+export type ChoiceSetting = keyof typeof CHOICES;
+export const CHOICE_SETTINGS = Object.keys(CHOICES) as ChoiceSetting[];
+
+/** The value of a view default. */
+export function choiceOf<S extends ChoiceSetting>(config: Config, setting: S): (typeof CHOICES)[S]["values"][number] {
+	return config[CHOICES[setting].key] ?? CHOICES[setting].values[0];
+}
+
+/** Stores a view default; the first value is not stored. Returns false when `value` is not one of the values. */
+export function setChoice(config: Config, setting: ChoiceSetting, value: string): boolean {
+	const { key, values } = CHOICES[setting];
+	const index = (values as readonly string[]).indexOf(value);
+	if (index < 0) return false;
+	Object.assign(config, { [key]: index === 0 ? undefined : value });
+	return true;
+}
 
 export function loadConfig(path: string): Config {
 	try {

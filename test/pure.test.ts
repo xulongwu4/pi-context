@@ -6,21 +6,29 @@ import {
 	analyze,
 	argLines,
 	bands,
+	baselineOf,
 	briefOf,
 	cacheStats,
+	callOf,
+	callView,
+	commandStatus,
 	declaredTools,
 	diffLines,
 	diffRows,
 	eventKinds,
+	fileRows,
 	injectors,
 	introducedAt,
 	programOf,
 	recordedDeclarations,
 	recordedSources,
+	replyCounts,
 	rowsOf,
 	scaleOf,
 	schemaSources,
 	schemasOf,
+	searchHits,
+	slowest,
 	sumByCategory,
 	TURN_ENTRY,
 	toolRows,
@@ -29,12 +37,13 @@ import {
 	undeclared,
 	type ViewData,
 } from "../src/analyze.ts";
-import { applyAffixes, loadConfig, saveConfig } from "../src/config.ts";
+import { applyAffixes, CHOICE_SETTINGS, type Config, choiceOf, loadConfig, saveConfig, setChoice } from "../src/config.ts";
 import { exportJson, exportMarkdown } from "../src/export.ts";
+import { boardOf, readTasks, taskFile, timelineOf } from "../src/fleet.ts";
 import { expiryText, expiryWarnAt, footerItems, footerText } from "../src/footer.ts";
 import { bar, fmtDay, fmtDuration, fmtTokens, sparkline } from "../src/format.ts";
 import { hintsOf, hintTotal } from "../src/hints.ts";
-import { aggregate, branchOf, calendar, parseEntries, scan, summarize } from "../src/insights.ts";
+import { aggregate, branchOf, calendar, groupSessions, parseEntries, scan, summarize } from "../src/insights.ts";
 import { droppedOf, isStub, PRUNE_ENTRY, prune, prunedOf } from "../src/prune.ts";
 import { report } from "../src/report.ts";
 
@@ -320,6 +329,8 @@ const view = (entries: any[]): ViewData => ({
 	dropped: [],
 	config: {},
 	agents: [],
+	timeline: [],
+	tasks: [],
 	running: false,
 	reconstruct: () => [],
 });
@@ -376,7 +387,7 @@ test("analyze reports tools and skills", () => {
 	expect(tool("bash")).toMatchObject({ calls: 1, nested: 0, errors: 1, resultTokens: 10 });
 	expect(tool("codemode")).toMatchObject({ calls: 1, callTokens: 28, resultTokens: 20 });
 	expect(tool("insert")).toMatchObject({ calls: 0, nested: 2, errors: 1, callTokens: 0 });
-	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: 100 }]);
+	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: 100, last: HOUR + 1000 }]);
 });
 
 test("analyze counts a /skill invocation as a load of the skill", () => {
@@ -386,7 +397,7 @@ test("analyze counts a /skill invocation as a load of the skill", () => {
 		{ type: "message", timestamp: at, message: { role: "user", content: `${block}\n\nfix   the bug`, timestamp: 1 } },
 		{ type: "message", timestamp: at, message: { role: "user", content: block, timestamp: 2 } },
 	]);
-	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: Math.ceil(block.length / 4) }]);
+	expect(a.skills).toEqual([{ path: "/skills/x/SKILL.md", name: "x", loads: 2, tokens: Math.ceil(block.length / 4), last: 2 }]);
 	expect(a.inputs.map((input) => input.preview)).toEqual(["/skill:x fix the bug", "/skill:x"]);
 });
 
@@ -439,8 +450,8 @@ test("summarize and aggregate build the cross-session figures", () => {
 	expect(insights.week[5]).toEqual({ day: "2026-06-09", requests: 2, tokens: 2020, cost: 0.75 });
 	// 26 and 25 hours before Wednesday noon: Tuesday 10:00 and 11:00.
 	expect(insights.heat[1].slice(9, 13)).toEqual([0, 1, 1, 0]);
-	expect(insights.tools[0]).toEqual(["read", 2]);
-	expect(insights.skills).toEqual([["x", 2]]);
+	expect(insights.tools[0]).toEqual(["read", 2, now - 25 * HOUR + 1000]);
+	expect(insights.skills).toEqual([["x", 2, now - 25 * HOUR + 1000]]);
 	expect(insights.models).toEqual([["m1", 2, 2020, 0.75]]);
 });
 
@@ -745,7 +756,7 @@ test("report returns one section when asked", () => {
 	expect(report(data, "requests")).toContain("m1: 2 requests, sent 2.0k, output 20, $0.7500");
 	expect(report(data, "tools")).toContain("bash: 1 direct, 0 nested, 1 errors, calls ≈11, results ≈10, direct calls while not declared: 1");
 	expect(report(data, "tools")).toContain("x ×2 ≈100  /skills/x/SKILL.md");
-	expect(report(data, "files")).toContain("2 0 0  /skills/x/SKILL.md");
+	expect(report(data, "files")).toContain("2 0 0 0 0  /skills/x/SKILL.md");
 	expect(report(data, "commands")).toContain("Programs: git ×1");
 	expect(report(data, "hints")).toContain("Nothing stands out");
 	data.hints = [{ kind: "result", tokens: 2000, label: "result bash", detail: "zzz" }];
@@ -1139,4 +1150,243 @@ test("exportMarkdown lists the request that each event followed and what the eve
 	const entries = [...session(0), { type: "compaction", timestamp: new Date(2 * HOUR).toISOString(), tokensBefore: 5000 }, at(assistant(3 * HOUR))];
 	const text = exportMarkdown(view(entries), aggregate([], HOUR, 30));
 	expect(text).toContain("| 2 | compaction | ≈−4.0k | 5.0k tokens before compaction |");
+});
+
+const toolCall = (id: string, name: string, args: any) => ({ type: "toolCall", id, name, arguments: args });
+const toolResult = (id: string, toolName: string, content: any[], timestamp: number, more = {}) =>
+	at({ role: "toolResult", toolCallId: id, toolName, content, isError: false, timestamp, ...more });
+const textBlock = (text: string) => [{ type: "text", text }];
+
+test("searchHits reads the files and the matches that a search lists", () => {
+	expect([...searchHits("grep", "src/a.ts:3: foo\nsrc/a.ts:9: foo\nsrc/a.ts-10- bar\nb.ts:1: foo", "/repo")]).toEqual([["/repo/src/a.ts", 2], ["/repo/b.ts", 1]]);
+	// A search of one file names the file without its directory.
+	expect([...searchHits("grep", "a.ts:3: foo", "/repo/src/a.ts")]).toEqual([["/repo/src/a.ts", 1]]);
+	expect([...searchHits("grep", "=== src/a.ts ===\n  5:│ abcde│foo\n  6-│ fghij│bar\n=== /x/b.ts ===\n 1:│ aaaaa│foo")]).toEqual([["src/a.ts", 1], ["/x/b.ts", 1]]);
+	expect([...searchHits("find", "src/a.ts\nsrc/dir/\n\n[2 results limit reached]", "/repo/")]).toEqual([["/repo/src/a.ts", 1], ["/repo/src/dir", 1]]);
+	expect(searchHits("find", "No files found matching pattern").size).toBe(0);
+	expect(searchHits("grep", Array.from({ length: 150 }, (_, i) => `f${i}.ts:1: x`).join("\n")).size).toBe(100);
+});
+
+test("analyze records a search on the files it found, and image reads", () => {
+	const image = { type: "image", data: "", mimeType: "image/png" };
+	const a = analyze([
+		at({ role: "user", content: "hi", timestamp: 1 }),
+		at(
+			assistant(1000, [
+				toolCall("g1", "grep", { pattern: "foo", path: "/repo" }),
+				toolCall("g2", "grep", { pattern: "none" }),
+				toolCall("f1", "find", { pattern: "*.png", path: "/repo" }),
+				toolCall("r1", "read", { path: "/repo/shot.png" }),
+				toolCall("r2", "read", { path: "/repo/blob" }),
+			]),
+		),
+		toolResult("g1", "grep", textBlock("src/a.ts:3: foo\nsrc/a.ts:9: foo\nb.ts:1: foo"), 2000),
+		toolResult("g2", "grep", textBlock("No matches found"), 2100),
+		toolResult("f1", "find", textBlock("shot.png"), 2200),
+		toolResult("r1", "read", [image], 2300),
+		toolResult("r2", "read", [...textBlock("Read image file"), image], 2400),
+		at(assistant(3000, [toolCall("c1", "codemode", {})])),
+		toolResult("c1", "codemode", textBlock("ok"), 4000, {
+			nestedCalls: { calls: [{ id: "c1/1", name: "grep", status: "ok", arguments: { pattern: "x", path: "/repo/src" } }] },
+		}),
+	]);
+	const file = (path: string) => a.files.find((f) => f.path === path);
+	expect(file("/repo/src/a.ts")).toMatchObject({ searches: 1, reads: 0, ops: [{ op: "searches", tool: "grep", hits: 2, id: "g1" }] });
+	expect(file("/repo/b.ts")?.ops[0].hits).toBe(1);
+	// A search that found nothing stays on the searched path, as does one whose result the session does not hold.
+	expect(file(".")).toMatchObject({ searches: 1, ops: [{ hits: 0 }] });
+	expect(file("/repo/src")?.searches).toBe(1);
+	expect(file("/repo/src")?.ops[0].hits).toBeUndefined();
+	expect(file("/repo")).toBeUndefined();
+	expect(file("/repo/shot.png")).toMatchObject({ searches: 1, images: 1, reads: 0 });
+	expect(file("/repo/blob")).toMatchObject({ images: 1, reads: 0 });
+	expect(fileRows(a.files, "name").map((f) => f.path)).toEqual([".", "/repo/b.ts", "/repo/blob", "/repo/shot.png", "/repo/src", "/repo/src/a.ts"]);
+	expect(fileRows(a.files, "ops")[0].path).toBe("/repo/shot.png");
+	expect(fileRows(a.files, "recent")[0].path).toBe("/repo/src");
+	expect(fileRows(a.files, "ops", "images").map((f) => f.path)).toEqual(["/repo/shot.png", "/repo/blob"]);
+});
+
+test("commandStatus and slowest tell the outcome of a command and the longest run", () => {
+	const commands: any[] = [{ ok: true, ms: 5 }, { ok: false, ms: 90 }, {}, { ok: true, ms: 20 }];
+	expect(commands.map(commandStatus)).toEqual(["ok", "failed", "unknown", "ok"]);
+	expect(slowest(commands)).toBe(1);
+	expect(slowest([{} as any])).toBe(-1);
+});
+
+test("rowsOf links a tool result to its call, and callView describes the call", () => {
+	const rows = rowsOf(
+		[
+			{ role: "assistant", content: [{ type: "thinking", thinking: "hm" }, { type: "text", text: "Reading." }, toolCall("c1", "read", { path: "/a.ts" })] },
+			{ role: "toolResult", toolCallId: "c1", toolName: "read", content: textBlock("one\ntwo"), isError: true },
+		],
+		undefined,
+		[],
+		true,
+	);
+	expect(replyCounts(rows)).toEqual({ reasoning: 1, toolCalls: 1, answers: 1 });
+	const result = rows.find((row) => row.id === "c1");
+	if (!result) throw new Error("no result row");
+	expect(result.error).toBe(true);
+	const call = callOf(result, rows);
+	expect(call).toMatchObject({ cat: "toolCalls", call: "c1" });
+	// The id of a row is that of a tool result: a call must not look like one.
+	expect(call?.id).toBeUndefined();
+	expect(callView(result, result.text ?? "", call?.text)).toEqual({ tool: "read", status: "error", lines: 2, args: '{\n  "path": "/a.ts"\n}' });
+	expect(callView({ ...result, error: undefined }, "")).toEqual({ tool: "read", status: "ok", lines: 0 });
+});
+
+test("baselineOf picks the request that a diff compares with", () => {
+	const a = analyze([
+		at({ role: "user", content: "one", timestamp: 1 }),
+		at(assistant(10)),
+		at(assistant(20)),
+		at({ role: "user", content: "two", timestamp: 30 }),
+		at(assistant(40)),
+		at(assistant(50)),
+	]);
+	expect([0, 1, 2, 3].map((index) => baselineOf(a, index))).toEqual([-1, 0, 1, 2]);
+	expect([0, 1, 2, 3].map((index) => baselineOf(a, index, "input"))).toEqual([-1, -1, 1, 1]);
+});
+
+test("trendBars carry the recorded duration and mark compactions, drops and restores", () => {
+	const turn = (time: number, ms: number) => ({ type: "custom", customType: TURN_ENTRY, data: { time, ms, toolMs: 0, activeMs: ms + 5, sums: {} } });
+	const dropped = (ids: string[]) => ({ type: "custom", customType: PRUNE_ENTRY, timestamp: new Date(0).toISOString(), data: { ids } });
+	const a = analyze([
+		at({ role: "user", content: "one", timestamp: 1 }),
+		at(assistant(10)),
+		turn(10, 300),
+		dropped(["c1"]),
+		at(assistant(20)),
+		turn(20, 200),
+		{ type: "compaction", timestamp: new Date(25).toISOString(), tokensBefore: 5000 },
+		dropped([]),
+		at({ role: "user", content: "two", timestamp: 30 }),
+		at(assistant(40)),
+	]);
+	expect(a.requests[0].activeMs).toBe(305);
+	expect(trendBars(a, false, false).map((bar) => [bar.ms, bar.marks])).toEqual([[300, undefined], [200, ["drop"]], [undefined, ["compaction", "restore"]]]);
+	expect(trendBars(a, true, false).map((bar) => [bar.ms, bar.marks])).toEqual([[500, ["drop"]], [undefined, ["compaction", "restore"]]]);
+});
+
+test("a view default is its first value until another is stored, and only its values are accepted", () => {
+	const config: Config = {};
+	expect(CHOICE_SETTINGS.map((setting) => choiceOf(config, setting))).toEqual(["30", "request", "total", "calls", "ops", "request"]);
+	expect(setChoice(config, "trend", "input")).toBe(true);
+	expect(setChoice(config, "period", "all")).toBe(true);
+	expect(setChoice(config, "diff", "turn")).toBe(false);
+	expect(config).toEqual({ trendBy: "input", insightsPeriod: "all" });
+	expect(choiceOf(config, "trend")).toBe("input");
+	setChoice(config, "trend", "request");
+	expect(config.trendBy).toBeUndefined();
+});
+
+test("aggregate counts inputs, tool runs, active time and cache reads, and lists the sessions that used a tool", () => {
+	const now = new Date(2026, 5, 10, 12).getTime(); // a Wednesday
+	const turn = { type: "custom", customType: TURN_ENTRY, data: { time: now - 25 * HOUR, ms: 1000, toolMs: 0, activeMs: 4000, sums: { system: 30, user: 10 } } };
+	const first = summarize([...session(now - 26 * HOUR, "first"), turn]);
+	const second = summarize([
+		{ type: "session", id: "second", timestamp: new Date(now - 3 * HOUR).toISOString(), cwd: "/work/other" },
+		at({ role: "user", content: "hi", timestamp: now - 3 * HOUR }),
+		at({ ...assistant(now - 3 * HOUR + 1000), usage: usage(50, 10) }),
+	]);
+	expect(first.context).toBe(1000);
+	expect(first.profile?.slice(0, 3)).toEqual([30, 0, 10]);
+	expect(first.lastUsed.programs).toEqual({ git: now - 26 * HOUR + 1000 });
+	expect(second.context).toBe(50);
+	expect(second.profile).toBeUndefined();
+	const insights = aggregate([first, second], now, 30);
+	expect(insights).toMatchObject({ userInputs: 2, toolCalls: first.toolCalls, activeMs: 4000 });
+	expect(insights.cacheRate).toBeCloseTo(1800 / 2050);
+	expect(insights.programs).toEqual([["git", 1, now - 26 * HOUR + 1000]]);
+	expect(aggregate([first, second], now, 30, { day: fmtDay(now) })).toMatchObject({ userInputs: 1, toolCalls: 0, activeMs: 0, cacheRate: 0 });
+	expect(insights.sessions.map((s) => s.id)).toEqual(["second", "first"]);
+	expect(aggregate([first, second], now, 30, { sort: "context" }).sessions.map((s) => s.id)).toEqual(["first", "second"]);
+	expect(aggregate([first, second], now, 30, { uses: { kind: "programs", name: "git" } }).sessions.map((s) => s.id)).toEqual(["first"]);
+	// The figures still cover every session.
+	expect(aggregate([first, second], now, 30, { uses: { kind: "skills", name: "none" } })).toMatchObject({ sessions: [], requests: 3 });
+	expect(groupSessions(insights.sessions)).toEqual([["/work/other", [second]], ["/work/proj", [first]]]);
+});
+
+test("timelineOf lists delegations, messages, result reads, notifications, completions and task changes in order", () => {
+	const entries = [
+		at(assistant(1000, [toolCall("a1", "Agent", { subagent_type: "Explore", description: "find it", prompt: "Look for X." }), toolCall("t1", "TaskCreate", { subject: "Ship", description: "All of it." })])),
+		toolResult("a1", "Agent", textBlock("started"), 1100, { details: { agentId: "ag1" } }),
+		at(assistant(2000, [toolCall("s1", "steer_subagent", { agent_id: "ag1", message: "Also Y." }), toolCall("c1", "codemode", {})])),
+		toolResult("c1", "codemode", [], 2500, {
+			nestedCalls: {
+				calls: [
+					{ id: "c1/1", name: "Agent", status: "ok", arguments: { subagent_type: "Plan", description: "plan it", prompt: "Plan." } },
+					{ id: "c1/2", name: "TaskUpdate", status: "ok", arguments: { taskId: "1", status: "completed" } },
+				],
+			},
+		}),
+		{ type: "custom_message", customType: "subagent-notification", timestamp: new Date(3000).toISOString(), content: "Agent ag1 finished.", details: { id: "ag1", description: "find it", status: "completed" } },
+		{ type: "custom", customType: "subagents:record", timestamp: new Date(3100).toISOString(), data: { id: "ag1", type: "Explore", description: "find it", status: "completed", startedAt: 1050, completedAt: 2900, result: "X is in a.ts." } },
+		at(assistant(4000, [toolCall("r1", "get_subagent_result", { agent_id: "ag1" })])),
+		toolResult("r1", "get_subagent_result", textBlock("X is in a.ts."), 4100),
+	];
+	const agents: any[] = [
+		{ id: "ag1", type: "Explore", description: "find it", status: "completed" },
+		{ id: "ag2", type: "Plan", description: "plan it", status: "running" },
+	];
+	const events = timelineOf(entries, agents);
+	expect(events.map((event) => [event.time, event.kind, event.agent, event.title])).toEqual([
+		[1000, "delegation", "ag1", "Explore: find it"],
+		[1000, "task", undefined, "task created: Ship"],
+		[2000, "steer", "ag1", "message to the agent"],
+		// A delegation made from a script has no result: the agent of its type and description is its agent.
+		[2500, "delegation", "ag2", "Plan: plan it"],
+		[2500, "task", undefined, "task #1: completed"],
+		[2900, "completion", "ag1", "Explore: find it — completed"],
+		[3000, "notification", "ag1", "find it — completed"],
+		[4000, "result", "ag1", "result read"],
+	]);
+	expect(events[0].body).toBe("Look for X.");
+	expect(events[5].body).toBe("X is in a.ts.");
+	expect(events[6].body).toBe("Agent ag1 finished.");
+	expect(events[7].body).toBe("X is in a.ts.");
+});
+
+test("taskFile finds the task list of pi-tasks, and readTasks and boardOf lay it out", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-context-tasks-"));
+	const cwd = join(dir, "work");
+	const agentDir = join(dir, "agent");
+	mkdirSync(join(cwd, ".pi", "tasks"), { recursive: true });
+	mkdirSync(agentDir);
+	expect(taskFile(cwd, "s1", agentDir, {})).toBe(join(cwd, ".pi", "tasks", "tasks-s1.json"));
+	expect(taskFile(cwd, "s1", agentDir, { PI_TASKS: "off" })).toBeUndefined();
+	expect(taskFile(cwd, "s1", agentDir, { PI_TASKS: "/x/t.json" })).toBe("/x/t.json");
+	expect(taskFile(cwd, "s1", agentDir, { PI_TASKS: "./t.json" })).toBe(join(cwd, "t.json"));
+	writeFileSync(join(agentDir, "tasks-config.json"), JSON.stringify({ taskScope: "session-global" }));
+	expect(taskFile(cwd, "s1", agentDir, {})).toBe(join(agentDir, "tasks", "sessions", `--${cwd.slice(1).replaceAll("/", "-")}--`, "tasks-s1.json"));
+	// The settings of the project go before those of the user.
+	writeFileSync(join(cwd, ".pi", "tasks-config.json"), JSON.stringify({ taskScope: "project" }));
+	const file = taskFile(cwd, "s1", agentDir, {});
+	expect(file).toBe(join(cwd, ".pi", "tasks", "tasks.json"));
+	expect(readTasks(file)).toEqual([]);
+	const stored = [
+		{ id: "1", subject: "Design", description: "", status: "completed", owner: "ann", blocks: ["2"], blockedBy: [] },
+		{ id: "2", subject: "Build", description: "Write it.", status: "in_progress", owner: "ann", blocks: ["3"], blockedBy: ["1"] },
+		{ id: "3", subject: "Ship", description: "", status: "pending", blocks: [], blockedBy: ["1", "2"], updatedAt: 5 },
+	];
+	writeFileSync(file ?? "", JSON.stringify({ nextId: 4, tasks: stored }));
+	const tasks = readTasks(file);
+	expect(tasks[2]).toEqual({ id: "3", subject: "Ship", description: undefined, status: "pending", owner: undefined, blocks: [], blockedBy: ["1", "2"], updatedAt: 5 });
+	const agents: any[] = [
+		{ id: "ag1", type: "Explore", description: "find it", status: "completed", result: "Found." },
+		{ id: "ag2", type: "Explore", description: "nested", status: "nested", parent: "ag1" },
+		{ id: "ag3", type: "Plan", description: "plan", status: "queued" },
+	];
+	const board = boardOf(tasks, agents);
+	expect(board.map((group) => [group.owner, group.items.map((item) => `${item.id} ${item.state}`)])).toEqual([
+		["ann", ["1 done", "2 in_progress"]],
+		["unassigned", ["3 pending"]],
+		["Explore", ["ag1 done"]],
+		["Plan", ["ag3 pending"]],
+	]);
+	// Only the unfinished tasks block.
+	expect(board[0].items[1].blockedBy).toEqual([]);
+	expect(board[1].items[0].blockedBy).toEqual(["2"]);
+	expect(board[2].items[0]).toMatchObject({ reply: "Found.", agent: "ag1" });
+	expect(boardOf(tasks, agents, "pending").map((group) => group.owner)).toEqual(["unassigned", "Plan"]);
 });

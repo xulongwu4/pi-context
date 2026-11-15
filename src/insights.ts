@@ -5,7 +5,7 @@ import { fmtDay } from "./format.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const TOP = 10;
 /** Days that the list of days covers at most: 53 weeks. */
 const MAX_DAYS = 371;
@@ -35,6 +35,18 @@ export interface SessionSummary {
 	 * followed by the tokens they sent in each category, in the order of CATEGORIES.
 	 */
 	composition: Record<string, number[]>;
+	/**
+	 * Hours since the epoch, to the human inputs and tool calls of the hour, the recorded wall time of its turns,
+	 * and the prompt tokens of its requests with those of them read from the cache.
+	 * The tool calls count in the hour of the human input that caused them.
+	 */
+	activity: Record<string, [number, number, number, number, number]>;
+	/** Prompt tokens of the last request. */
+	context: number;
+	/** Estimated tokens of the last recorded request, in the order of CATEGORIES. */
+	profile?: number[];
+	/** Time of the last use of each tool, program and skill. */
+	lastUsed: Record<"tools" | "programs" | "skills", Record<string, number>>;
 	/** Path of the session file. `scan` sets it; it is not cached. */
 	file?: string;
 }
@@ -46,7 +58,7 @@ export interface DayStat {
 	cost: number;
 }
 
-export type SessionSort = "recent" | "cost" | "tokens";
+export type SessionSort = "recent" | "cost" | "tokens" | "context";
 
 export interface InsightsFilter {
 	/** Count only sessions that ran in this directory or below it. */
@@ -55,6 +67,8 @@ export interface InsightsFilter {
 	sort?: SessionSort;
 	/** Count only this day of the period, as `fmtDay` writes it. `daily`, `week` and `activeDays` still cover the period. */
 	day?: string;
+	/** List only the sessions that used this tool, program or skill. The figures still cover all sessions. */
+	uses?: { kind: "tools" | "programs" | "skills"; name: string };
 }
 
 export interface Insights {
@@ -67,6 +81,12 @@ export interface Insights {
 	requests: number;
 	tokens: number;
 	cost: number;
+	/** Human inputs and tool calls in the period, and the recorded wall time of its turns. */
+	userInputs: number;
+	toolCalls: number;
+	activeMs: number;
+	/** Share of the prompt tokens that were read from the cache. */
+	cacheRate: number;
 	activeDays: number;
 	/** The last seven days, oldest first. */
 	week: DayStat[];
@@ -80,9 +100,10 @@ export interface Insights {
 	models: [string, number, number, number][];
 	/** Working directory, sessions, requests, tokens and cost in the period; the most expensive first. */
 	projects: [string, number, number, number, number][];
-	tools: [string, number][];
-	programs: [string, number][];
-	skills: [string, number][];
+	/** Name, uses in the sessions of the period, and the time of the last use. The most used first. */
+	tools: [string, number, number][];
+	programs: [string, number, number][];
+	skills: [string, number, number][];
 }
 
 interface Cache {
@@ -132,7 +153,11 @@ export function summarize(entries: any[]): SessionSummary {
 		programs: {},
 		skills: {},
 		composition: {},
+		activity: {},
+		context: 0,
+		lastUsed: { tools: {}, programs: {}, skills: {} },
 	};
+	const hourOf = (time: number) => (summary.activity[Math.floor(time / HOUR)] ??= [0, 0, 0, 0, 0]);
 	for (const request of analysis.requests) {
 		const tokens = request.context + request.output;
 		const estimated = request.sums ? CATEGORIES.reduce((sum, cat) => sum + (request.sums?.[cat] ?? 0), 0) : 0;
@@ -150,10 +175,34 @@ export function summarize(entries: any[]): SessionSummary {
 		summary.tokens += tokens;
 		summary.cost += request.cost;
 		summary.end = Math.max(summary.end, request.time);
+		const hour = hourOf(request.time);
+		hour[2] += request.activeMs ?? 0;
+		hour[3] += request.context;
+		hour[4] += request.cacheRead;
+		summary.context = request.context;
+		if (request.sums && estimated > 0) summary.profile = CATEGORIES.map((cat) => request.sums?.[cat] ?? 0);
 	}
-	for (const tool of analysis.tools) summary.tools[tool.name] = tool.calls + tool.nested;
-	for (const command of analysis.commands) summary.programs[command.program] = (summary.programs[command.program] ?? 0) + 1;
-	for (const skill of analysis.skills) summary.skills[skill.name] = (summary.skills[skill.name] ?? 0) + skill.loads;
+	for (const input of analysis.inputs) {
+		const hour = hourOf(input.time);
+		// A session that starts without a user message has an input without text.
+		if (input.preview) hour[0]++;
+		hour[1] += input.toolCalls;
+	}
+	const used = (key: "tools" | "programs" | "skills", name: string, time = 0) => {
+		summary.lastUsed[key][name] = Math.max(summary.lastUsed[key][name] ?? 0, time);
+	};
+	for (const tool of analysis.tools) {
+		summary.tools[tool.name] = tool.calls + tool.nested;
+		used("tools", tool.name, tool.last);
+	}
+	for (const command of analysis.commands) {
+		summary.programs[command.program] = (summary.programs[command.program] ?? 0) + 1;
+		used("programs", command.program, command.time);
+	}
+	for (const skill of analysis.skills) {
+		summary.skills[skill.name] = (summary.skills[skill.name] ?? 0) + skill.loads;
+		used("skills", skill.name, skill.last);
+	}
 	return summary;
 }
 
@@ -170,6 +219,10 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		requests: 0,
 		tokens: 0,
 		cost: 0,
+		userInputs: 0,
+		toolCalls: 0,
+		activeMs: 0,
+		cacheRate: 0,
 		activeDays: 0,
 		week: [],
 		daily: [],
@@ -183,7 +236,12 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	};
 	const models = new Map<string, [string, number, number, number]>();
 	const projects = new Map<string, [string, number, number, number, number]>();
-	const counts = { tools: new Map<string, number>(), programs: new Map<string, number>(), skills: new Map<string, number>() };
+	/** Name to the count and the time of the last use. */
+	const tally = () => new Map<string, [number, number]>();
+	const counts = { tools: tally(), programs: tally(), skills: tally() };
+	/** Prompt tokens of the counted requests, and those of them read from the cache. */
+	let sent = 0;
+	let cacheRead = 0;
 	for (const summary of summaries) {
 		if (filter.cwd && summary.cwd !== filter.cwd && !summary.cwd.startsWith(`${filter.cwd}/`)) continue;
 		let active = false;
@@ -228,17 +286,33 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 				insights.composition.sums[cat] += sent[i + 1];
 			});
 		}
+		for (const [hour, [inputs, toolCalls, activeMs, hourSent, hourRead]] of Object.entries(summary.activity ?? {})) {
+			const time = Number(hour) * HOUR;
+			if (time + HOUR <= since || (filter.day && fmtDay(time) !== filter.day)) continue;
+			insights.userInputs += inputs;
+			insights.toolCalls += toolCalls;
+			insights.activeMs += activeMs;
+			sent += hourSent;
+			cacheRead += hourRead;
+		}
 		for (const key of ["tools", "programs", "skills"] as const) {
-			for (const [name, n] of Object.entries(summary[key])) counts[key].set(name, (counts[key].get(name) ?? 0) + n);
+			for (const [name, n] of Object.entries(summary[key])) {
+				const [count, last] = counts[key].get(name) ?? [0, 0];
+				counts[key].set(name, [count + n, Math.max(last, summary.lastUsed?.[key][name] ?? 0)]);
+			}
 		}
 	}
 	const order: Record<SessionSort, (session: SessionSummary) => number> = {
 		recent: (session) => session.end,
 		cost: (session) => session.cost,
 		tokens: (session) => session.tokens,
+		context: (session) => session.context ?? 0,
 	};
 	const rank = order[filter.sort ?? "recent"];
 	insights.sessions.sort((a, b) => rank(b) - rank(a) || b.end - a.end);
+	const uses = filter.uses;
+	if (uses) insights.sessions = insights.sessions.filter((session) => session[uses.kind][uses.name]);
+	insights.cacheRate = sent > 0 ? cacheRead / sent : 0;
 	insights.models = [...models.values()].sort((a, b) => b[3] - a[3] || b[2] - a[2]);
 	insights.projects = [...projects.values()].sort((a, b) => b[4] - a[4] || b[3] - a[3]).slice(0, TOP);
 	insights.activeDays = byDay.size;
@@ -256,11 +330,20 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	}
 	insights.daily = insights.daily.slice(-MAX_DAYS);
 	for (const key of ["tools", "programs", "skills"] as const) {
-		insights[key] = [...counts[key]].sort((a, b) => b[1] - a[1]).slice(0, TOP);
+		insights[key] = [...counts[key]]
+			.map(([name, [count, last]]): [string, number, number] => [name, count, last])
+			.sort((a, b) => b[1] - a[1])
+			.slice(0, TOP);
 	}
 	return insights;
 }
 
+/** The sessions by working directory, in the order given: the directories in the order of their first session. */
+export function groupSessions(sessions: SessionSummary[]): [string, SessionSummary[]][] {
+	const groups = new Map<string, SessionSummary[]>();
+	for (const session of sessions) groups.set(session.cwd, [...(groups.get(session.cwd) ?? []), session]);
+	return [...groups];
+}
 /** The days as a calendar: one row per weekday, Monday first, and one column per week. A cell outside the days is undefined. */
 export function calendar(daily: DayStat[]): (DayStat | undefined)[][] {
 	const rows: (DayStat | undefined)[][] = Array.from({ length: 7 }, () => []);

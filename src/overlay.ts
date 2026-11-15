@@ -4,23 +4,38 @@ import { basename } from "node:path";
 import {
 	type AgentRec,
 	bands,
+	baselineOf,
 	briefOf,
 	type CacheMiss,
+	COMMAND_STATUSES,
 	cacheStats,
 	CATEGORIES,
 	type Category,
 	type CommandRec,
+	type CommandStatus,
+	callOf,
+	callView,
+	commandStatus,
 	diffRows,
 	eventKinds,
+	FILE_KINDS,
+	FILE_ORDERS,
+	type FileKind,
 	type FileOp,
+	type FileOrder,
 	type FileRec,
+	fileRows,
 	injectors,
 	introducedAt,
 	LABELS,
+	REPLY_KINDS,
+	type ReplyKind,
 	type RequestRec,
 	type Row,
+	replyCounts,
 	scaleOf,
 	schemaSources,
+	slowest,
 	sumByCategory,
 	sumTokens,
 	TOOL_ORDERS,
@@ -30,11 +45,12 @@ import {
 	undeclared,
 	type ViewData,
 } from "./analyze.ts";
-import { DEFAULT_WARN_PERCENT } from "./config.ts";
+import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
+import { type BoardItem, boardOf, type FleetEvent, TASK_STATES, type TaskState } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
 import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens, sparkline } from "./format.ts";
 import { hintTotal } from "./hints.ts";
-import { aggregate, calendar, type Insights, type SessionSort, type SessionSummary } from "./insights.ts";
+import { aggregate, calendar, groupSessions, type Insights, type InsightsFilter, type SessionSort, type SessionSummary } from "./insights.ts";
 
 const TABS = [
 	"Stats",
@@ -61,14 +77,32 @@ const SORTS: [SessionSort, string][] = [
 	["recent", "newest first"],
 	["cost", "by cost"],
 	["tokens", "by tokens"],
+	["context", "by context size"],
 ];
-export const SETTINGS = ["warn", "compact", "budget", "expiry", "footer", "prefix", "suffix"] as const;
+/** The top lists of the Insights tab, by the key that chooses an entry of the list. */
+const USE_KEYS = { t: "tools", c: "programs", k: "skills" } as const;
+/** The settings of the Settings tab, in its order. The view defaults come last. */
+export const SETTINGS = ["warn", "compact", "budget", "expiry", "footer", "prefix", "suffix", ...CHOICE_SETTINGS] as const;
 export type Setting = (typeof SETTINGS)[number];
 /** Characters of an item that the inspector shows at most. */
 const MAX_INSPECT_CHARS = 200_000;
 const REFRESH_MS = 1000;
-/** Tabs whose lists the user can filter. */
-const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Insights"];
+/** Tabs whose lists the user can filter. In the Fleet tab, only the timeline. */
+const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Fleet", "Insights"];
+/** Names of the kinds of reply that the Browser tab can list alone. */
+const REPLY_NAMES: Record<ReplyKind, string> = { reasoning: "thinking", toolCalls: "tool calls", answers: "answers" };
+const FILE_ORDER_NAMES: Record<FileOrder, string> = { ops: "most operations first", recent: "last used first", name: "by path" };
+/** Marks of the Trend tab for what happened since the bar before. */
+const TREND_MARKS = [
+	["compaction", "✂"],
+	["drop", "▾"],
+	["restore", "▴"],
+] as const;
+/** Views of the Fleet tab. */
+const FLEET_VIEWS = ["Agents", "Timeline", "Tasks"] as const;
+const TASK_STATE_NAMES: Record<TaskState, string> = { in_progress: "in progress", pending: "pending", done: "done" };
+/** Position of the setting that the overlay last closed for. The overlay that opens on the Settings tab selects it again. */
+let lastSetting = 0;
 /** Removed items that the Browser tab lists at most. */
 const MAX_REMOVED = 30;
 /** The lines under the selected bar of the Trend tab. */
@@ -115,12 +149,33 @@ export interface SettingRequest {
 	clear: boolean;
 }
 
+/** An entry of the list in the Insights or Fleet tab. */
+interface Entry {
+	/** Body line of the entry. */
+	line: number;
+	/** The session that the entry opens. */
+	file?: string;
+	title: string;
+	/** What the inspector shows for the entry. */
+	text?: string;
+}
+
 interface Body {
 	lines: string[];
 	/** Line that must stay visible. */
 	cursor?: number;
 	/** Lines after the cursor that must stay visible with it. */
 	span?: number;
+}
+
+/** How long before the present the time was, in the largest unit that fits: "3d ago". Empty when the time is not known. */
+export function ago(time: number, now = Date.now()): string {
+	if (!time) return "";
+	const minutes = Math.max(0, Math.floor((now - time) / 60_000));
+	if (minutes < 1) return "now";
+	if (minutes < 60) return `${minutes}m ago`;
+	if (minutes < 1440) return `${Math.floor(minutes / 60)}h ago`;
+	return `${Math.floor(minutes / 1440)}d ago`;
 }
 
 function pad(line: string, width: number): string {
@@ -148,8 +203,8 @@ export class ContextOverlay {
 	private request: number;
 	/** Selected entry of the list that the tab shows. */
 	private item = 0;
-	/** Body line of each entry of the list in the Insights or Fleet tab, and the session it opens, as of the last render. */
-	private picks: { line: number; file?: string; title: string }[] = [];
+	/** The entries of the list in the Insights or Fleet tab, as of the last render. */
+	private picks: Entry[] = [];
 	/** Entries of the list in the Hints tab, as of the last render. */
 	private hintList: { ids: string[]; dropped: boolean }[] = [];
 	/** Text that the lists of the tab must contain. */
@@ -182,6 +237,21 @@ export class ContextOverlay {
 	private toResult?: string;
 	/** Position in TOOL_ORDERS of the order of the Tools tab. */
 	private toolOrder = 0;
+	/** Position in FILE_ORDERS of the order of the Files tab, and the kind of operation that its files must have. Empty: every file. */
+	private fileOrder = 0;
+	private fileKind: FileKind | "" = "";
+	/** The status of the commands that the Commands tab lists. Empty: every status. */
+	private status: CommandStatus | "" = "";
+	/** The kind of reply that the Browser tab lists. Empty: every item. */
+	private reply: ReplyKind | "" = "";
+	/** The Browser tab compares a request with the last request before its human input, not with the request before it. */
+	private byInput = false;
+	/** Position in FLEET_VIEWS of the view of the Fleet tab. */
+	private fleetView = 0;
+	/** The timeline of the Fleet tab lists the latest event first. */
+	private latestFirst = false;
+	/** The state of the tasks that the Fleet tab lists. Empty: every state. */
+	private taskState: TaskState | "" = "";
 	/** Compositions rebuilt from the session, by request number. */
 	private rebuilt = new Map<number, Row[]>();
 	/** The item being inspected. `back` is the scroll position to return to. */
@@ -197,6 +267,10 @@ export class ContextOverlay {
 	private day?: string;
 	private projectOnly = false;
 	private sort = 0;
+	/** The tool, program or skill that the sessions of the Insights tab must have used. */
+	private uses?: InsightsFilter["uses"];
+	/** The Insights tab groups the sessions by project. */
+	private grouped = false;
 	private loading = false;
 	private progress = "";
 	/** Width of the body, as of the last render. */
@@ -215,6 +289,15 @@ export class ContextOverlay {
 		this.data = host.collect();
 		this.tab = Math.max(0, TABS.indexOf(host.tab ?? "Stats"));
 		this.request = this.data.analysis.requests.length - 1;
+		// The views start with the defaults of the settings.
+		const { config } = this.data;
+		this.period = Math.max(0, PERIODS.indexOf(Number(choiceOf(config, "period")) || Number.POSITIVE_INFINITY));
+		this.byTurn = choiceOf(config, "trend") === "input";
+		this.delta = choiceOf(config, "mode") === "change";
+		this.toolOrder = TOOL_ORDERS.indexOf(choiceOf(config, "tools"));
+		this.fileOrder = FILE_ORDERS.indexOf(choiceOf(config, "files"));
+		this.byInput = choiceOf(config, "diff") === "input";
+		if (host.tab === "Settings") this.item = lastSetting;
 		this.timer = setInterval(() => this.tick(), REFRESH_MS);
 		this.timer.unref?.();
 	}
@@ -282,6 +365,7 @@ export class ContextOverlay {
 				else if (command) this.notice = "The user ran this command: it has no tool result.";
 			}
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
+			else if (this.name === "Fleet" && this.fleetView > 0) this.openEntry();
 			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
 			else if (this.name === "Settings") {
 				this.close({ setting: SETTINGS[this.item], clear: false });
@@ -290,7 +374,7 @@ export class ContextOverlay {
 		} else if (key === "x" && this.name === "Settings") {
 			this.close({ setting: SETTINGS[this.item], clear: true });
 			return;
-		} else if (key === "/" && FILTERED.includes(this.name) && !this.opened) this.typing = true;
+		} else if (key === "/" && FILTERED.includes(this.name) && !this.opened && (this.name !== "Fleet" || this.fleetView === 1)) this.typing = true;
 		else if ((key === "d" || key === "u") && (this.name === "Current" || this.name === "Hints")) this.drop(key === "d");
 		else if (key === "k" && this.name === "Events") {
 			const kinds = ["", ...eventKinds(this.data.analysis.events).map(([kind]) => kind)];
@@ -299,6 +383,19 @@ export class ContextOverlay {
 		} else if (key === "g" && this.name === "Trend") this.byTurn = !this.byTurn;
 		else if (key === "m" && this.name === "Trend") this.delta = !this.delta;
 		else if (key === "s" && this.name === "Tools") this.toolOrder = (this.toolOrder + 1) % TOOL_ORDERS.length;
+		else if (key === "k" && this.name === "Files" && !this.opened) this.fileKind = this.next(FILE_KINDS, this.fileKind);
+		else if (key === "s" && this.name === "Files" && !this.opened) this.fileOrder = (this.fileOrder + 1) % FILE_ORDERS.length;
+		else if (key === "k" && this.name === "Commands") this.status = this.next(COMMAND_STATUSES, this.status);
+		else if ((key === "f" || key === "s") && this.name === "Commands") this.toCommand(key === "f");
+		else if (key === "k" && this.name === "Browser") this.reply = this.next(REPLY_KINDS, this.reply);
+		else if (key === "b" && this.name === "Browser") this.byInput = !this.byInput;
+		else if (key === "v" && this.name === "Fleet") {
+			this.fleetView = (this.fleetView + 1) % FLEET_VIEWS.length;
+			this.filterText = "";
+			this.item = 0;
+			this.scroll = 0;
+		} else if (key === "o" && this.name === "Fleet" && this.fleetView === 1) this.latestFirst = !this.latestFirst;
+		else if (key === "k" && this.name === "Fleet" && this.fleetView === 2) this.taskState = this.next(TASK_STATES, this.taskState);
 		else if (key === "o" && this.name === "Current") {
 			this.ordered = !this.ordered;
 			this.item = 0;
@@ -374,20 +471,25 @@ export class ContextOverlay {
 			Hints: "↑/↓ select  d drop  u restore",
 			Turns: "↑/↓ select  enter browse",
 			Trend: `↑/↓ select  enter browse  [ ] request  g ${this.byTurn ? "requests" : "inputs"}  m ${this.delta ? "totals" : "changes"}`,
-			Browser: "↑/↓ select  enter inspect  [ ] request  / filter",
+			Browser: "↑/↓ select  enter inspect  [ ] request  / filter  k kind  b baseline",
 			Events: "↑/↓ scroll  k kind",
-			Files: this.opened ? "↑/↓ select  enter result  esc files" : "↑/↓ select  enter operations  / filter",
-			Commands: "↑/↓ select  enter result  / filter",
+			Files: this.opened ? "↑/↓ select  enter result  esc files" : "↑/↓ select  enter operations  / filter  k kind  s order",
+			Commands: "↑/↓ select  enter result  / filter  k status  f next failed  s slowest",
 			Tools: "↑/↓ scroll  / filter  s sort",
-			Fleet: "↑/↓ select  enter open",
-			Insights: "↑/↓ select  enter open  p period  [ ] day  a project  s sort  / filter",
-			Settings: "↑/↓ select  enter edit  x clear",
+			Fleet: [
+				"↑/↓ select  enter open  v timeline",
+				`↑/↓ select  enter inspect  o ${this.latestFirst ? "earliest" : "latest"} first  / filter  v tasks`,
+				"↑/↓ select  enter inspect  k state  v agents",
+			][this.fleetView],
+			Insights: "↑/↓ select  enter open  p period  [ ] day  a project  s sort  g group  t/c/k tool/program/skill  x all  / filter",
+			Settings: "↑/↓ select  enter edit or next value  x clear",
 		};
 		const filter = this.filterText ? `filter "${this.filterText}" (esc clears)  ` : "";
 		return `${filter}←/→ tab  ${keys[this.name] ?? "↑/↓ scroll"}  r refresh  ${this.back ? "esc back  " : ""}q close`;
 	}
 
 	private close(request?: SettingRequest): void {
+		if (request) lastSetting = this.item;
 		clearInterval(this.timer);
 		this.done(request);
 	}
@@ -431,6 +533,8 @@ export class ContextOverlay {
 		this.picks = [];
 		this.opened = undefined;
 		this.filterText = "";
+		// A tab that selects an item of the Browser tab must find it in the list.
+		this.reply = "";
 		if (this.name === "Insights" && !this.summaries) this.readInsights();
 	}
 
@@ -469,7 +573,18 @@ export class ContextOverlay {
 			this.day = undefined;
 		} else if (key === "a") this.projectOnly = !this.projectOnly;
 		else if (key === "s") this.sort = (this.sort + 1) % SORTS.length;
-		else return;
+		else if (key === "g") this.grouped = !this.grouped;
+		else if (key === "x") this.uses = undefined;
+		else if (key === "t" || key === "c" || key === "k") {
+			// The entry after the chosen one of the list. After the last entry, none is chosen.
+			const kind = USE_KEYS[key];
+			// The lists are those of the last render.
+			if (!this.insights) return;
+			const names = this.insights[kind].map(([name]) => name);
+			const name = names[this.uses?.kind === kind ? names.indexOf(this.uses.name) + 1 : 0];
+			this.uses = name === undefined ? undefined : { kind, name };
+			if (names.length === 0) this.notice = `The list of top ${kind} is empty.`;
+		} else return;
 		this.insights = undefined;
 		if (PERIODS[this.period] > this.loadedDays) this.readInsights();
 	}
@@ -537,6 +652,24 @@ export class ContextOverlay {
 		const at = bars.findIndex((bar) => bar.index >= this.request);
 		return at < 0 ? bars.length - 1 : at;
 	}
+
+	/** The value of a filter after `value`. After the last value, the filter is empty again. The selection returns to the first entry. */
+	private next<T extends string>(values: readonly T[], value: T | ""): T | "" {
+		const all: (T | "")[] = ["", ...values];
+		this.item = 0;
+		this.scroll = 0;
+		return all[(all.indexOf(value) + 1) % all.length];
+	}
+
+	/** Selects the next failed command of the list, or the slowest one. */
+	private toCommand(failed: boolean): void {
+		const list = this.commandList;
+		const after = this.item + 1;
+		const at = failed ? list.findIndex((_, i) => list[(after + i) % list.length].ok === false) : slowest(list);
+		if (at < 0) this.notice = failed ? "No command of the list failed." : "No command of the list has a recorded time.";
+		else this.item = failed ? (after + at) % list.length : at;
+	}
+
 	private move(delta: number): void {
 		const listed: Tab[] = ["Current", "Hints", "Turns", "Browser", "Files", "Commands", "Settings"];
 		if (this.name === "Trend") {
@@ -606,17 +739,37 @@ export class ContextOverlay {
 		this.setTab(TABS.indexOf(inRequest ? "Browser" : "Current"));
 		this.toResult = id;
 	}
-	/** Shows the session of the selected entry of the Insights or Fleet tab. */
-	private openSession(): void {
+
+	/** The selected entry of the Insights or Fleet tab. An entry that the user cannot see comes into view instead. */
+	private picked(): Entry | undefined {
 		const pick = this.picks[this.item];
-		if (!pick) return;
+		if (!pick) return undefined;
 		const height = this.bodyHeight();
 		if (pick.line < this.scroll || pick.line >= this.scroll + height) {
 			// Do not open an entry that the user cannot see.
 			this.scroll = Math.max(0, pick.line - Math.floor(height / 2));
 			this.notice = "The selected entry is now in view. Press enter again to open it.";
+			return undefined;
+		}
+		return pick;
+	}
+
+	/** Shows the content of the selected event or task of the Fleet tab in the inspector. */
+	private openEntry(): void {
+		const pick = this.picked();
+		if (!pick) return;
+		if (!pick.text) {
+			this.notice = "This entry has no content.";
 			return;
 		}
+		this.inspect = { title: pick.title, text: pick.text, back: this.scroll };
+		this.scroll = 0;
+	}
+
+	/** Shows the session of the selected entry of the Insights or Fleet tab. */
+	private openSession(): void {
+		const pick = this.picked();
+		if (!pick) return;
 		if (!pick.file) {
 			this.notice = "No saved session is known for this entry.";
 			return;
@@ -680,19 +833,25 @@ export class ContextOverlay {
 		return rows;
 	}
 
-	/** Opens the selected item of the Current or Browser tab in the inspector. */
+	/** Opens the selected item of the Current or Browser tab in the inspector. A tool result comes with its call. */
 	private openItem(): void {
 		const row = this.rows[this.item];
 		if (!row) return;
 		let text = row.text;
+		let rows = this.data.current;
 		const request = this.data.analysis.requests[this.request];
-		if (text === undefined && this.name === "Browser" && request) {
-			// A snapshot keeps no content. Find the item in the context rebuilt from the session.
-			text = textOf(row, this.positions[this.item], this.rebuiltRows(request));
+		if (this.name === "Browser" && request && (text === undefined || row.id)) {
+			// A snapshot keeps no content. Find the item, and the call of a tool result, in the context rebuilt from the session.
+			rows = this.rebuiltRows(request);
+			text ??= textOf(row, this.positions[this.item], rows);
 		}
+		const call = row.id && text !== undefined ? callView(row, text, callOf(row, rows)?.text) : undefined;
+		const head = call
+			? `Tool: ${call.tool}\nStatus: ${call.status}\nLines: ${call.lines}\n\n${call.args === undefined ? "" : `Arguments:\n${call.args}\n\n`}Result:\n`
+			: "";
 		this.inspect = {
 			title: `${LABELS[row.cat]} · ${row.label}${text === undefined ? "" : ` · ${fmtTokens(text.length)} characters`}`,
-			text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)`,
+			text: head + (text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)`),
 			back: this.scroll,
 		};
 		this.scroll = 0;
@@ -711,6 +870,21 @@ export class ContextOverlay {
 
 	private head(text: string): string {
 		return this.theme.bold(this.theme.fg("accent", text));
+	}
+
+	/** A value of a filter with the number of entries that it keeps. The active value is marked. */
+	private chip(name: string, count: number, on: boolean): string {
+		const t = this.theme;
+		return on ? t.bold(t.fg("accent", `[${name} ${count}]`)) : t.fg("muted", `${name} ${count}`);
+	}
+
+	/** The shares of the categories as a bar of `width` cells, each in the color of its category. A list holds the sizes in the order of CATEGORIES. */
+	private mix(sums: Record<Category, number> | number[] | undefined, width: number): string {
+		const cells = bands(
+			CATEGORIES.map((cat, i) => ({ cat, tokens: (Array.isArray(sums) ? sums[i] : sums?.[cat]) ?? 0, label: "", preview: "" })),
+			width,
+		);
+		return cells.length ? cells.map((cat) => this.theme.fg(COLORS[cat], "█")).join("") : this.theme.fg("dim", "·".repeat(width));
 	}
 
 	/** Packs the items into lines that fit the body. */
@@ -760,7 +934,7 @@ export class ContextOverlay {
 			case "Insights":
 				return { lines: this.insightsTab() };
 			case "Settings":
-				return { lines: this.settings() };
+				return this.settings();
 		}
 	}
 
@@ -890,14 +1064,14 @@ export class ContextOverlay {
 	/**
 	 * A selectable list of the rows that pass the filter. It starts `above` lines into the tab.
 	 * `marks` holds one mark for each row: "+" added, "~" changed. `positions` holds the position of each row in the prompt;
-	 * without it the rows are in reading order.
+	 * without it the rows are in reading order. With `kind`, the list holds only the rows of that category.
 	 */
-	private list(rows: Row[], factor: number, above: number, marks?: string[], positions?: number[]): Body {
+	private list(rows: Row[], factor: number, above: number, marks?: string[], positions?: number[], kind?: ReplyKind | ""): Body {
 		const t = this.theme;
 		const requests = this.data.analysis.requests;
 		const shown = rows
 			.map((row, i) => ({ row, mark: marks?.[i], position: positions?.[i] ?? i, from: introducedAt(row, requests) }))
-			.filter(({ row }) => this.matches(`${LABELS[row.cat]} ${row.dropped ? "dropped " : ""}${row.label} ${row.preview}`));
+			.filter(({ row }) => (!kind || row.cat === kind) && this.matches(`${LABELS[row.cat]} ${row.dropped ? "dropped " : ""}${row.label} ${row.preview}`));
 		this.rows = shown.map(({ row }) => row);
 		this.positions = shown.map(({ position }) => position);
 		if (this.toResult) {
@@ -928,9 +1102,24 @@ export class ContextOverlay {
 		return this.theme.fg("dim", "  # position in the prompt   @ first request that carried the item");
 	}
 
+	/** Where pi starts compaction, the room before it, and the output limit of the model. Nothing when the window or the reserve is not known. */
+	private reserve(): string[] {
+		const { usage, reserve } = this.data;
+		if (!reserve || !usage || usage.contextWindow <= 0) return [];
+		const items: string[] = [];
+		const item = (key: string, value: string) => items.push(`${this.theme.fg("muted", key)} ${value}`);
+		if (reserve.compaction !== undefined) {
+			const start = usage.contextWindow - reserve.compaction;
+			item("Compaction starts at", `${fmtTokens(start)} (${fmtPercent(start, usage.contextWindow)} of the window)`);
+			if (usage.tokens != null) item("Room before compaction", fmtTokens(Math.max(0, start - usage.tokens)));
+		}
+		if (reserve.output !== undefined) item("Output limit", fmtTokens(reserve.output));
+		return items.length ? this.wrap(items) : [];
+	}
+
 	private current(): Body {
 		const { current, usage, factor } = this.data;
-		const top = [this.head("Composition"), ...this.composition(sumByCategory(current), usage?.tokens), ""];
+		const top = [this.head("Composition"), ...this.composition(sumByCategory(current), usage?.tokens), ...this.reserve(), ""];
 		// The strip marks the selected item, which is known only after the list is built.
 		const strip = (selected?: number) => [...this.strip(current, selected), this.head(this.ordered ? "Items in reading order" : "Items, largest first"), this.legend()];
 		const order = current.map((_, i) => i);
@@ -1027,8 +1216,11 @@ export class ContextOverlay {
 			this.head(this.delta ? `Change of the tokens sent, from one bar to the next: ${what}` : `Tokens sent by ${what} (provider-reported)`),
 			`  ${t.fg("muted", line)}`,
 			`  ${" ".repeat(Math.floor((selected * line.length) / bars.length))}${t.fg("accent", "▲")}`,
+			t.fg("dim", `  took: the recorded duration.   ${TREND_MARKS.map(([kind, mark]) => `${mark} ${kind}`).join("   ")}, since the bar before.`),
 		];
 		const above = lines.length;
+		/** Lines under the selected bar. */
+		let below = 0;
 		bars.forEach((entry, i) => {
 			const on = i === selected;
 			// The selected line has one color.
@@ -1047,12 +1239,27 @@ export class ContextOverlay {
 			const figures = input
 				? `reqs ${String(input.requests).padStart(3)}  out ${fmtTokens(input.output).padStart(6)}  ${fmtCost(input.cost)}  ${paint("dim", input.preview)}`
 				: `out ${fmtTokens(r.output).padStart(6)}  cache ${fmtPercent(r.cacheRead, r.context).padStart(4)}  ${fmtCost(r.cost)}${miss}${stop}`;
-			const row = `#${String(entry.n).padStart(3)} ${fmtTime(input?.time ?? r.time)} ${size}  ${figures}`;
+			const took = entry.ms === undefined ? " ".repeat(11) : `took ${fmtDuration(entry.ms).padStart(6)}`;
+			const marks = paint("warning", TREND_MARKS.map(([kind, mark]) => (entry.marks?.includes(kind) ? mark : " ")).join(""));
+			const row = `#${String(entry.n).padStart(3)} ${fmtTime(input?.time ?? r.time)} ${size} ${marks} ${took}  ${figures}`;
 			lines.push(on ? t.fg("accent", `▶ ${row}`) : `  ${row}`);
-			const brief = on ? briefOf(this.data.analysis, entry.index, this.byTurn) : undefined;
+			if (!on) return;
+			const from = lines.length;
+			const brief = briefOf(this.data.analysis, entry.index, this.byTurn);
 			if (brief) lines.push(...BRIEF.map(([name, key]) => `      ${t.fg("muted", name.padEnd(6))}${brief[key]}`));
+			lines.push(
+				`      ${t.fg("muted", "Usage ")}input ${fmtTokens(r.input)}  cache read ${fmtTokens(r.cacheRead)}  cache write ${fmtTokens(r.cacheWrite)}  output ${fmtTokens(r.output)}  ${t.fg("dim", "(provider-reported)")}`,
+			);
+			const parts = entry.parts;
+			if (parts) {
+				const sizes = CATEGORIES.filter((cat) => Math.round(parts[cat]) !== 0).map(
+					(cat) => `${LABELS[cat]} ${parts[cat] < 0 ? "−" : this.delta ? "+" : ""}${fmtTokens(Math.abs(parts[cat]))}`,
+				);
+				lines.push(`      ${t.fg("muted", "Est.  ")}${sizes.join("  ") || "no change"}  ${t.fg("dim", "(by category)")}`);
+			}
+			below = lines.length - from;
 		});
-		return { lines, cursor: selected === 0 ? 0 : above + selected, span: BRIEF.length };
+		return { lines, cursor: selected === 0 ? 0 : above + selected, span: below };
 	}
 
 	private browser(): Body {
@@ -1070,22 +1277,27 @@ export class ContextOverlay {
 			]),
 		];
 		if (request.miss) top.push(this.theme.fg("warning", `  Cache miss: ${this.missText(request.miss)}.`));
-		top.push("");
 		const rows = request.rows ?? this.rebuiltRows(request);
 		if (rows.length === 0 && !request.sums) {
-			return { lines: [...top, "The context of this request cannot be rebuilt from the session."] };
+			return { lines: [...top, "", "The context of this request cannot be rebuilt from the session."] };
 		}
+		const replies = replyCounts(rows);
+		top.push(
+			...this.wrap([this.chip("all items", rows.length, !this.reply), ...REPLY_KINDS.map((kind) => this.chip(REPLY_NAMES[kind], replies[kind], kind === this.reply))]),
+			"",
+		);
 		const sums = request.rows ? sumByCategory(rows) : (request.sums ?? sumByCategory(rows));
 		const rebuilt = " (rebuilt from the session)";
 		const factor = scaleOf(sumTokens(rows), request.context);
 		const signed = (tokens: number) => `≈${tokens < 0 ? "−" : "+"}${fmtTokens(Math.abs(tokens) * factor)}`;
 		top.push(this.head(`Composition${request.rows || request.sums ? "" : rebuilt}`), ...this.composition(sums, request.context), "");
-		const previous = this.data.analysis.requests[this.request - 1];
+		const previous = this.data.analysis.requests[baselineOf(this.data.analysis, this.request, this.byInput ? "input" : "request")];
 		const diff = previous ? diffRows(previous.rows ?? this.rebuiltRows(previous), rows) : undefined;
+		if (!diff && this.byInput) top.push(this.theme.fg("dim", "  No request came before the human input of this request: there is nothing to compare with."), "");
 		if (diff) {
 			const count = (mark: string) => diff.marks.filter((m) => m === mark).length;
 			top.push(
-				this.head(`Since request #${previous.n}`),
+				this.head(`Since request #${previous.n}, ${this.byInput ? "the last request before the human input" : "the request before"}`),
 				this.pairs([
 					["+ added", count("+")],
 					["~ changed", count("~")],
@@ -1105,7 +1317,7 @@ export class ContextOverlay {
 		const above = top.length + strip().length;
 		if (this.toAdded) this.item = Math.max(0, diff?.marks.indexOf("+") ?? 0);
 		this.toAdded = false;
-		const list = this.list(rows, factor, above, diff?.marks);
+		const list = this.list(rows, factor, above, diff?.marks, undefined, this.reply);
 		top.push(...strip(this.positions[this.item]));
 		const removed = diff?.removed ?? [];
 		const gone = removed.length
@@ -1128,7 +1340,6 @@ export class ContextOverlay {
 		const kinds = eventKinds(events);
 		if (!kinds.some(([kind]) => kind === this.kind)) this.kind = "";
 		const shown = events.filter((e) => !this.kind || e.kind === this.kind);
-		const chip = (name: string, count: number, on: boolean) => (on ? t.bold(t.fg("accent", `[${name} ${count}]`)) : t.fg("muted", `${name} ${count}`));
 		// A negative change frees context.
 		const change = (delta: number | undefined, width = 0) =>
 			delta === undefined ? " ".repeat(width) : t.fg(delta < 0 ? "success" : "warning", `≈${delta < 0 ? "−" : "+"}${fmtTokens(Math.abs(delta))}`.padStart(width));
@@ -1139,7 +1350,7 @@ export class ContextOverlay {
 		const name = Math.max(...by.map((sum) => sum.producer.length));
 		return [
 			this.head("Events by kind"),
-			...this.wrap([chip("all", events.length, !this.kind), ...kinds.map(([kind, count]) => chip(kind, count, kind === this.kind))]),
+			...this.wrap([this.chip("all", events.length, !this.kind), ...kinds.map(([kind, count]) => this.chip(kind, count, kind === this.kind))]),
 			this.pairs([["Net change of the context", sized.length ? change(sized.reduce((sum, e) => sum + (e.delta ?? 0), 0)) : "not known"]]),
 			...(by.length
 				? ["", this.head("Injected by"), ...by.map((sum) => `  ${sum.producer.padEnd(name)}  ${`${sum.count}×`.padStart(5)}  ≈${fmtTokens(sum.tokens).padStart(6)}`)]
@@ -1163,7 +1374,7 @@ export class ContextOverlay {
 			// Newest first.
 			this.ops = [...file.ops].reverse();
 			this.item = Math.min(this.item, this.ops.length - 1);
-			const names = { reads: "read", writes: "write", edits: "edit" };
+			const names = { reads: "read", writes: "write", edits: "edit", searches: "search", images: "image" };
 			return select(
 				[
 					this.head(file.path),
@@ -1171,32 +1382,42 @@ export class ContextOverlay {
 						["Reads", file.reads],
 						["Writes", file.writes],
 						["Edits", file.edits],
+						["Searches", file.searches],
+						["Images", file.images],
 						["Lines", `+${file.added} −${file.removed}`],
 					]),
 					"",
-					t.fg("muted", `  ${"time".padEnd(8)}  ${"request".padEnd(7)}  ${"what".padEnd(5)}  ${columns}  tool`),
+					t.fg("muted", `  ${"time".padEnd(8)}  ${"request".padEnd(7)}  ${"what".padEnd(6)}  ${columns}  tool`),
 				],
 				this.ops.map(
 					(op) =>
-						`${fmtTime(op.time)}  ${`#${op.request}`.padEnd(7)}  ${names[op.op].padEnd(5)}  ${changed(op.added, op.removed)}  ${op.tool}${op.error ? t.fg("error", "  failed") : ""}`,
+						`${fmtTime(op.time)}  ${`#${op.request}`.padEnd(7)}  ${names[op.op].padEnd(6)}  ${op.hits === undefined ? changed(op.added, op.removed) : `${op.hits} ${op.hits === 1 ? "hit" : "hits"}`.padStart(16)}  ${op.tool}${op.error ? t.fg("error", "  failed") : ""}`,
 				),
 			);
 		}
 		this.opened = undefined;
-		const files = this.data.analysis.files
-			.filter((file) => this.matches(file.path))
-			.sort((a, b) => b.reads + b.writes + b.edits - (a.reads + a.writes + a.edits));
+		const all = this.data.analysis.files.filter((file) => this.matches(file.path));
+		const files = fileRows(all, FILE_ORDERS[this.fileOrder], this.fileKind || undefined);
 		this.fileList = files;
 		const unresolved = this.data.analysis.unresolvedEdits;
 		const note = unresolved
 			? [this.theme.fg("dim", `  ${unresolved} anchor-based edits are not listed: they were made before pi-context recorded their file.`)]
 			: [];
-		if (files.length === 0) return { lines: [this.filterText ? "No file matches the filter." : "No file activity yet.", ...note] };
+		if (this.data.analysis.files.length === 0) return { lines: ["No file activity yet.", ...note] };
+		// A kind keeps the files that have such operations.
+		const top = [
+			...this.wrap([this.chip("all", all.length, !this.fileKind), ...FILE_KINDS.map((kind) => this.chip(kind, all.filter((file) => file[kind] > 0).length, kind === this.fileKind))]),
+			t.fg("dim", `  Order: ${FILE_ORDER_NAMES[FILE_ORDERS[this.fileOrder]]}.`),
+		];
+		if (files.length === 0) return { lines: [...top, "  No file matches the filter.", ...note] };
 		this.item = Math.min(this.item, files.length - 1);
-		const count = (n: number) => String(n).padStart(5);
+		const count = (n: number, width = 5) => String(n).padStart(width);
 		return select(
-			[this.head(` ${"read".padStart(6)}${"write".padStart(6)}${"edit".padStart(6)}  ${columns}  path`)],
-			files.map((f) => `${count(f.reads)} ${count(f.writes)} ${count(f.edits)}  ${f.added + f.removed ? changed(f.added, f.removed) : changed()}  ${f.path}`),
+			[...top, this.head(` ${"read".padStart(6)}${"write".padStart(6)}${"edit".padStart(6)}${"search".padStart(7)}${"image".padStart(6)}  ${columns}  path`)],
+			files.map(
+				(f) =>
+					`${count(f.reads)} ${count(f.writes)} ${count(f.edits)} ${count(f.searches, 6)} ${count(f.images)}  ${f.added + f.removed ? changed(f.added, f.removed) : changed()}  ${f.path}`,
+			),
 			note,
 		);
 	}
@@ -1211,13 +1432,17 @@ export class ContextOverlay {
 		const mark = (ok?: boolean) => (ok === undefined ? t.fg("dim", "…") : ok ? t.fg("success", "✓") : t.fg("error", "✗"));
 		const timed = commands.filter((c) => c.ms !== undefined);
 		// Newest first.
-		this.commandList = commands.filter((c) => this.matches(c.command)).reverse();
+		this.commandList = commands.filter((c) => (!this.status || commandStatus(c) === this.status) && this.matches(c.command)).reverse();
 		this.item = Math.max(0, Math.min(this.item, this.commandList.length - 1));
 		const top = [
 			this.pairs([
 				["Commands", commands.length],
 				["Failed", commands.filter((c) => c.ok === false).length],
 				["Time", timed.length ? fmtDuration(timed.reduce((sum, c) => sum + (c.ms ?? 0), 0)) : "not known"],
+			]),
+			...this.wrap([
+				this.chip("all", commands.length, !this.status),
+				...COMMAND_STATUSES.map((status) => this.chip(status, commands.filter((c) => commandStatus(c) === status).length, status === this.status)),
 			]),
 			"",
 			this.head("Programs"),
@@ -1232,6 +1457,7 @@ export class ContextOverlay {
 			const took = (c.ms === undefined ? "" : c.ms < 10_000 ? `${(c.ms / 1000).toFixed(1)}s` : fmtDuration(c.ms)).padStart(6);
 			return `${i === this.item ? t.fg("accent", "▶") : " "} ${mark(c.ok)} ${fmtTime(c.time)}  ${t.fg("muted", request)}  ${took}  ${c.command.replace(/\s+/g, " ")}`;
 		});
+		if (lines.length === 0) lines.push("  No command matches the filter.");
 		return { lines: [...top, ...lines], cursor: this.item === 0 ? 0 : top.length + this.item };
 	}
 
@@ -1294,7 +1520,13 @@ export class ContextOverlay {
 		if (agent.cost != null) detail("Cost", fmtCost(agent.cost));
 		if (agent.toolUses != null) detail("Tool uses", agent.toolUses);
 		if (agent.compactions) detail("Compactions", agent.compactions);
-		const indent = agent.parent ? "    " : "  ";
+		if (agent.context != null) {
+			const window = agent.window ? ` / ${fmtTokens(agent.window)} (${fmtPercent(agent.context, agent.window)}) ${bar(agent.context / agent.window, 12)}` : "";
+			detail("Context", `${fmtTokens(agent.context)}${window}`);
+		}
+		if (agent.sums) detail("Composition", this.mix(agent.sums, 16));
+		// An agent is under the agent that started it.
+		const indent = "  ".repeat((agent.depth ?? (agent.parent ? 1 : 0)) + 1);
 		const lines = [
 			`${selected ? t.fg("accent", "▶") + indent.slice(1) : indent}${agent.parent ? "↳ " : ""}${mark} ${t.bold(agent.type)}  ${agent.description}  ${t.fg("dim", agent.id)}`,
 			...this.wrap(details, `${indent}  `),
@@ -1304,7 +1536,7 @@ export class ContextOverlay {
 	}
 
 	private fleet(): string[] {
-		const { analysis, agents, usage, model, running, parentSession } = this.data;
+		const { analysis, agents, usage, model, running, parentSession, timeline, tasks } = this.data;
 		const t = this.theme;
 		const context =
 			usage?.percent == null ? "?" : `${Math.round(usage.percent)}% ${fmtTokens(usage.tokens)}/${fmtTokens(usage.contextWindow)}`;
@@ -1318,15 +1550,85 @@ export class ContextOverlay {
 			])}`,
 		];
 		if (parentSession) lines.push(`  ${this.pairs([["Parent session", parentSession]])}`);
-		lines.push("", this.head(`Subagents (${agents.length})`));
-		if (agents.length === 0) lines.push("  None on this branch.");
-		this.item = Math.min(this.item, Math.max(0, agents.length - 1));
+		const view = FLEET_VIEWS[this.fleetView];
+		const counts = { Agents: agents.length, Timeline: timeline.length, Tasks: boardOf(tasks, agents).reduce((sum, group) => sum + group.items.length, 0) };
+		lines.push("", ...this.wrap(FLEET_VIEWS.map((name) => this.chip(name, counts[name], name === view))));
 		this.picks = [];
-		agents.forEach((agent, i) => {
-			this.picks.push({ line: lines.length, file: agent.sessionFile, title: `${agent.type}: ${agent.description}` });
-			lines.push(...this.agentLines(agent, i === this.item));
-		});
+		if (view === "Timeline") this.timeline(lines);
+		else if (view === "Tasks") this.board(lines);
+		else {
+			lines.push("", this.head(`Subagents (${agents.length})`));
+			if (agents.length === 0) lines.push("  None on this branch.");
+			this.item = Math.min(this.item, Math.max(0, agents.length - 1));
+			agents.forEach((agent, i) => {
+				this.picks.push({ line: lines.length, file: agent.sessionFile, title: `${agent.type}: ${agent.description}` });
+				lines.push(...this.agentLines(agent, i === this.item));
+			});
+		}
 		return lines;
+	}
+
+	/** The timeline view of the Fleet tab: adds the events that pass the filter. An event opens into its content. */
+	private timeline(lines: string[]): void {
+		const t = this.theme;
+		const { timeline, agents } = this.data;
+		// The type of an agent tells more than its id.
+		const who = (event: FleetEvent) => agents.find((agent) => agent.id === event.agent)?.type ?? event.agent ?? "";
+		const events = timeline.filter((event) => this.matches(`${event.title} ${event.body ?? ""}`));
+		if (this.latestFirst) events.reverse();
+		this.item = Math.min(this.item, Math.max(0, events.length - 1));
+		lines.push("", this.head(`Timeline (${this.latestFirst ? "latest" : "earliest"} first)`));
+		if (events.length === 0) lines.push(timeline.length ? "  No event matches the filter." : "  No delegation, message, completion or task event on this branch.");
+		const wide = Math.min(24, Math.max(0, ...events.map((event) => who(event).length)));
+		events.forEach((event, i) => {
+			this.picks.push({ line: lines.length, title: `${event.kind} · ${event.title.replace(/\s+/g, " ")}`, text: event.body });
+			lines.push(
+				`${i === this.item ? t.fg("accent", "▶") : " "} ${fmtDay(event.time).slice(5)} ${fmtTime(event.time)}  ${t.fg("accent", event.kind.padEnd(12))}  ${t.fg("muted", who(event).slice(0, wide).padEnd(wide))}  ${event.title.replace(/\s+/g, " ")}`,
+			);
+		});
+	}
+
+	/** The tasks view of the Fleet tab: adds the tasks and the delegations by owner. An entry opens into its description and reply. */
+	private board(lines: string[]): void {
+		const t = this.theme;
+		const { tasks, agents } = this.data;
+		const all = boardOf(tasks, agents).flatMap((group) => group.items);
+		const groups = boardOf(tasks, agents, this.taskState || undefined);
+		this.item = Math.min(this.item, Math.max(0, groups.reduce((sum, group) => sum + group.items.length, 0) - 1));
+		const mark = (item: BoardItem) =>
+			item.state === "in_progress"
+				? t.fg("accent", "●")
+				: item.state === "pending"
+					? t.fg("dim", "○")
+					: item.status === "completed"
+						? t.fg("success", "✓")
+						: t.fg("error", "✗");
+		const ids = (list: string[]) => list.map((id) => `#${id}`).join(", ");
+		lines.push(
+			"",
+			...this.wrap([
+				this.chip("all", all.length, !this.taskState),
+				...TASK_STATES.map((state) => this.chip(TASK_STATE_NAMES[state], all.filter((item) => item.state === state).length, state === this.taskState)),
+			]),
+		);
+		if (groups.length === 0) lines.push("", all.length ? "  No task is in this state." : "  No tasks and no delegations on this branch.");
+		for (const { owner, items } of groups) {
+			lines.push("", this.head(`${owner} (${items.length})`));
+			for (const item of items) {
+				const text = [
+					`Status: ${item.status}`,
+					...(item.blockedBy.length ? [`Blocked by: ${ids(item.blockedBy)}`] : []),
+					...(item.description ? [`\nDescription:\n${item.description}`] : []),
+					...(item.reply ? [`\nReply:\n${item.reply}`] : []),
+				].join("\n");
+				const selected = this.picks.length === this.item;
+				this.picks.push({ line: lines.length, title: `${owner} · ${item.subject.replace(/\s+/g, " ")}`, text });
+				const blocked = item.blockedBy.length ? `  ${t.fg("warning", `blocked by ${ids(item.blockedBy)}`)}` : "";
+				// A delegation has the id of its agent, which is long.
+				const subject = `${item.agent ? "" : `#${item.id} `}${item.subject.replace(/\s+/g, " ")}`;
+				lines.push(`${selected ? t.fg("accent", "▶") : " "} ${mark(item)} ${subject}  ${t.fg("muted", item.status)}${blocked}${item.agent ? `  ${t.fg("dim", item.id)}` : ""}`);
+			}
+		}
 	}
 
 	private insightsTab(): string[] {
@@ -1337,25 +1639,42 @@ export class ContextOverlay {
 			cwd: this.projectOnly ? this.host.cwd : undefined,
 			sort: SORTS[this.sort][0],
 			day: this.day,
+			uses: this.uses,
 		});
 		const s = this.insights;
 		const period = Number.isFinite(days) ? `Last ${days} days` : "All time";
 		const [year, month, date] = (s.day ?? "").split("-").map(Number);
 		const span = s.day ? `${s.day} (${WEEKDAYS[(new Date(year, month - 1, date).getDay() + 6) % 7]}) of ${period.toLowerCase()}` : period;
 		const recorded = s.composition.requests;
-		const top = (list: [string, number][]) => this.wrap(list.map(([name, n]) => `${name} ×${n}`));
+		const uses = this.uses;
+		// The entry that narrows the list of sessions is marked. The time tells the last use.
+		const top = (kind: NonNullable<InsightsFilter["uses"]>["kind"]) =>
+			this.wrap(
+				s[kind].map(([name, n, last]) => {
+					const text = `${name} ×${n}`;
+					const on = uses?.kind === kind && uses.name === name;
+					return `${on ? t.bold(t.fg("accent", `[${text}]`)) : text}${last ? ` ${t.fg("dim", ago(last))}` : ""}`;
+				}),
+			);
+		const used = uses ? `, sessions that used the ${uses.kind.slice(0, -1)} ${uses.name}` : "";
 		const max = Math.max(...s.week.map((day) => day.tokens), 1);
 		const peak = Math.max(...s.heat.flat(), 1);
 		const sessions = s.sessions.filter((session) => this.matches(`${session.cwd} ${session.name}`));
 		this.item = Math.min(this.item, Math.max(0, sessions.length - 1));
 		const lines = [
-			this.head(`${span}, ${this.projectOnly ? `project ${basename(this.host.cwd)}` : "all projects"}`),
+			this.head(`${span}, ${this.projectOnly ? `project ${basename(this.host.cwd)}` : "all projects"}${used}`),
 			this.pairs([
-				["Sessions", s.sessions.length],
+				[uses ? "Sessions listed" : "Sessions", s.sessions.length],
 				["Requests", s.requests],
 				["Tokens", fmtTokens(s.tokens)],
 				["Cost", fmtCost(s.cost)],
 				...(s.day ? [] : ([["Active days", s.activeDays]] as [string, number][])),
+			]),
+			this.pairs([
+				["Human inputs", s.userInputs],
+				["Tool calls", s.toolCalls],
+				["Active time", fmtDuration(s.activeMs)],
+				["Cache-hit rate", fmtPercent(s.cacheRate, 1)],
 			]),
 			"",
 			this.head("Tokens by day"),
@@ -1392,29 +1711,34 @@ export class ContextOverlay {
 			),
 			"",
 			this.head("Top tools"),
-			...top(s.tools),
+			...top("tools"),
 			this.head("Top programs"),
-			...top(s.programs),
+			...top("programs"),
 			this.head("Top skills"),
-			...top(s.skills),
+			...top("skills"),
+			t.fg("dim", "  The time is the last use. t, c, k: list only the sessions that used the next tool, program or skill. x: all sessions."),
 			"",
-			this.head(`Sessions (${SORTS[this.sort][1]})`),
+			this.head(`Sessions (${SORTS[this.sort][1]}${this.grouped ? ", by project" : ""}${used.replace(", sessions", ",")})`),
+			t.fg("dim", "  ctx: the tokens that the last request of the session sent. The bar shows the estimated composition of that request:"),
+			...this.wrap(CATEGORIES.map((cat) => `${t.fg(COLORS[cat], "█")} ${t.fg("muted", LABELS[cat])}`)),
 		];
 		if (sessions.length === 0) lines.push(this.filterText ? "  No session matches the filter." : "  None.");
-		this.picks = sessions.map((session, i) => ({
-			line: lines.length + i,
-			file: session.file,
-			title: session.name || `${basename(session.cwd)} ${fmtDay(session.end)}`,
-		}));
-		sessions.forEach((session, i) =>
+		this.picks = [];
+		const row = (session: SessionSummary) => {
+			const selected = this.picks.length === this.item;
+			this.picks.push({ line: lines.length, file: session.file, title: session.name || `${basename(session.cwd)} ${fmtDay(session.end)}` });
 			lines.push(
-				`${i === this.item ? t.fg("accent", "▶") : " "} ${fmtDay(session.end).slice(5)} ${fmtTime(session.end).slice(0, 5)}  ${basename(session.cwd).slice(0, 24).padEnd(24)} ${String(session.requests).padStart(5)} req ${fmtTokens(session.tokens).padStart(7)}  ${fmtCost(session.cost).padStart(9)}  ${t.fg("dim", session.name)}`,
-			),
-		);
+				`${selected ? t.fg("accent", "▶") : " "} ${fmtDay(session.end).slice(5)} ${fmtTime(session.end).slice(0, 5)}  ${basename(session.cwd).slice(0, 24).padEnd(24)} ${String(session.requests).padStart(5)} req ${fmtTokens(session.tokens).padStart(7)}  ${fmtCost(session.cost).padStart(9)} ${fmtTokens(session.context).padStart(7)} ctx ${this.mix(session.profile, 10)}  ${t.fg("dim", session.name)}`,
+			);
+		};
+		for (const [cwd, group] of this.grouped ? groupSessions(sessions) : ([["", sessions]] as [string, SessionSummary[]][])) {
+			if (cwd) lines.push(t.fg("muted", `  ${cwd} (${group.length})`));
+			for (const session of group) row(session);
+		}
 		return lines;
 	}
 
-	private settings(): string[] {
+	private settings(): Body {
 		const { config } = this.data;
 		const t = this.theme;
 		const affix = (text?: string) => (text ? `${text.length} characters: ${text.replace(/\s+/g, " ").slice(0, 60)}` : "disabled");
@@ -1458,15 +1782,32 @@ export class ContextOverlay {
 				text: config.systemPromptSuffix,
 			},
 		];
+		// The entries are in the order of SETTINGS.
+		const own = items.length;
+		for (const name of CHOICE_SETTINGS) {
+			const { key, label, values, help } = CHOICES[name];
+			items.push({
+				name: label,
+				value: `${choiceOf(config, name)}${config[key] === undefined ? " (default)" : ""}  ${t.fg("dim", `of: ${values.join(", ")}`)}`,
+				help: `${help} Enter sets the next value. Clearing restores the default: ${values[0]}.`,
+			});
+		}
 		this.item = Math.min(this.item, items.length - 1);
 		const selected = items[this.item];
-		return [
+		const row = (item: (typeof items)[number], i: number) => `${i === this.item ? t.fg("accent", "▶") : " "} ${item.name.padEnd(22)} ${item.value}`;
+		const lines = [
 			this.head("Settings"),
-			...items.map((item, i) => `${i === this.item ? t.fg("accent", "▶") : " "} ${item.name.padEnd(22)} ${item.value}`),
+			...items.slice(0, own).map(row),
+			"",
+			this.head("View defaults"),
+			...items.slice(own).map((item, i) => row(item, own + i)),
 			"",
 			...wrapped(selected.help, this.width - 2).map((line) => t.fg("dim", `  ${line}`)),
 			t.fg("dim", `  Saved in ${this.host.configPath}`),
 			...(selected.text ? ["", this.head("Value"), ...wrapped(selected.text, this.width - 2).map((line) => `  ${line}`)] : []),
 		];
+		// The selected setting stays in view, and its help with it when the height allows.
+		const cursor = this.item === 0 ? 0 : this.item < own ? 1 + this.item : 3 + this.item;
+		return { lines, cursor, span: lines.length - 1 - cursor };
 	}
 }

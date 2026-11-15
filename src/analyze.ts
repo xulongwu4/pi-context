@@ -1,4 +1,5 @@
 import type { Config } from "./config.ts";
+import type { FleetEvent, TaskRec } from "./fleet.ts";
 import { fmtTokens } from "./format.ts";
 import type { Hint } from "./hints.ts";
 
@@ -41,6 +42,10 @@ export interface Row {
 	dropped?: boolean;
 	/** When the message of the row was created, in ms. The system prompt and the tool schemas have none. */
 	time?: number;
+	/** Tool call id, for a tool call. */
+	call?: string;
+	/** Set for a tool result that is an error. */
+	error?: boolean;
 }
 
 /** How the rows of a request differ from those of the request before it. */
@@ -96,6 +101,8 @@ export interface RequestRec {
 	/** Composition by category and duration, when pi-context recorded the turn in the session. */
 	sums?: Record<Category, number>;
 	ms?: number;
+	/** Wall time of the turn: the request and the tools it ran. From the same record. */
+	activeMs?: number;
 }
 
 /** One human input and the work it caused, up to the next input. */
@@ -127,10 +134,14 @@ export interface EventRec {
 	delta?: number;
 }
 
-/** One read, write or edit of a file. */
+/** The kinds of file operations. A search counts on each file it found, or on the searched path. */
+export const FILE_KINDS = ["reads", "writes", "edits", "searches", "images"] as const;
+export type FileKind = (typeof FILE_KINDS)[number];
+
+/** One read, write, edit or search of a file. */
 export interface FileOp {
 	time: number;
-	op: "reads" | "writes" | "edits";
+	op: FileKind;
 	tool: string;
 	/** Number of the request that made the call. */
 	request: number;
@@ -140,6 +151,8 @@ export interface FileOp {
 	added?: number;
 	removed?: number;
 	error?: boolean;
+	/** Matches of the search in the file. Undefined when the session does not tell them. */
+	hits?: number;
 }
 
 export interface FileRec {
@@ -147,6 +160,8 @@ export interface FileRec {
 	reads: number;
 	writes: number;
 	edits: number;
+	searches: number;
+	images: number;
 	/** Lines added and removed by the writes and edits whose lines are known. */
 	added: number;
 	removed: number;
@@ -179,6 +194,8 @@ export interface ToolRec {
 	undeclared: number;
 	/** Direct calls made before pi-context recorded any declarations. */
 	unchecked: number;
+	/** Time of the last call. */
+	last?: number;
 }
 
 export interface ModelRec {
@@ -194,6 +211,8 @@ export interface SkillRec {
 	path: string;
 	name: string;
 	loads: number;
+	/** Time of the last load. */
+	last?: number;
 	/** Estimated size of the last load; 0 when the load was a nested call. */
 	tokens: number;
 }
@@ -215,6 +234,15 @@ export interface AgentRec {
 	cost?: number;
 	toolUses?: number;
 	compactions?: number;
+	/** Prompt tokens of the agent's last request, and the context window of its model when it is known. */
+	context?: number;
+	window?: number;
+	/** Estimated tokens of the agent's last recorded request, by category. */
+	sums?: Record<Category, number>;
+	/** How many agents are above it: 0 for an agent of this session. */
+	depth?: number;
+	/** The final reply. */
+	result?: string;
 }
 
 export interface Timing {
@@ -302,6 +330,12 @@ export interface ViewData {
 	/** Finished and live subagents, newest first. */
 	agents: AgentRec[];
 	running: boolean;
+	/** Tokens of the window that pi keeps free: before it compacts, and for the reply of the model. */
+	reserve?: { compaction?: number; output?: number };
+	/** Delegations, messages and completions of the subagents, oldest first. */
+	timeline: FleetEvent[];
+	/** The tasks of the session's pi-tasks list. */
+	tasks: TaskRec[];
 	parentSession?: string;
 	/** Name of the session, when it is not the current one. Such data is read-only. */
 	other?: string;
@@ -470,13 +504,14 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 	const rows: Row[] = [];
 	/** Time of the message being read. */
 	let time: number | undefined;
-	const push = (cat: Category, chars: number, label: string, text: string, content = text, id?: string) => {
-		if (chars <= 0) return;
+	const push = (cat: Category, chars: number, label: string, text: string, content = text, id?: string): Row | undefined => {
+		if (chars <= 0) return undefined;
 		const row: Row = { cat, tokens: estimate(chars), label, preview: text.slice(0, 640).replace(/\s+/g, " ").trim().slice(0, 160) };
 		if (full) row.text = content;
 		if (id) row.id = id;
 		if (time !== undefined) row.time = time;
 		rows.push(row);
+		return row;
 	};
 	// System messages replay in order: later ones append text, and replace or remove sections.
 	const sections = new Map<string, string>();
@@ -516,12 +551,13 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				for (const call of blocks.filter((b) => b?.type === "toolCall")) {
 					const args = JSON.stringify(call.arguments ?? {});
 					if (isSkillRead(call)) skillCalls.add(call.id);
-					push("toolCalls", call.name.length + args.length, `call ${call.name}`, args);
+					const row = push("toolCalls", call.name.length + args.length, `call ${call.name}`, args);
+					if (row && call.id) row.call = call.id;
 				}
 				break;
 			}
-			case "toolResult":
-				push(
+			case "toolResult": {
+				const row = push(
 					skillCalls.has(m.toolCallId) ? "skills" : "toolResults",
 					contentChars(m.content),
 					`result ${m.toolName}`,
@@ -529,7 +565,9 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 					undefined,
 					m.toolCallId,
 				);
+				if (row && m.isError) row.error = true;
 				break;
+			}
 			case "bashExecution":
 				if (!m.excludeFromContext) {
 					push("injected", (m.command?.length ?? 0) + (m.output?.length ?? 0), "bash", m.command ?? "", `${m.command ?? ""}\n${m.output ?? ""}`);
@@ -598,6 +636,54 @@ export function textOf(row: Row, index: number, rebuilt: Row[]): string | undefi
 	return (same(rebuilt[index]) ? rebuilt[index] : (rebuilt.find(same) ?? (fixed ? rebuilt.find((other) => other.cat === row.cat) : undefined)))?.text;
 }
 
+/** The parts of the replies of the model, as categories. */
+export const REPLY_KINDS = ["reasoning", "toolCalls", "answers"] as const;
+export type ReplyKind = (typeof REPLY_KINDS)[number];
+
+/** How many rows each part of the replies has. */
+export function replyCounts(rows: Row[]): Record<ReplyKind, number> {
+	const counts: Record<ReplyKind, number> = { reasoning: 0, toolCalls: 0, answers: 0 };
+	for (const row of rows) {
+		const kind = REPLY_KINDS.find((each) => each === row.cat);
+		if (kind) counts[kind]++;
+	}
+	return counts;
+}
+
+/** The row of the tool call that a tool result answers. */
+export const callOf = (row: Row, rows: Row[]) => (row.id ? rows.find((other) => other.call === row.id) : undefined);
+
+/** What the view of a tool result tells about its call. */
+export interface CallView {
+	tool: string;
+	status: "ok" | "error";
+	/** Lines of the result. */
+	lines: number;
+	/** The arguments of the call, when its row is known. */
+	args?: string;
+}
+
+/** Describes the call of a tool result from the text of the result and the arguments on the row of the call. */
+export function callView(row: Row, text: string, argsText?: string): CallView {
+	const view: CallView = { tool: row.label.replace(/^result /, ""), status: row.error ? "error" : "ok", lines: text ? text.split("\n").length : 0 };
+	if (argsText === undefined) return view;
+	try {
+		view.args = JSON.stringify(JSON.parse(argsText), null, 2);
+	} catch {
+		view.args = argsText;
+	}
+	return view;
+}
+
+/**
+ * Index of the request that the diff of request `index` compares with: the request before it,
+ * or with "input" the last request before the human input that the request belongs to. -1 when there is none.
+ */
+export function baselineOf(analysis: Analysis, index: number, base: "request" | "input" = "request"): number {
+	if (base === "request") return index - 1;
+	const input = analysis.inputs.findLast((rec) => rec.requests > 0 && rec.first <= index);
+	return input ? input.first - 1 : -1;
+}
 export function sumByCategory(rows: Row[]): Record<Category, number> {
 	const sums = emptySums();
 	for (const row of rows) sums[row.cat] += row.tokens;
@@ -667,7 +753,14 @@ export interface TrendBar {
 	value: number;
 	/** `value` by category. Undefined when pi-context has no record of the composition. */
 	parts?: Record<Category, number>;
+	/** Recorded duration of the request, or of the requests of the human input. */
+	ms?: number;
+	/** Kinds of the compactions, drops and restores since the bar before. */
+	marks?: string[];
 }
+
+/** The events that the trend marks on the bar after them. */
+const TREND_MARKS = ["compaction", "drop", "restore"];
 
 /**
  * The bars of the trend: one for each request, or with `byTurn` one for each human input that caused a request.
@@ -694,6 +787,11 @@ export function trendBars(analysis: Analysis, byTurn: boolean, delta: boolean): 
 		if (parts && base) for (const cat of CATEGORIES) parts[cat] -= base[cat];
 		const bar: TrendBar = { index, n, value: requests[index].context - (before?.context ?? 0) };
 		if (parts) bar.parts = parts;
+		const from = i > 0 ? picked[i - 1].index : -1;
+		const marks = analysis.events.filter((event) => TREND_MARKS.includes(event.kind) && event.after > from && event.after <= index).map((event) => event.kind);
+		if (marks.length > 0) bar.marks = [...new Set(marks)];
+		const timed = requests.slice(byTurn ? from + 1 : index, index + 1).filter((request) => request.ms !== undefined);
+		if (timed.length > 0) bar.ms = timed.reduce((sum, request) => sum + (request.ms ?? 0), 0);
 		return bar;
 	});
 }
@@ -773,11 +871,84 @@ export function programOf(command: string): string {
 	return fallback;
 }
 
-export function fileOp(toolName: string): "reads" | "writes" | "edits" | undefined {
-	if (toolName === "read") return "reads";
+const SEARCH_TOOLS = /^(grep|find|glob|rg|ffgrep|fffind)$/i;
+const IMAGE_PATH = /\.(png|jpe?g|gif|webp)$/i;
+/** Most files that one search is recorded on. */
+const MAX_SEARCH_FILES = 100;
+
+/** The kind of file operation a tool makes. A read of a path with an image extension is an image read. */
+export function fileOp(toolName: string, path?: string): FileKind | undefined {
+	if (toolName === "read") return path && IMAGE_PATH.test(path) ? "images" : "reads";
 	if (toolName === "write") return "writes";
 	if (/edit|replace|insert|patch/i.test(toolName)) return "edits";
+	if (SEARCH_TOOLS.test(toolName)) return "searches";
 	return undefined;
+}
+
+const hasImage = (content: unknown) => Array.isArray(content) && content.some((block) => block?.type === "image");
+
+/**
+ * The files that the result of a search lists, with the matches in each: at most {@link MAX_SEARCH_FILES} files.
+ * Reads `path:line:` lines and lines under `=== path ===` headers; for a find or glob tool, one path on each line.
+ * Paths are relative to the searched path `base`.
+ */
+export function searchHits(toolName: string, text: string, base = "."): Map<string, number> {
+	const hits = new Map<string, number>();
+	const dir = base.replace(/\/+$/, "");
+	const resolve = (path: string) => {
+		if (/^[/~]/.test(path) || dir === "." || dir === "") return path;
+		// A search of one file names the file without its directory.
+		return dir === path || dir.endsWith(`/${path}`) ? dir : `${dir}/${path}`;
+	};
+	const count = (path: string, by: number) => {
+		if (hits.has(path) || hits.size < MAX_SEARCH_FILES) hits.set(path, (hits.get(path) ?? 0) + by);
+	};
+	const byName = /find|glob/i.test(toolName);
+	let group: string | undefined;
+	for (const line of text.split("\n")) {
+		const header = /^=== (.+) ===$/.exec(line);
+		if (header) {
+			group = resolve(header[1]);
+			count(group, 0);
+		} else if (group) {
+			if (/^\s*\d+:/.test(line)) count(group, 1);
+		} else if (byName) {
+			if (line.trim() && !/^(\[|No )/.test(line)) count(resolve(line.trim().replace(/\/$/, "")), 1);
+		} else {
+			const match = /^(.+?):\d+:/.exec(line);
+			if (match) count(resolve(match[1]), 1);
+		}
+	}
+	return hits;
+}
+
+/** Orders of the file list: {@link fileRows}. */
+export const FILE_ORDERS = ["ops", "recent", "name"] as const;
+export type FileOrder = (typeof FILE_ORDERS)[number];
+
+/** The files with the most operations first, the last used first, or by path. With `kind`, only the files with such operations. */
+export function fileRows(files: FileRec[], order: FileOrder = "ops", kind?: FileKind): FileRec[] {
+	const rows = kind ? files.filter((file) => file[kind] > 0) : [...files];
+	const ops = (file: FileRec) => FILE_KINDS.reduce((sum, each) => sum + file[each], 0);
+	const last = (file: FileRec) => file.ops.reduce((time, op) => Math.max(time, op.time), 0);
+	if (order === "name") return rows.sort((a, b) => a.path.localeCompare(b.path));
+	if (order === "recent") return rows.sort((a, b) => last(b) - last(a));
+	return rows.sort((a, b) => ops(b) - ops(a));
+}
+
+export const COMMAND_STATUSES = ["ok", "failed", "unknown"] as const;
+export type CommandStatus = (typeof COMMAND_STATUSES)[number];
+
+/** Whether the command succeeded, failed, or the session does not tell. */
+export const commandStatus = (command: CommandRec): CommandStatus => (command.ok === undefined ? "unknown" : command.ok ? "ok" : "failed");
+
+/** Index of the run with the longest wall time; -1 when no run has one. */
+export function slowest(commands: CommandRec[]): number {
+	let index = -1;
+	commands.forEach((command, i) => {
+		if (command.ms !== undefined && (index < 0 || command.ms > (commands[index].ms ?? 0))) index = i;
+	});
+	return index;
 }
 
 /** Lines that a diff adds and removes. */
@@ -860,7 +1031,20 @@ export function analyze(entries: any[]): Analysis {
 	const paths = new Map<string, string>();
 	const lines = new Map<string, [number, number]>();
 	/** File operations of direct calls, until their result tells the outcome. */
-	const opsById = new Map<string, FileOp>();
+	const opsById = new Map<string, { op: FileOp; path: string }>();
+	const fileAt = (path: string) => {
+		let file = files.get(path);
+		if (!file) {
+			file = { path, reads: 0, writes: 0, edits: 0, searches: 0, images: 0, added: 0, removed: 0, ops: [] };
+			files.set(path, file);
+		}
+		return file;
+	};
+	const addOp = (path: string, op: FileOp) => {
+		const file = fileAt(path);
+		file[op.op]++;
+		file.ops.push(op);
+	};
 	const declarations: { time: number; names: Set<string> }[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== TURN_ENTRY || !entry.data) continue;
@@ -910,9 +1094,10 @@ export function analyze(entries: any[]): Analysis {
 		analysis.inputs.push(rec);
 		return rec;
 	};
-	const loadSkill = (path: string) => {
-		const skill = skills.get(path) ?? { path, name: path.split("/").at(-2) ?? path, loads: 0, tokens: 0 };
+	const loadSkill = (path: string, time: number) => {
+		const skill: SkillRec = skills.get(path) ?? { path, name: path.split("/").at(-2) ?? path, loads: 0, tokens: 0 };
 		skill.loads++;
+		skill.last = time;
 		skills.set(path, skill);
 		return skill;
 	};
@@ -921,6 +1106,7 @@ export function analyze(entries: any[]): Analysis {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
 		const rec = tool(call.name);
+		rec.last = time;
 		if (nestedStatus) {
 			rec.nested++;
 			if (nestedStatus === "error") rec.errors++;
@@ -931,22 +1117,19 @@ export function analyze(entries: any[]): Analysis {
 			if (known === false) rec.undeclared++;
 			else if (known === undefined) rec.unchecked++;
 		}
-		const path = argPath(call.arguments) ?? paths.get(call.id);
-		const op = fileOp(call.name);
+		const op = fileOp(call.name, argPath(call.arguments));
+		const path = argPath(call.arguments) ?? paths.get(call.id) ?? (op === "searches" ? "." : undefined);
 		if (path && op) {
-			const file = files.get(path) ?? { path, reads: 0, writes: 0, edits: 0, added: 0, removed: 0, ops: [] };
-			file[op]++;
 			const rec: FileOp = { time, op, tool: call.name, request: analysis.requests.length, id: outer ?? call.id };
 			if (nestedStatus === "error") rec.error = true;
-			const change = op === "reads" || rec.error ? undefined : (lines.get(call.id) ?? argLines(call.arguments));
+			const change = (op === "writes" || op === "edits") && !rec.error ? (lines.get(call.id) ?? argLines(call.arguments)) : undefined;
 			// A write does not tell what it replaced.
 			if (change && op === "writes") rec.added = change[0];
 			else if (change) [rec.added, rec.removed] = change;
-			file.ops.push(rec);
-			if (!nestedStatus) opsById.set(call.id, rec);
-			files.set(path, file);
+			addOp(path, rec);
+			if (!nestedStatus) opsById.set(call.id, { op: rec, path });
 		} else if (op === "edits" && nestedStatus !== "error" && hasAnchor(call.arguments)) analysis.unresolvedEdits++;
-		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path));
+		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path, time));
 		if (call.name === "bash" && typeof call.arguments?.command === "string") {
 			const command: CommandRec = {
 				time,
@@ -1006,8 +1189,8 @@ export function analyze(entries: any[]): Analysis {
 			dropped = ids;
 		} else if (entry.type === "usage") addUsage(analysis.totals, entry.usage);
 		else if (entry.type === "custom" && entry.customType === "subagents:record" && typeof entry.data?.id === "string") {
-			const { id, type, description, status, startedAt, completedAt, sessionFile, error } = entry.data;
-			agents.set(id, { id, type, description, status, startedAt, completedAt, sessionFile, error });
+			const { id, type, description, status, startedAt, completedAt, sessionFile, error, result } = entry.data;
+			agents.set(id, { id, type, description, status, startedAt, completedAt, sessionFile, error, result });
 		}
 		if (entry.type === "custom_message") {
 			add(entry.customType ?? "custom", contentChars(entry.content));
@@ -1021,7 +1204,7 @@ export function analyze(entries: any[]): Analysis {
 			analysis.userInputs++;
 			const skill = skillBlock(contentText(m.content));
 			if (skill) {
-				loadSkill(skill.path).tokens = estimate(skill.block.length);
+				loadSkill(skill.path, time).tokens = estimate(skill.block.length);
 				add(`skill ${skill.name}`, skill.block.length);
 				inject(`skill ${skill.name}`, skill.block.length);
 			}
@@ -1041,11 +1224,27 @@ export function analyze(entries: any[]): Analysis {
 				rec.errors++;
 			}
 			addUsage(analysis.totals, m.usage);
-			const op = opsById.get(m.toolCallId);
+			const done = opsById.get(m.toolCallId);
+			const op = done?.op;
 			if (op && m.isError) {
 				op.error = true;
 				op.added = op.removed = undefined;
-			} else if (op && op.op !== "reads" && typeof m.details?.diff === "string") [op.added, op.removed] = diffLines(m.details.diff);
+			} else if (done && op?.op === "searches") {
+				// The search moves from the searched path to the files it found.
+				const found = searchHits(m.toolName, contentText(m.content), done.path);
+				if (found.size === 0) op.hits = 0;
+				else {
+					const searched = fileAt(done.path);
+					searched.searches--;
+					searched.ops.splice(searched.ops.indexOf(op), 1);
+					if (searched.ops.length === 0) files.delete(done.path);
+					for (const [path, hits] of found) addOp(path, { ...op, hits });
+				}
+			} else if (done && op?.op === "reads" && hasImage(m.content)) {
+				fileAt(done.path).reads--;
+				fileAt(done.path).images++;
+				op.op = "images";
+			} else if (op && (op.op === "writes" || op.op === "edits") && typeof m.details?.diff === "string") [op.added, op.removed] = diffLines(m.details.diff);
 			const command = commandsById.get(m.toolCallId);
 			if (command) {
 				command.ok = !m.isError;
@@ -1085,6 +1284,7 @@ export function analyze(entries: any[]): Analysis {
 				parentId: entry.parentId,
 				sums: turn?.sums,
 				ms: turn?.ms,
+				activeMs: turn?.activeMs,
 			};
 			analysis.requests.push(request);
 			added = [];
