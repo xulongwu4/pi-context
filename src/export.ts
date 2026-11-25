@@ -1,4 +1,4 @@
-import { cacheStats, CATEGORIES, type Category, LABELS, scaleOf, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
+import { cacheStats, CATEGORIES, type Category, familyTotals, LABELS, scaleOf, sumByCategory, tokensPerSecond, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
 import { hintTotal } from "./hints.ts";
 import type { Insights } from "./insights.ts";
@@ -23,13 +23,15 @@ function composition(sums: Record<Category, number>, reported?: number | null): 
 	);
 }
 
-const top = (list: [string, number, number?][]) => list.map(([name, n]) => `${name} ×${n}`).join(", ") || "None.";
+const top = (list: [string, number, ...number[]][]) => list.map(([name, n]) => `${name} ×${n}`).join(", ") || "None.";
 
 /** The whole dashboard as a Markdown document. */
 export function exportMarkdown(data: ViewData, insights: Insights): string {
 	const { analysis, current, usage, agents, factor, hints } = data;
 	const { totals, timing } = analysis;
 	const cache = cacheStats(analysis);
+	const family = familyTotals(totals, agents);
+	const speed = tokensPerSecond(timing);
 	const programs = new Map<string, number>();
 	for (const command of analysis.commands) programs.set(command.program, (programs.get(command.program) ?? 0) + 1);
 	const percent = usage?.percent == null ? "?" : `${Math.round(usage.percent)}%`;
@@ -48,8 +50,16 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 		`- Requests: ${analysis.requests.length}`,
 		`- Tool calls: ${analysis.toolCalls} (${analysis.toolErrors} errors)`,
 		`- Cost: ${fmtCost(totals.cost)}`,
+		...(family.agents.count > 0
+			? [`- With ${family.agents.count} subagents: ${fmtTokens(family.tokens)} tokens, ${fmtCost(family.cost)}`]
+			: []),
 		`- Tokens: input ${fmtTokens(totals.input)}, cache read ${fmtTokens(totals.cacheRead)}, cache write ${fmtTokens(totals.cacheWrite)}, output ${fmtTokens(totals.output)}`,
 		`- Timing of the recorded turns: active ${fmtDuration(timing.activeMs)}, model calls ${fmtDuration(timing.modelMs)}, tool runs ${fmtDuration(timing.toolMs)}`,
+		...(speed === undefined
+			? []
+			: [
+					`- Reply streams of ${timing.streamed} requests: first token after ${fmtDuration(timing.ttftMs / timing.streamed)} on average, ${Math.round(speed)} output tokens per second`,
+				]),
 		`- Prompt cache: ${fmtPercent(cache.rate, 1)} of the tokens sent were read from the cache; ${cache.misses} misses, ≈${fmtTokens(cache.tokens)} tokens billed again (≈${fmtCost(cache.cost)} extra)`,
 		"",
 		...table(

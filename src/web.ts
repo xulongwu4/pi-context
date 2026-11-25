@@ -4,12 +4,18 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
+	attentionOf,
 	baselineOf,
 	briefOf,
 	callOf,
 	callView,
 	diffRows,
+	familyTotals,
+	filesUpTo,
 	LABELS,
+	MARK_KINDS,
+	placeOf,
+	programRanks,
 	type RequestRec,
 	replyCounts,
 	type Row,
@@ -18,13 +24,14 @@ import {
 	sumTokens,
 	TOOL_ORDERS,
 	textOf,
+	tokensPerSecond,
 	toolRows,
 	trendBars,
 	type ViewData,
 } from "./analyze.ts";
 import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
 import { viewJson } from "./export.ts";
-import { boardOf } from "./fleet.ts";
+import { agentDetail, boardOf, chainOf, fleetSummary } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
 import { aggregate, type SessionSort } from "./insights.ts";
 import type { OverlayHost } from "./overlay.ts";
@@ -153,6 +160,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 		data(query) {
 			const file = query.get("session");
 			const { data, version: collected } = view(file, true);
+			const board = boardOf(data.tasks, data.agents);
 			return {
 				...viewJson(data),
 				trend: trendBars(data.analysis, query.get("turn") === "1", query.get("delta") === "1"),
@@ -167,7 +175,14 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				warnDefault: DEFAULT_WARN_PERCENT,
 				labels: LABELS,
 				replies: replyCounts(data.current),
-				board: boardOf(data.tasks, data.agents),
+				board,
+				fleet: fleetSummary(data.agents, data.timeline, board),
+				family: familyTotals(data.analysis.totals, data.agents),
+				attention: attentionOf(data.analysis.commands),
+				programs: programRanks(data.analysis.commands),
+				tps: tokensPerSecond(data.analysis.timing),
+				rates: data.rates ?? {},
+				markKinds: MARK_KINDS,
 				choices: CHOICES,
 				view: Object.fromEntries(CHOICE_SETTINGS.map((setting) => [setting, choiceOf(data.config, setting)])),
 			};
@@ -194,6 +209,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				items: diff?.items,
 				brief: briefOf(v.data.analysis, index, query.get("turn") === "1"),
 				replies: replyCounts(rows),
+				place: placeOf(v.data.analysis, index),
 			};
 		},
 		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. A tool result comes with its call. */
@@ -209,11 +225,34 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			const row = (request.rows ?? full)[index];
 			return described(row, row && textOf(row, index, full), full);
 		},
+		/** The description and the parameters of tool `name`, when pi knows the tool now. */
+		tool(query) {
+			const doc = view(query.get("session")).data.toolDoc?.(query.get("name") ?? "");
+			if (!doc) throw new Error("The tool is not known now.");
+			return doc;
+		},
+		/** The files as they were after request `n`. */
+		files(query) {
+			const v = view(query.get("session"));
+			return { files: filesUpTo(v.data.analysis.files, indexOf(v, query.get("n")) + 1) };
+		},
+		/** What subagent `id` was asked, what it answered, its tasks and its last events. */
+		agent(query) {
+			const { data } = view(query.get("session"));
+			const agent = data.agents.find((each) => each.id === query.get("id"));
+			if (!agent) throw new Error("There is no such subagent.");
+			return agentDetail(agent, data.timeline, boardOf(data.tasks, data.agents));
+		},
+		/** The tasks that task `id` waits for, directly or through other tasks. */
+		chain(query) {
+			return { ids: chainOf(view(query.get("session")).data.tasks, query.get("id") ?? "") };
+		},
 		async insights(query) {
 			// "all" is a period without a start.
 			const all = query.get("days") === "all";
 			const days = all ? Number.POSITIVE_INFINITY : Math.min(365, Math.max(1, Math.round(Number(query.get("days")) || 30)));
 			const day = query.get("day") ?? "";
+			const until = query.get("until") ?? "";
 			// "tools:read" lists only the sessions that used the tool read.
 			const [, usedKind, name] = /^(\w+):(.+)$/.exec(query.get("uses") ?? "") ?? [];
 			const kind = USE_KINDS.find((each) => each === usedKind);
@@ -221,6 +260,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				cwd: query.get("project") === "1" ? host.cwd : undefined,
 				sort: SORTS.find((sort) => sort === query.get("sort")),
 				day: /^\d{4}-\d{2}-\d{2}$/.test(day) ? day : undefined,
+				until: /^\d{4}-\d{2}-\d{2}$/.test(until) && until > day ? until : undefined,
 				uses: kind && name ? { kind, name } : undefined,
 			};
 			const insights = aggregate(await host.loadSummaries(days, () => {}), Date.now(), days, filter);

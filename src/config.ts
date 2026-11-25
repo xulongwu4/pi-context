@@ -17,8 +17,9 @@ export interface Config {
 	insightsPeriod?: "30" | "7" | "90" | "all";
 	trendBy?: "request" | "input";
 	trendMode?: "total" | "change";
+	trendFit?: "off" | "100" | "200" | "300";
 	toolOrder?: "calls" | "schema" | "name";
-	fileOrder?: "ops" | "recent" | "name";
+	fileOrder?: "ops" | "recent" | "name" | "lines";
 	diffBase?: "request" | "input";
 }
 
@@ -35,8 +36,9 @@ export const CHOICES = {
 	period: { key: "insightsPeriod", label: "Insights period", values: ["30", "7", "90", "all"], help: "Days that the Insights tab covers when it opens." },
 	trend: { key: "trendBy", label: "Trend bars", values: ["request", "input"], help: "One bar of the Context Trend for each request, or for each human input." },
 	mode: { key: "trendMode", label: "Trend values", values: ["total", "change"], help: "The Context Trend shows the size of the context, or its change since the bar before." },
+	fit: { key: "trendFit", label: "Trend fit", values: ["off", "100", "200", "300"], help: "The page shows the Context Trend whole, or only its last 100, 200 or 300 bars when it opens." },
 	tools: { key: "toolOrder", label: "Tool order", values: ["calls", "schema", "name"], help: "Order of the tool list." },
-	files: { key: "fileOrder", label: "File order", values: ["ops", "recent", "name"], help: "Order of the file list: most operations first, last used first, or by path." },
+	files: { key: "fileOrder", label: "File order", values: ["ops", "recent", "name", "lines"], help: "Order of the file list: most operations first, last used first, by path, or most changed lines first." },
 	diff: {
 		key: "diffBase",
 		label: "Diff baseline",

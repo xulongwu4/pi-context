@@ -103,6 +103,8 @@ export interface RequestRec {
 	ms?: number;
 	/** Wall time of the turn: the request and the tools it ran. From the same record. */
 	activeMs?: number;
+	/** Time from the start of the request to the first token of the reply, when pi-context timed the stream. */
+	ttft?: number;
 }
 
 /** One human input and the work it caused, up to the next input. */
@@ -120,6 +122,8 @@ export interface InputRec {
 	cost: number;
 	/** Time from the input to the last message it caused. */
 	ms: number;
+	/** The part of `ms` that tools spent waiting for an answer of the user. Undefined when no tool asked. */
+	waitMs?: number;
 }
 
 export interface EventRec {
@@ -132,6 +136,8 @@ export interface EventRec {
 	producer?: string;
 	/** Tokens that the event added to the context, or took from it when negative. Undefined when the event changes no size or the size is not known. */
 	delta?: number;
+	/** For a compaction: the messages that its summary replaced. */
+	replaced?: number;
 }
 
 /** The kinds of file operations. A search counts on each file it found, or on the searched path. */
@@ -153,6 +159,8 @@ export interface FileOp {
 	error?: boolean;
 	/** Matches of the search in the file. Undefined when the session does not tell them. */
 	hits?: number;
+	/** For a read of a part of the file: its first line and its number of lines; 0 lines when the read names no limit. */
+	range?: [number, number];
 }
 
 export interface FileRec {
@@ -172,6 +180,8 @@ export interface CommandRec {
 	time: number;
 	command: string;
 	program: string;
+	/** Every program that the command runs, in order. See {@link programsOf}. */
+	programs: string[];
 	/** Requests made before the command ran: the number of the request that ran it, for a command of the model. */
 	request: number;
 	/** Tool call whose result tells the outcome. For a nested call, the call that made it. Undefined for a command of the user. */
@@ -249,7 +259,18 @@ export interface Timing {
 	activeMs: number;
 	modelMs: number;
 	toolMs: number;
+	/** Sum of the times to the first token, over the requests whose stream pi-context timed. */
+	ttftMs: number;
+	/** Time that those requests took after their first token, their number, and the tokens they put out. */
+	streamMs: number;
+	streamed: number;
+	streamOutput: number;
+	/** Time and number of the blocks of each part of their replies. */
+	spans: Record<ReplyKind, [ms: number, blocks: number]>;
 }
+
+/** Output tokens per second of the timed streams, after the first token. Undefined when no stream was timed. */
+export const tokensPerSecond = (timing: Timing): number | undefined => (timing.streamMs > 0 ? (timing.streamOutput * 1000) / timing.streamMs : undefined);
 
 /** Session entry type that lists the tool calls whose results the user dropped. The last entry on the branch applies. */
 export const PRUNE_ENTRY = "pi-context:prune";
@@ -273,6 +294,9 @@ export interface TurnData {
 	declared?: Record<string, number>;
 	/** Who provides each of those tools. Written with `declared`. See {@link toolSource}. */
 	sources?: Record<string, string>;
+	/** Time from the start of the request to the first token of the reply, and the time and number of the blocks of each part of the reply. Unset when the reply came without stream events. */
+	ttft?: number;
+	spans?: Partial<Record<ReplyKind, [ms: number, blocks: number]>>;
 }
 
 export interface Totals {
@@ -310,6 +334,17 @@ export interface Analysis {
 	cacheUntil?: number;
 }
 
+export interface Rates {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+}
+
+export interface ToolDoc {
+	description?: string;
+	params: ParamRec[];
+}
 export interface ViewData {
 	analysis: Analysis;
 	current: Row[];
@@ -339,6 +374,10 @@ export interface ViewData {
 	parentSession?: string;
 	/** Name of the session, when it is not the current one. Such data is read-only. */
 	other?: string;
+	/** Prices of the models that made the requests, in dollars for a million tokens. Only the models that pi knows now. */
+	rates?: Record<string, Rates>;
+	/** The description and the parameters of a tool that pi knows now. */
+	toolDoc?: (name: string) => ToolDoc | undefined;
 	/** Rebuilds the composition of a request that has no snapshot. */
 	reconstruct: (request: RequestRec) => Row[];
 }
@@ -755,12 +794,27 @@ export interface TrendBar {
 	parts?: Record<Category, number>;
 	/** Recorded duration of the request, or of the requests of the human input. */
 	ms?: number;
-	/** Kinds of the compactions, drops and restores since the bar before. */
+	/** What happened since the bar before, and what sets the bar apart: some of MARK_KINDS, in their order. */
 	marks?: string[];
 }
 
-/** The events that the trend marks on the bar after them. */
-const TREND_MARKS = ["compaction", "drop", "restore"];
+/**
+ * What the trend flags on a bar. An event flags the bar after it: a compaction, a drop or restore of tool results, a finished or created task,
+ * a question to the user, a delegation, a message of a subagent ("agent"), a loaded skill, a change of model.
+ * "longest" flags the bar that took the most time, "growth" the bar whose context grew most since the bar before.
+ */
+export const MARK_KINDS = ["compaction", "drop", "restore", "task done", "task", "question", "longest", "growth", "delegation", "agent", "skill", "model"] as const;
+export type MarkKind = (typeof MARK_KINDS)[number];
+
+/** Types of the messages that pi-subagents puts into the context. */
+const AGENT_MESSAGES = ["subagent-notification", "workflow-result"];
+
+/** The flag that an event puts on the bar after it. */
+function markOf(event: EventRec): MarkKind | undefined {
+	if (event.kind !== "injection") return MARK_KINDS.find((kind) => kind === event.kind);
+	if (event.producer?.startsWith("skill ")) return "skill";
+	return AGENT_MESSAGES.includes(event.producer ?? "") ? "agent" : undefined;
+}
 
 /**
  * The bars of the trend: one for each request, or with `byTurn` one for each human input that caused a request.
@@ -779,7 +833,7 @@ export function trendBars(analysis: Analysis, byTurn: boolean, delta: boolean): 
 		for (const cat of CATEGORIES) parts[cat] = ((sums[cat] ?? 0) * context) / total;
 		return parts;
 	};
-	return picked.map(({ index, n }, i) => {
+	const bars = picked.map(({ index, n }, i) => {
 		const before = delta && i > 0 ? requests[picked[i - 1].index] : undefined;
 		const base = before && scaled(before);
 		let parts = scaled(requests[index]);
@@ -788,12 +842,31 @@ export function trendBars(analysis: Analysis, byTurn: boolean, delta: boolean): 
 		const bar: TrendBar = { index, n, value: requests[index].context - (before?.context ?? 0) };
 		if (parts) bar.parts = parts;
 		const from = i > 0 ? picked[i - 1].index : -1;
-		const marks = analysis.events.filter((event) => TREND_MARKS.includes(event.kind) && event.after > from && event.after <= index).map((event) => event.kind);
-		if (marks.length > 0) bar.marks = [...new Set(marks)];
+		const marks = analysis.events.filter((event) => event.after > from && event.after <= index).flatMap((event) => markOf(event) ?? []);
+		if (marks.length > 0) bar.marks = marks;
 		const timed = requests.slice(byTurn ? from + 1 : index, index + 1).filter((request) => request.ms !== undefined);
 		if (timed.length > 0) bar.ms = timed.reduce((sum, request) => sum + (request.ms ?? 0), 0);
 		return bar;
 	});
+	/** The bar with the highest score above 0; -1 when no bar has one. */
+	const top = (score: (i: number) => number) => {
+		let best = -1;
+		for (let i = 0; i < bars.length; i++) {
+			if (score(i) > (best < 0 ? 0 : score(best))) best = i;
+		}
+		return best;
+	};
+	const flags: [MarkKind, number][] = [
+		["longest", bars.length > 1 ? top((i) => bars[i].ms ?? 0) : -1],
+		["growth", top((i) => (i > 0 ? requests[bars[i].index].context - requests[bars[i - 1].index].context : 0))],
+	];
+	for (const [mark, i] of flags) {
+		if (i >= 0) (bars[i].marks ??= []).push(mark);
+	}
+	for (const bar of bars) {
+		if (bar.marks) bar.marks = MARK_KINDS.filter((kind) => bar.marks?.includes(kind));
+	}
+	return bars;
 }
 
 /** What one request did, in three lines. */
@@ -854,21 +927,58 @@ export function injectors(events: EventRec[]): { producer: string; count: number
 	return [...sums.values()].sort((a, b) => b.tokens - a.tokens);
 }
 
-/** Program a shell command runs: the first one that is not `cd`, ignoring env assignments, sudo and directories. */
-export function programOf(command: string): string {
-	let fallback = "";
-	for (const segment of command.split(/&&|\|\||[;|\n]/)) {
-		const word =
-			segment
-				.trim()
-				.split(/\s+/)
-				.map((w) => w.replace(/^\w+=\$\(/, ""))
-				.find((w) => w && !/^\w+=/.test(w) && w !== "sudo") ?? "";
-		const program = word.split("/").pop() ?? "";
-		if (program && program !== "cd") return program;
-		fallback ||= program;
+/** Commands that run another command, each with its options that take a value. */
+const WRAPPERS = new Map<string, RegExp>([
+	["sudo", /^-[ughpCDRT]$/],
+	["doas", /^-[uC]$/],
+	["env", /^-[uCS]$/],
+	["timeout", /^-[ks]$/],
+	["nice", /^-n$/],
+	["time", /^-[of]$/],
+	["exec", /^-a$/],
+	["nohup", /^$/],
+	["command", /^$/],
+]);
+/** Shell words that a command can follow, and words that start a part without a command. */
+const SHELL_PREFIXES = new Set(["if", "then", "else", "elif", "while", "until", "do", "!", "{"]);
+const SHELL_WORDS = new Set(["for", "case", "select", "function", "fi", "done", "esac", "}"]);
+
+/**
+ * Every program that a shell command runs, in order: one for each part of a pipeline or a list.
+ * Env assignments, directories, wrappers such as sudo or timeout, the bodies of heredocs and quoted text do not count; `cd` counts only when nothing else runs.
+ */
+export function programsOf(command: string): string[] {
+	const bare = command
+		.replace(/((?<!<)<<(?!<)-?\s*(['"]?)(\w+)\2[^\n]*)\n[\s\S]*?\n[ \t]*\3[ \t]*(?=\n|$)/g, "$1")
+		.replace(/'[^']*'|"(?:\\.|[^"\\$`])*"/g, "''");
+	const programs: string[] = [];
+	let cd = false;
+	for (const segment of bare.split(/&&|\|\||[;|\n]/)) {
+		const words = segment
+			.trim()
+			.split(/\s+/)
+			.map((w) => w.replace(/^\w+=\$\(/, "").replace(/^\(+/, ""));
+		let i = 0;
+		for (; i < words.length; i++) {
+			if (!words[i] || /^\w+=/.test(words[i]) || SHELL_PREFIXES.has(words[i])) continue;
+			const wrapper = words[i];
+			const takesValue = WRAPPERS.get(wrapper);
+			if (!takesValue) break;
+			while (words[i + 1]?.startsWith("-")) i += takesValue.test(words[i + 1]) ? 2 : 1;
+			// The duration.
+			if (wrapper === "timeout") i++;
+		}
+		const program = (words[i] ?? "").split("/").pop() ?? "";
+		if (!program || program.startsWith("#") || SHELL_WORDS.has(program)) continue;
+		if (program === "cd") cd = true;
+		else programs.push(program);
 	}
-	return fallback;
+	return programs.length === 0 && cd ? ["cd"] : programs;
+}
+
+/** The first program that a shell command runs. See {@link programsOf}. */
+export function programOf(command: string): string {
+	return programsOf(command)[0] ?? "";
 }
 
 const SEARCH_TOOLS = /^(grep|find|glob|rg|ffgrep|fffind)$/i;
@@ -923,14 +1033,15 @@ export function searchHits(toolName: string, text: string, base = "."): Map<stri
 }
 
 /** Orders of the file list: {@link fileRows}. */
-export const FILE_ORDERS = ["ops", "recent", "name"] as const;
+export const FILE_ORDERS = ["ops", "recent", "name", "lines"] as const;
 export type FileOrder = (typeof FILE_ORDERS)[number];
 
-/** The files with the most operations first, the last used first, or by path. With `kind`, only the files with such operations. */
+/** The files with the most operations first, the last used first, by path, or with the most changed lines first. With `kind`, only the files with such operations. */
 export function fileRows(files: FileRec[], order: FileOrder = "ops", kind?: FileKind): FileRec[] {
 	const rows = kind ? files.filter((file) => file[kind] > 0) : [...files];
 	const ops = (file: FileRec) => FILE_KINDS.reduce((sum, each) => sum + file[each], 0);
 	const last = (file: FileRec) => file.ops.reduce((time, op) => Math.max(time, op.time), 0);
+	if (order === "lines") return rows.sort((a, b) => b.added + b.removed - (a.added + a.removed));
 	if (order === "name") return rows.sort((a, b) => a.path.localeCompare(b.path));
 	if (order === "recent") return rows.sort((a, b) => last(b) - last(a));
 	return rows.sort((a, b) => ops(b) - ops(a));
@@ -999,6 +1110,146 @@ const LONG_CACHE_MS = 60 * 60_000;
 const ANCHOR_KEYS = ["anchor", "remove_from", "replace_from", "source_from"];
 const hasAnchor = (args: any) => ANCHOR_KEYS.some((key) => typeof args?.[key] === "string");
 
+/** How often the commands ran each program, and in how many commands. The most run first. */
+export function programRanks(commands: CommandRec[]): { program: string; uses: number; runs: number }[] {
+	const ranks = new Map<string, { program: string; uses: number; runs: number }>();
+	for (const command of commands) {
+		const seen = new Set<string>();
+		for (const program of command.programs) {
+			const rank = ranks.get(program) ?? { program, uses: 0, runs: 0 };
+			rank.uses++;
+			if (!seen.has(program)) rank.runs++;
+			seen.add(program);
+			ranks.set(program, rank);
+		}
+	}
+	return [...ranks.values()].sort((a, b) => b.uses - a.uses || a.program.localeCompare(b.program));
+}
+
+/** The commands that deserve a look. */
+export interface Attention {
+	/** Index of the run with the longest wall time, when it took a second or more. */
+	slowest?: number;
+	/** The program whose runs failed most, when two or more failed. */
+	failing?: { program: string; count: number };
+	/** The command that ran most often, when it ran twice or more. */
+	repeated?: { command: string; count: number };
+}
+
+export function attentionOf(commands: CommandRec[]): Attention {
+	const attention: Attention = {};
+	const index = slowest(commands);
+	if (index >= 0 && (commands[index].ms ?? 0) >= 1000) attention.slowest = index;
+	/** The key that occurs most often, when it occurs twice or more. */
+	const most = (keys: string[]) => {
+		const counts = new Map<string, number>();
+		let best: [key: string, count: number] | undefined;
+		for (const key of keys) {
+			const count = (counts.get(key) ?? 0) + 1;
+			counts.set(key, count);
+			if (count >= 2 && count > (best?.[1] ?? 0)) best = [key, count];
+		}
+		return best;
+	};
+	const failing = most(commands.filter((command) => command.ok === false).map((command) => command.program));
+	if (failing) attention.failing = { program: failing[0], count: failing[1] };
+	const repeated = most(commands.map((command) => command.command));
+	if (repeated) attention.repeated = { command: repeated[0], count: repeated[1] };
+	return attention;
+}
+
+/** Whether the run took ten seconds or more. */
+export const isSlow = (command: CommandRec): boolean => (command.ms ?? 0) >= 10_000;
+
+/** The lines of a command, and whether it holds a heredoc or a script given to an interpreter on the command line. */
+export function commandShape(text: string): { lines: number; heredoc: boolean; inline: boolean } {
+	return {
+		lines: text.split("\n").length,
+		heredoc: /(?<!<)<<(?!<)-?\s*['"]?\w/.test(text),
+		inline: /(?:^|[\s;|&(])(?:python[\d.]*|node|bun|deno|perl|ruby|bash|sh|zsh)\s+(?:-\w+\s+)*(?:-c|-e|--eval)\s/.test(text),
+	};
+}
+
+/** The files as they were after request number `request`: only the operations made up to it. */
+export function filesUpTo(files: FileRec[], request: number): FileRec[] {
+	return files.flatMap((file) => {
+		const ops = file.ops.filter((op) => op.request <= request);
+		if (ops.length === 0) return [];
+		const rec: FileRec = { path: file.path, reads: 0, writes: 0, edits: 0, searches: 0, images: 0, added: 0, removed: 0, ops };
+		for (const op of ops) {
+			rec[op.op]++;
+			rec.added += op.added ?? 0;
+			rec.removed += op.removed ?? 0;
+		}
+		return [rec];
+	});
+}
+
+/** Tokens and cost of the session's own requests, of its subagents, and of both. */
+export function familyTotals(totals: Totals, agents: AgentRec[]) {
+	const own = { tokens: totals.input + totals.output + totals.cacheRead + totals.cacheWrite, cost: totals.cost };
+	const sub = { count: agents.length, tokens: 0, cost: 0 };
+	for (const agent of agents) {
+		sub.tokens += agent.tokens ?? 0;
+		sub.cost += agent.cost ?? 0;
+	}
+	return { own, agents: sub, tokens: own.tokens + sub.tokens, cost: own.cost + sub.cost };
+}
+
+/** The human input that the request at `index` belongs to, and its place among the requests of that input. */
+export function placeOf(analysis: Analysis, index: number): { input: number; step: number; steps: number } | undefined {
+	const input = analysis.inputs.find((each) => each.first >= 0 && index >= each.first && index < each.first + each.requests);
+	return input && { input: input.n, step: index - input.first + 1, steps: input.requests };
+}
+
+/** One parameter of a tool. */
+export interface ParamRec {
+	name: string;
+	type: string;
+	required: boolean;
+	description: string;
+}
+
+function schemaType(schema: any): string {
+	if (!schema || typeof schema !== "object") return "any";
+	const options = schema.anyOf ?? schema.oneOf;
+	if (Array.isArray(options)) return options.map(schemaType).join(" | ");
+	if (Array.isArray(schema.enum)) return `${schema.type ?? "string"} (enum)`;
+	if (schema.const !== undefined) return JSON.stringify(schema.const);
+	if (Array.isArray(schema.type)) return schema.type.join(" | ");
+	if (schema.type === "array") return schema.items ? `array<${schemaType(schema.items)}>` : "array";
+	if (schema.type === "object" && schema.properties) return `object{${Object.keys(schema.properties).length}}`;
+	return typeof schema.type === "string" ? schema.type : "any";
+}
+
+/** The parameters of a tool, from its JSON schema or from a declaration that holds the schema. */
+export function paramsOf(declaration: any): ParamRec[] {
+	const schema = declaration?.input_schema ?? declaration?.function?.parameters ?? declaration?.parameters ?? declaration;
+	const required = new Set<string>(Array.isArray(schema?.required) ? schema.required : []);
+	return Object.entries<any>(schema?.properties ?? {}).map(([name, param]) => ({
+		name,
+		type: schemaType(param),
+		required: required.has(name),
+		description: typeof param?.description === "string" ? param.description : "",
+	}));
+}
+
+/** Whether the tool asks the user a question and waits for the answer. */
+const isQuestion = (name: string) => /^(ask_user_question|AskUserQuestion|questionnaire)$/.test(name);
+
+/** The event that a call of a workflow tool makes: a question to the user, a delegation, or a task that is created or finished. */
+function workflowEvent(call: { name: string; arguments?: any }): [kind: string, detail: string] | undefined {
+	const args = call.arguments ?? {};
+	if (isQuestion(call.name)) {
+		const questions: any[] = Array.isArray(args.questions) ? args.questions : [args];
+		const first = String(questions[0]?.question ?? "");
+		return ["question", questions.length > 1 ? `${questions.length} questions: ${first}` : first];
+	}
+	if (call.name === "Agent") return ["delegation", `${args.subagent_type ?? "agent"}: ${args.description ?? ""}`];
+	if (call.name === "TaskCreate") return ["task", String(args.subject ?? "")];
+	if (call.name === "TaskUpdate" && args.status === "completed") return ["task done", `#${args.taskId}`];
+	return undefined;
+}
 /** Derives requests, events, tool, file and command activity from the session entries of one branch. */
 export function analyze(entries: any[]): Analysis {
 	const analysis: Analysis = {
@@ -1016,7 +1267,7 @@ export function analyze(entries: any[]): Analysis {
 		toolErrors: 0,
 		unresolvedEdits: 0,
 		totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
-		timing: { activeMs: 0, modelMs: 0, toolMs: 0 },
+		timing: { activeMs: 0, modelMs: 0, toolMs: 0, ttftMs: 0, streamMs: 0, streamed: 0, streamOutput: 0, spans: { reasoning: [0, 0], toolCalls: [0, 0], answers: [0, 0] } },
 		billed: emptySums(),
 		billedRequests: 0,
 	};
@@ -1101,10 +1352,23 @@ export function analyze(entries: any[]): Analysis {
 		skills.set(path, skill);
 		return skill;
 	};
+	/** Time of the entry being read. */
+	let now = 0;
+	const event = (kind: string, detail: string, delta?: number) => {
+		const rec: EventRec = { time: now, kind, detail, after: analysis.requests.length };
+		if (delta !== undefined) rec.delta = delta;
+		analysis.events.push(rec);
+		return rec;
+	};
+	/** Ids of the messages that the context holds in full: those since the last compaction, and those it kept. */
+	const live: string[] = [];
 	/** Counts a tool call. A call nested in the result of another one comes with its status and the id of that other call. */
 	const recordCall = (call: { id: string; name: string; arguments?: any; durationMs?: number }, time: number, nestedStatus?: string, outer?: string) => {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
+		const workflow = workflowEvent(call);
+		if (workflow) event(workflow[0], workflow[1]);
+		if (input && isQuestion(call.name) && typeof call.durationMs === "number") input.waitMs = (input.waitMs ?? 0) + call.durationMs;
 		const rec = tool(call.name);
 		rec.last = time;
 		if (nestedStatus) {
@@ -1122,6 +1386,8 @@ export function analyze(entries: any[]): Analysis {
 		if (path && op) {
 			const rec: FileOp = { time, op, tool: call.name, request: analysis.requests.length, id: outer ?? call.id };
 			if (nestedStatus === "error") rec.error = true;
+			const { offset, limit } = call.arguments ?? {};
+			if (op === "reads" && (typeof offset === "number" || typeof limit === "number")) rec.range = [typeof offset === "number" ? offset : 1, typeof limit === "number" ? limit : 0];
 			const change = (op === "writes" || op === "edits") && !rec.error ? (lines.get(call.id) ?? argLines(call.arguments)) : undefined;
 			// A write does not tell what it replaced.
 			if (change && op === "writes") rec.added = change[0];
@@ -1131,10 +1397,12 @@ export function analyze(entries: any[]): Analysis {
 		} else if (op === "edits" && nestedStatus !== "error" && hasAnchor(call.arguments)) analysis.unresolvedEdits++;
 		if (path && isSkillRead(call)) skillsById.set(call.id, loadSkill(path, time));
 		if (call.name === "bash" && typeof call.arguments?.command === "string") {
+			const programs = programsOf(call.arguments.command);
 			const command: CommandRec = {
 				time,
 				command: call.arguments.command,
-				program: programOf(call.arguments.command),
+				program: programs[0] ?? "",
+				programs,
 				request: analysis.requests.length,
 				id: outer ?? call.id,
 			};
@@ -1145,18 +1413,16 @@ export function analyze(entries: any[]): Analysis {
 	};
 	for (const entry of entries) {
 		const entryTime = Date.parse(entry.timestamp) || 0;
-		const event = (kind: string, detail: string, delta?: number) => {
-			const rec: EventRec = { time: entryTime, kind, detail, after: analysis.requests.length };
-			if (delta !== undefined) rec.delta = delta;
-			analysis.events.push(rec);
-			return rec;
-		};
+		now = entryTime;
 		/** Content that an extension or a skill put into the context. */
 		const inject = (producer: string, chars: number) => {
 			event("injection", `${producer}, ≈${fmtTokens(estimate(chars))} tokens`, estimate(chars)).producer = producer;
 		};
 		if (entry.type === "compaction") {
 			const rec = event("compaction", `${fmtTokens(entry.tokensBefore)} tokens before compaction`);
+			const kept = live.indexOf(entry.firstKeptEntryId);
+			rec.replaced = kept < 0 ? live.length : kept;
+			live.splice(0, rec.replaced);
 			compacted = typeof entry.tokensBefore === "number" ? { event: rec, before: entry.tokensBefore } : undefined;
 			// The compacted context is new to the cache; the next request is not a miss.
 			cached = undefined;
@@ -1197,6 +1463,7 @@ export function analyze(entries: any[]): Analysis {
 			inject(entry.customType ?? "custom", contentChars(entry.content));
 		}
 		if (entry.type !== "message") continue;
+		live.push(entry.id);
 
 		const m = entry.message;
 		const time = m.timestamp ?? entryTime;
@@ -1212,7 +1479,7 @@ export function analyze(entries: any[]): Analysis {
 			input = inputAt(time, preview(skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content)));
 		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
 		if (m.role === "bashExecution") {
-			analysis.commands.push({ time, command: m.command, program: programOf(m.command), request: analysis.requests.length, ok: m.exitCode === 0 });
+			analysis.commands.push({ time, command: m.command, program: programOf(m.command ?? ""), programs: programsOf(m.command ?? ""), request: analysis.requests.length, ok: m.exitCode === 0 });
 			if (!m.excludeFromContext) add("bash", (m.command?.length ?? 0) + (m.output?.length ?? 0));
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
@@ -1224,6 +1491,7 @@ export function analyze(entries: any[]): Analysis {
 				rec.errors++;
 			}
 			addUsage(analysis.totals, m.usage);
+			if (input && isQuestion(m.toolName) && typeof m.durationMs === "number") input.waitMs = (input.waitMs ?? 0) + m.durationMs;
 			const done = opsById.get(m.toolCallId);
 			const op = done?.op;
 			if (op && m.isError) {
@@ -1285,8 +1553,20 @@ export function analyze(entries: any[]): Analysis {
 				sums: turn?.sums,
 				ms: turn?.ms,
 				activeMs: turn?.activeMs,
+				ttft: turn?.ttft,
 			};
 			analysis.requests.push(request);
+			if (turn && typeof turn.ttft === "number") {
+				const { timing } = analysis;
+				timing.ttftMs += turn.ttft;
+				timing.streamMs += Math.max(0, turn.ms - turn.ttft);
+				timing.streamed++;
+				timing.streamOutput += request.output;
+				for (const kind of REPLY_KINDS) {
+					timing.spans[kind][0] += turn.spans?.[kind]?.[0] ?? 0;
+					timing.spans[kind][1] += turn.spans?.[kind]?.[1] ?? 0;
+				}
+			}
 			added = [];
 			if (compacted) {
 				compacted.event.delta = request.context - compacted.before;

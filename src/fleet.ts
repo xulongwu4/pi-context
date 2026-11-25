@@ -188,3 +188,49 @@ export function boardOf(tasks: TaskRec[], agents: AgentRec[], state?: TaskState)
 	}
 	return [...groups].map(([owner, items]) => ({ owner, items }));
 }
+
+export type Board = ReturnType<typeof boardOf>;
+
+/** The figures of the fleet: its agents and those that run, the items of the board, and the messages to and from the agents. */
+export function fleetSummary(agents: AgentRec[], timeline: FleetEvent[], board: Board): { agents: number; running: number; items: number; messages: number } {
+	return {
+		agents: agents.length,
+		running: agents.filter((agent) => agent.status === "running").length,
+		items: board.reduce((sum, group) => sum + group.items.length, 0),
+		messages: timeline.filter((event) => event.kind === "steer" || event.kind === "notification").length,
+	};
+}
+
+/** What one agent was asked and answered, the tasks that it or its type owns, and its last events. */
+export function agentDetail(agent: AgentRec, timeline: FleetEvent[], board: Board): { prompt?: string; reply?: string; tasks: BoardItem[]; events: FleetEvent[] } {
+	return {
+		prompt: timeline.find((event) => event.kind === "delegation" && event.agent === agent.id)?.body,
+		reply: agent.result ?? agent.error,
+		tasks: board.filter((group) => group.owner === agent.id || group.owner === agent.type).flatMap((group) => group.items.filter((item) => !item.agent)),
+		events: timeline.filter((event) => event.agent === agent.id).slice(-6),
+	};
+}
+
+/** Ids of the tasks that must finish before the task `id`: its blockers, then theirs, the nearest first. */
+export function chainOf(tasks: TaskRec[], id: string): string[] {
+	const byId = new Map(tasks.map((task) => [task.id, task]));
+	const chain: string[] = [];
+	const seen = new Set([id]);
+	for (let queue = [id]; queue.length > 0; ) {
+		const next: string[] = [];
+		for (const blocker of queue.flatMap((each) => byId.get(each)?.blockedBy ?? [])) {
+			if (seen.has(blocker)) continue;
+			seen.add(blocker);
+			chain.push(blocker);
+			next.push(blocker);
+		}
+		queue = next;
+	}
+	return chain;
+}
+
+/** Whether a pending task can start, or waits for other tasks. Undefined for a delegation and for a task that is not pending. */
+export function readiness(item: BoardItem): "ready" | "blocked" | undefined {
+	if (item.agent || item.state !== "pending") return undefined;
+	return item.blockedBy.length > 0 ? "blocked" : "ready";
+}

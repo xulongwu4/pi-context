@@ -1,4 +1,4 @@
-import { cacheStats, CATEGORIES, FILE_KINDS, fileRows, LABELS, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
+import { cacheStats, CATEGORIES, FILE_KINDS, familyTotals, fileRows, LABELS, programRanks, sumByCategory, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
 import { hintTotal } from "./hints.ts";
 
@@ -83,11 +83,9 @@ export function report(data: ViewData, section: Section = "summary"): string {
 				),
 			].join("\n");
 		case "commands": {
-			const programs = new Map<string, number>();
-			for (const command of analysis.commands) programs.set(command.program, (programs.get(command.program) ?? 0) + 1);
-			const top = [...programs].sort((a, b) => b[1] - a[1]).slice(0, 10);
+			const top = programRanks(analysis.commands).slice(0, 10);
 			return [
-				`Commands: ${analysis.commands.length}. Programs: ${top.map(([name, n]) => `${name} ×${n}`).join(", ") || "none"}`,
+				`Commands: ${analysis.commands.length}. Programs: ${top.map(({ program, uses }) => `${program} ×${uses}`).join(", ") || "none"}`,
 				...tail(analysis.commands).map(
 					(c) => `  ${c.ok === undefined ? "?" : c.ok ? "ok" : "failed"} ${fmtTime(c.time)}  ${c.command.replace(/\s+/g, " ").slice(0, 160)}`,
 				),
@@ -110,9 +108,11 @@ export function report(data: ViewData, section: Section = "summary"): string {
 	}
 	if (data.model) lines.push(`Model: ${data.model}`);
 	const t = analysis.totals;
+	const family = familyTotals(t, data.agents);
 	lines.push(
 		`Session totals (provider-reported): input ${fmtTokens(t.input)}, cache read ${fmtTokens(t.cacheRead)}, cache write ${fmtTokens(t.cacheWrite)}, output ${fmtTokens(t.output)}, cost ${fmtCost(t.cost)}`,
 		`Requests: ${analysis.requests.length}, human inputs: ${analysis.userInputs}, tool calls: ${analysis.toolCalls} (${analysis.toolErrors} errors), compactions: ${analysis.events.filter((e) => e.kind === "compaction").length}`,
+		...(data.agents.length > 0 ? [`With ${data.agents.length} subagents: ${fmtTokens(family.tokens)} tokens, cost ${fmtCost(family.cost)}`] : []),
 		"",
 		...composition(8),
 	);

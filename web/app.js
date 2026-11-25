@@ -23,8 +23,23 @@ const MAX_TEXTS = 50;
 const SESSIONS_STEP = 60;
 /** The kinds of file operations: the counter of a file, the name of its chip, the name of one operation. */
 const FILE_KINDS = [["reads", "Read", "read"], ["writes", "Written", "write"], ["edits", "Edited", "edit"], ["searches", "Searched", "search"], ["images", "Images", "image"]];
-/** The events that the trend marks on the bar after them. The first that a bar has is shown. */
-const MARKS = { compaction: "✂", drop: "▾", restore: "▴" };
+/** What the trend marks on a bar, in the order of the server: the glyph and what it tells. The first that a bar has is shown. */
+const MARKS = {
+	compaction: ["✂", "compaction"],
+	drop: ["▾", "drop"],
+	restore: ["▴", "restore"],
+	"task done": ["✓", "task done"],
+	task: ["□", "task created"],
+	question: ["?", "question to the user"],
+	longest: ["◷", "took the longest"],
+	growth: ["↑", "largest growth"],
+	delegation: ["→", "delegation"],
+	agent: ["←", "message of a subagent"],
+	skill: ["◆", "skill loaded"],
+	model: ["⇄", "model change"],
+};
+/** Width of the treemap of the current context, in units of its height. */
+const MAP_RATIO = 2.5;
 const TASK_STATES = [["in_progress", "In progress"], ["pending", "Pending"], ["done", "Done"]];
 
 const state = {
@@ -36,20 +51,36 @@ const state = {
 	request: null,
 	/** What the server said about that request. */
 	view: null,
-	/** Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width. */
-	trend: { byTurn: false, delta: false, fit: false },
+	/**
+	 * Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width.
+	 * `last` is the number of bars that the trend shows, the last ones, until `whole` is set. 0: every bar.
+	 */
+	trend: { byTurn: false, delta: false, fit: false, last: 0, whole: false },
+	/** Current Context shows a treemap in place of the bar. */
+	treemap: false,
 	/** Order of the tools: calls, schema or name. */
 	toolOrder: "calls",
-	/** Order of the files: ops, recent or name. */
+	/** Order of the files: ops, recent, name or lines. */
 	fileOrder: "ops",
 	/** The kind of operation whose files File Activity lists. Empty: every file. */
 	fileKind: "",
+	/** File Activity shows the files as they were after the request of the Context Browser: `then` holds them as { n, files }. */
+	asOf: false,
+	then: null,
 	/** The status whose runs Command Executions lists. Empty: every run. */
 	commandStatus: "",
 	/** Index in the commands of the run that Command Executions highlights. */
 	run: null,
 	/** What the diff of a request compares with: the request before it, or with "input" the last request before its human input. */
 	diff: "request",
+	/** The tool whose description the tool list shows, and what the server said about it: { name, description, params } or { name, error }. */
+	tool: null,
+	toolDoc: null,
+	/** The subagent whose detail Agents shows, and what the server said about it: { id, prompt, reply, tasks, events } or { id, error }. */
+	agent: null,
+	agentInfo: null,
+	/** The kind of event that Collaboration Timeline lists. Empty: every kind. */
+	fleetKind: "",
 	/** The part of the replies that the Context Browser keeps: reasoning, toolCalls or answers. Empty: every item. */
 	reply: "",
 	/** Collaboration Timeline: the earliest event first, and the events whose body is open. */
@@ -59,21 +90,26 @@ const state = {
 	taskState: "",
 	openTasks: new Set(),
 	task: null,
+	/** Id of a task to the ids of the tasks that it waits for, for the tasks that were opened. */
+	chains: new Map(),
 	/** Whether the page took the view defaults of the settings. */
 	started: false,
 	openCats: new Set(),
 	openItems: new Set(),
 	/** Paths of the files whose operations File Activity lists. */
 	openFiles: new Set(),
-	/** The opened items as { text, call }; `call` describes the call of a tool result. */
+	/** The opened items as { text, call, json }; `call` describes the call of a tool result, `json` is the text as formatted JSON when it is JSON. */
 	texts: new Map(),
+	/** How the content of an opened item shows, by the key of the item: { mode, find, at }. */
+	viewers: new Map(),
 	/** The kind of event that Context Events lists. Empty: every kind. */
 	kind: "",
 	insights: null,
 	/** Length of the Insights period in days, or "all". */
 	days: 30,
-	/** The day that Insights is narrowed to, as YYYY-MM-DD. Null: the whole period. */
+	/** The day that Insights is narrowed to, as YYYY-MM-DD, or with `until` the first and the last day. Null: the whole period. */
 	day: null,
+	until: null,
 	/** The tool, program or skill whose sessions Insights lists, as { kind, name }. Null: every session. */
 	uses: null,
 	shown: SESSIONS_STEP,
@@ -97,6 +133,8 @@ function dur(ms) {
 	return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
 }
 const clock = (ms) => new Date(ms).toTimeString().slice(0, 8);
+/** A short time shows tenths of a second. */
+const secs = (ms) => (ms < 10_000 ? (ms / 1000).toFixed(1) + "s" : dur(ms));
 const date = (ms) => new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
 const pct = (part, total) => (total > 0 ? Math.round((part / total) * 100) : 0) + "%";
 
@@ -134,9 +172,16 @@ function paint(id, html) {
 		[...body.querySelectorAll("[data-keep]")].map((el) => [el.dataset.keep, el.scrollWidth - el.clientWidth - el.scrollLeft < 4 ? null : el.scrollLeft]),
 	);
 	const top = body.scrollTop;
+	// A field of the card that has the focus keeps it, with its caret.
+	const active = body.contains(document.activeElement) ? document.activeElement : null;
+	const focus = active?.dataset.focus;
 	body.innerHTML = html;
 	body.scrollTop = top;
 	for (const el of body.querySelectorAll("[data-keep]")) el.scrollLeft = kept.get(el.dataset.keep) ?? el.scrollWidth;
+	if (!focus) return;
+	const field = body.querySelector(`[data-focus="${focus}"]`);
+	field?.focus();
+	field?.setSelectionRange(active.selectionStart, active.selectionEnd);
 }
 
 // Parts of cards.
@@ -167,8 +212,9 @@ const catParts = (sums, factor = 1) =>
 
 const pairs = (list) => `<dl class="pairs">${list.map(([name, value]) => `<div><dt>${esc(name)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
 
+/** One tile for each [value, label, sub, to]. A tile with `to` goes to the card, or the part of a card, with that id. */
 const tiles = (list) =>
-	`<div class="tiles">${list.map(([value, label, sub = ""]) => `<div class="tile"><b>${esc(value)}</b><span>${esc(label)}</span><small>${esc(sub)}</small></div>`).join("")}</div>`;
+	`<div class="tiles">${list.map(([value, label, sub = "", to]) => `<div class="tile"${to ? ` data-act="go" data-to="${to}" title="Go to the card"` : ""}><b>${esc(value)}</b><span>${esc(label)}</span><small>${esc(sub)}</small></div>`).join("")}</div>`;
 
 /** Names with counts, the largest first. */
 function pills(title, items, max = 8) {
@@ -205,6 +251,19 @@ const statusCss = (status) => (/run|progress/.test(status) ? "warn" : /complete|
 /** As commandStatus() of src/analyze.ts. */
 const commandStatus = (command) => (command.ok == null ? "unknown" : command.ok ? "ok" : "failed");
 
+/** As isSlow() of src/analyze.ts: the run took ten seconds or more. */
+const isSlow = (command) => (command.ms ?? 0) >= 10_000;
+
+/** As commandShape() of src/analyze.ts: the lines of a command, and whether it holds a heredoc or a script given to an interpreter on the command line. */
+const commandShape = (text) => ({
+	lines: text.split("\n").length,
+	heredoc: /(?<!<)<<(?!<)-?\s*['"]?\w/.test(text),
+	inline: /(?:^|[\s;|&(])(?:python[\d.]*|node|bun|deno|perl|ruby|bash|sh|zsh)\s+(?:-\w+\s+)*(?:-c|-e|--eval)\s/.test(text),
+});
+
+/** As readiness() of src/fleet.ts: whether a pending task can start, or waits for other tasks. */
+const readiness = (item) => (item.agent || item.state !== "pending" ? undefined : item.blockedBy.length > 0 ? "blocked" : "ready");
+
 /** Index of the run with the longest wall time; -1 when no run has one. */
 function slowest(commands) {
 	let index = -1;
@@ -219,19 +278,37 @@ const missText = (miss) => `≈${tok(miss.tokens)} tokens billed again, ≈${cos
 // The cards of the Context page. Each returns HTML for the data `d` of a session.
 
 function statsCard(d) {
-	const programs = new Map();
-	for (const command of d.commands) programs.set(command.program, (programs.get(command.program) ?? 0) + 1);
 	const compactions = d.events.filter((event) => /compact/i.test(event.kind)).length;
 	const misses = d.cache.misses ? `${d.cache.misses} misses, ≈${cost(d.cache.cost)} extra` : "no misses";
+	// The session with its subagents.
+	const { own, agents } = d.family;
+	const family = (text) => (agents.count ? `${text} with ${agents.count === 1 ? "the subagent" : `${agents.count} subagents`}` : "");
+	const timing = d.timing;
 	const top = tiles([
-		[d.userInputs, "Human inputs"],
-		[d.requests.length, "Requests"],
-		[d.toolCalls, "Tool calls", `${d.toolErrors} errors`],
-		[cost(d.totals.cost), "Cost"],
-		[pct(d.cache.rate, 1), "Read from cache", misses],
-		[d.events.length, "Context events", `${compactions} compactions`],
+		[d.userInputs, "Human inputs", "", "turns"],
+		[d.requests.length, "Requests", "", "trend"],
+		[d.toolCalls, "Tool calls", `${d.toolErrors} errors`, "tools"],
+		[tok(own.tokens), "Tokens", family(tok(d.family.tokens)), "tokens"],
+		[cost(own.cost), "Cost", family(cost(d.family.cost)), "models"],
+		[pct(d.cache.rate, 1), "Read from cache", misses, "tokens"],
+		[d.events.length, "Context events", `${compactions} compactions`, "events"],
+		...(agents.count ? [[agents.count, "Subagents", `${d.fleet.running} running`, "agents"]] : []),
+		// The reply streams that pi-context timed.
+		...(timing.streamed ? [[secs(timing.ttftMs / timing.streamed), "To the first token", `average of ${timing.streamed} requests`, "timing"]] : []),
+		...(d.tps == null ? [] : [[Math.round(d.tps), "Output tokens per second", "after the first token", "timing"]]),
 	]);
-	return top + pills("Tools", d.tools.map((tool) => [tool.name, tool.calls + tool.nested])) + pills("Programs", [...programs]);
+	const money = (dollars) => "$" + Number(dollars.toFixed(4));
+	const rate = ([model, rates]) =>
+		`<span class="pill">${esc(model)} <b>${money(rates.input)} input · ${money(rates.output)} output · ${money(rates.cacheRead)} cache read · ${money(rates.cacheWrite)} cache write</b></span>`;
+	const rates = Object.entries(d.rates).map(rate);
+	const prices = rates.length ? `<div class="pills"><span class="muted">Prices per million tokens</span>${rates.join("")}</div>` : "";
+	const link = (to, text) => `<a data-act="go" data-to="${to}" title="Go to the card">${text}</a>`;
+	return (
+		top +
+		pills(link("tools", "Tools"), d.tools.map((tool) => [tool.name, tool.calls + tool.nested])) +
+		pills(link("commands", "Programs"), d.programs.map((program) => [program.program, program.uses])) +
+		prices
+	);
 }
 
 function tokensCard(d) {
@@ -257,9 +334,59 @@ function timingCard(d) {
 		part("Tool runs", timing.toolMs, COLORS.toolResults),
 		part("Overhead", Math.max(0, timing.activeMs - timing.modelMs - timing.toolMs), "#9ca3af"),
 	];
-	return `<div class="split">${donut(parts, dur(timing.activeMs), "active")}${legend(parts)}</div>`;
+	const split = `<div class="split">${donut(parts, dur(timing.activeMs), "active")}${legend(parts)}</div>`;
+	if (!timing.streamed) return split;
+	// The reply streams that pi-context timed: the wait for the first token, the speed after it, and the time that each part of the replies took.
+	const spans = ["reasoning", "toolCalls", "answers"].map((kind) => {
+		const [ms, blocks] = timing.spans[kind];
+		return { label: labels[kind], color: COLORS[kind], value: ms, text: `${secs(ms)} in ${blocks} ${blocks === 1 ? "block" : "blocks"}` };
+	});
+	const whole = spans.reduce((sum, span) => sum + span.value, 0);
+	const facts = pairs([
+		["Timed", `${timing.streamed} of ${d.requests.length} requests`],
+		["To the first token", `${secs(timing.ttftMs / timing.streamed)} on average`],
+		...(d.tps == null ? [] : [["Output", `${Math.round(d.tps)} tokens per second`]]),
+	]);
+	const bar = spans.map((span) => `<i style="width:${(span.value / whole) * 100}%;background:${span.color}" title="${esc(span.label)} ${esc(span.text)}"></i>`);
+	return `${split}<h3>Reply streams</h3>${facts}${whole ? `<div class="bar">${bar.join("")}</div>${legend(spans)}` : ""}`;
 }
 
+/**
+ * Gives each node a rectangle of the area x, y, w, h, in proportion to its value: halves the nodes by value along the longer side, and each half again.
+ * The nodes come largest first. `put` gets each node with its rectangle.
+ */
+function layout(nodes, x, y, w, h, put) {
+	if (nodes.length === 1) return put(nodes[0], x, y, w, h);
+	const total = nodes.reduce((sum, node) => sum + node.value, 0);
+	let cut = 1;
+	let first = nodes[0].value;
+	while (cut < nodes.length - 1 && first + nodes[cut].value <= total / 2) first += nodes[cut++].value;
+	const share = first / total;
+	if (w >= h) {
+		layout(nodes.slice(0, cut), x, y, w * share, h, put);
+		layout(nodes.slice(cut), x + w * share, y, w * (1 - share), h, put);
+	} else {
+		layout(nodes.slice(0, cut), x, y, w, h * share, put);
+		layout(nodes.slice(cut), x, y + h * share, w, h * (1 - share), put);
+	}
+}
+
+/** The context as a treemap: one area for each category, divided into its items. A click on an item opens it in the Context Browser. */
+function treemap(rows, factor) {
+	const groups = CATS.map((cat) => {
+		const items = rows.map((row, i) => ({ row, i, value: row.tokens })).filter((item) => item.row.cat === cat && item.value > 0);
+		return { items: items.sort((a, b) => b.value - a.value), value: items.reduce((sum, item) => sum + item.value, 0) };
+	}).filter((group) => group.value > 0);
+	if (groups.length === 0) return "";
+	const cells = [];
+	// The rectangles are in percent of the height; an area that is large enough shows the label of its item.
+	const cell = ({ row, i }, x, y, w, h) =>
+		cells.push(
+			`<i data-act="cell" data-i="${i}" style="left:${x / MAP_RATIO}%;top:${y}%;width:${w / MAP_RATIO}%;height:${h}%;background:${COLORS[row.cat]}" title="#${i + 1} ${esc(labels[row.cat])} · ${esc(row.label)} · ≈${tok(row.tokens * factor)}">${w > 20 && h > 12 ? esc(row.label) : ""}</i>`,
+		);
+	layout(groups.sort((a, b) => b.value - a.value), 0, 0, 100 * MAP_RATIO, 100, (group, x, y, w, h) => layout(group.items, x, y, w, h, cell));
+	return `<div class="map">${cells.join("")}</div>`;
+}
 function currentCard(d) {
 	const sums = sumBy(d.current);
 	const size = d.usage?.tokens ?? totalOf(sums) * d.factor;
@@ -280,13 +407,17 @@ function currentCard(d) {
 		reserve?.output ? `Output limit of the model: ${tok(reserve.output)} tokens.` : "",
 	].filter(Boolean);
 	const kept = limits.length ? `<p>${limits.join(" ")}</p>` : "";
-	return `<div class="between"><span><b class="big">${tok(size)}</b>${window ? " / " + tok(window) : ""} tokens</span>${used}</div><div class="bar">${bar.join("")}${tail}</div>${kept}${legend(parts)}<p class="muted">${note}</p>`;
+	const shape = state.treemap ? treemap(d.current, d.factor) : `<div class="bar">${bar.join("")}${tail}</div>`;
+	return `<div class="between"><span><b class="big">${tok(size)}</b>${window ? " / " + tok(window) : ""} tokens</span>${used}</div>${shape}${kept}${legend(parts)}<p class="muted">${note}</p>`;
 }
 
 function trendCard(d) {
-	const bars = d.trend;
-	if (bars.length === 0) return `<p class="muted">No requests yet.</p>`;
-	const { byTurn, delta, fit } = state.trend;
+	const all = d.trend;
+	if (all.length === 0) return `<p class="muted">No requests yet.</p>`;
+	const { byTurn, delta, fit, last, whole } = state.trend;
+	// The view default can keep the trend to its last bars.
+	const hidden = last && !whole ? Math.max(0, all.length - last) : 0;
+	const bars = all.slice(hidden);
 	// What a bar adds above the base line, and what it takes away below the line.
 	const sides = (bar) => {
 		const values = bar.parts ? CATS.map((cat) => bar.parts[cat]) : [bar.value];
@@ -300,10 +431,10 @@ function trendCard(d) {
 		const request = d.requests[bar.index];
 		const input = byTurn ? d.inputs[bar.n - 1] : undefined;
 		// The requests that the bar stands for: one, or those of the human input.
-		const covered = d.requests.slice((bars[i - 1]?.index ?? -1) + 1, bar.index + 1);
-		// A compaction, a drop and a restore are marked on the first bar after them.
+		const covered = d.requests.slice((all[hidden + i - 1]?.index ?? -1) + 1, bar.index + 1);
+		// An event is marked on the first bar after it.
 		const marks = bar.marks ?? [];
-		const mark = MARKS[Object.keys(MARKS).find((kind) => marks.includes(kind))];
+		const mark = MARKS[d.markKinds.find((kind) => marks.includes(kind))]?.[0];
 		const miss = covered.find((r) => r.miss)?.miss;
 		const [more, less] = sides(bar);
 		const stack = (sign) =>
@@ -318,7 +449,8 @@ function trendCard(d) {
 			delta ? `change ${bar.value < 0 ? "−" : "+"}${tok(Math.abs(bar.value))}` : "",
 			`sent ${tok(request.context)}, ${pct(request.cacheRead, request.context)} from cache · output ${tok(request.output)} · ${cost(request.cost)}`,
 			bar.ms == null ? "" : `took ${dur(bar.ms)}`,
-			marks.length ? `since the bar before: ${marks.join(", ")}` : "",
+			request.ttft == null ? "" : `first token after ${secs(request.ttft)}`,
+			marks.length ? `marks: ${marks.map((kind) => MARKS[kind]?.[1] ?? kind).join(", ")}` : "",
 			miss ? "cache miss: " + missText(miss) : "",
 		];
 		const on = covered.some((r) => r.n === state.request);
@@ -329,12 +461,20 @@ function trendCard(d) {
 	const reported = picked
 		? pairs([[`#${picked.n}, provider-reported`, ""], ["Input", tok(picked.input)], ["Cache read", tok(picked.cacheRead)], ["Cache write", tok(picked.cacheWrite)], ["Output", tok(picked.output)]])
 		: "";
+	// Where the request stands among the requests of its human input, and how long its first token took.
+	const where = picked ? placePairs(picked, state.view?.place) : [];
 	// As in the bars, the recorded composition is scaled to the size that the provider reported.
 	const recorded = picked?.sums ? CATS.reduce((total, cat) => total + (picked.sums[cat] ?? 0), 0) : 0;
 	const estimate = (cat) => (recorded > 0 ? ` ≈${tok(((picked.sums[cat] ?? 0) * picked.context) / recorded)}` : "");
 	const key = CATS.map((cat) => `<span class="pill"><i class="dot" style="background:${COLORS[cat]}"></i> ${esc(labels[cat])}${estimate(cat)}</span>`).join("");
 	const what = `${delta ? "The change of the tokens sent since the bar before: growth above the line, the rest below it. One bar for" : "Tokens sent by"} ${byTurn ? "the last request of each human input" : "each request"}.`;
-	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context. ✂ compaction, ▾ drop, ▴ restore, ! cache miss.${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request #${picked.n}.` : ""}`;
+	// The marks that the bars on show have.
+	const seen = d.markKinds.filter((kind) => MARKS[kind] && bars.some((bar) => bar.marks?.includes(kind))).map((kind) => MARKS[kind].join(" "));
+	if (d.requests.some((request) => request.miss)) seen.push("! cache miss");
+	const glyphs = seen.length ? ` Marks: ${seen.join(", ")}. A bar shows the first of its marks; its tooltip lists all.` : "";
+	const some = hidden ? `The last ${bars.length} of ${all.length} bars.` : `All ${all.length} bars.`;
+	const cut = last && all.length > last ? `<p class="muted">${some} <a data-act="bars">${hidden ? "Show all" : `Show the last ${last}`}</a></p>` : "";
+	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request #${picked.n}.` : ""}`;
 	const axis = `<div class="axis${longest ? " timed" : ""}"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
 	// What the selected request did. Each line opens what it tells of in the Context Browser.
 	const brief = state.view?.brief;
@@ -342,12 +482,120 @@ function trendCard(d) {
 	const told = brief
 		? `<div class="brief">${line("User", brief.user, brief.first == null ? "" : `data-act="request" data-n="${d.requests[brief.first]?.n}"`, "Open the first request of the human input")}${line("In", brief.added, `data-act="added"`, "Show the first item added since the request before")}${line("Out", brief.reply, `data-act="reply"`, "Show the answer in the context of the next request")}</div>`
 		: "";
-	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div>${told}${reported}<div class="pills">${key}</div><p class="muted">${note}</p>`;
+	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div>${cut}${told}${where.length ? pairs(where) : ""}${reported}<div class="pills">${key}</div><p class="muted">${note}</p>`;
 }
 
 /** Number of the first request that carried the row: the first one made after the message of the row was created. */
 const firstRequest = (row) => (row.time == null ? undefined : state.data.requests.find((request) => request.time > row.time)?.n);
 
+/** The pairs that tell where a request stands among the requests of its human input, and how long its first token took. */
+const placePairs = (request, place) => [
+	...(place ? [["Place", `input ${place.input}, step ${place.step} of ${place.steps}`]] : []),
+	...(request.ttft == null ? [] : [["To the first token", secs(request.ttft)]]),
+];
+
+/** The row of item `i` of the context that the browser shows. */
+const shownRow = (i) => (state.request == null ? state.data.current : state.view?.rows)?.[i];
+
+/** The text as formatted JSON, when it is a JSON object or array. */
+function prettyJson(text) {
+	if (!/^\s*[[{]/.test(text ?? "")) return undefined;
+	try {
+		return JSON.stringify(JSON.parse(text), null, 2);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Escapes text and marks what matches `needle`, whatever the case: `mark` makes the HTML of a piece of text.
+ * `count` is the number of matches marked so far; match number `at` is the current one.
+ */
+function finder(needle) {
+	const pattern = needle ? new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi") : null;
+	const found = { count: 0, at: -1 };
+	found.mark = (text) => {
+		if (!pattern) return esc(text);
+		let html = "";
+		let end = 0;
+		for (const match of text.matchAll(pattern)) {
+			html += `${esc(text.slice(end, match.index))}<mark${found.count++ === found.at ? ' class="at"' : ""}>${esc(match[0])}</mark>`;
+			end = match.index + match[0].length;
+		}
+		return html + esc(text.slice(end));
+	};
+	return found;
+}
+
+/**
+ * Text as HTML with the headings, code fences, lists and inline code of Markdown. Any other line is a paragraph.
+ * `mark` escapes every piece of the text; no part of the text reaches the page as HTML.
+ */
+function markdown(text, mark) {
+	const inline = (line) => line.split(/(`[^`]+`)/).map((part, i) => (i % 2 ? `<code>${mark(part.slice(1, -1))}</code>` : mark(part))).join("");
+	const out = [];
+	/** The lines of the open code fence, and the tag of the open list. */
+	let fence;
+	let list = "";
+	const close = () => {
+		if (list) out.push(`</${list}>`);
+		list = "";
+	};
+	for (const line of text.split("\n")) {
+		if (/^\s*(```|~~~)/.test(line)) {
+			close();
+			if (fence) out.push(`<pre>${mark(fence.join("\n"))}</pre>`);
+			fence = fence ? undefined : [];
+			continue;
+		}
+		if (fence) {
+			fence.push(line);
+			continue;
+		}
+		const item = /^\s*([-*+]|\d+[.)])\s+(.*)$/.exec(line);
+		if (item) {
+			const tag = /\d/.test(item[1]) ? "ol" : "ul";
+			if (list !== tag) {
+				close();
+				out.push(`<${tag}>`);
+				list = tag;
+			}
+			out.push(`<li>${inline(item[2])}</li>`);
+			continue;
+		}
+		close();
+		const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+		// The headings are those of an item, not of the page: levels 4 to 6.
+		if (heading) out.push(`<h${Math.min(6, heading[1].length + 3)}>${inline(heading[2])}</h${Math.min(6, heading[1].length + 3)}>`);
+		else if (line.trim()) out.push(`<p>${inline(line)}</p>`);
+	}
+	if (fence) out.push(`<pre>${mark(fence.join("\n"))}</pre>`);
+	close();
+	return out.join("");
+}
+
+/**
+ * The content of the opened item `i`: as text, as Markdown, or as formatted JSON when it is JSON; with a button that copies it,
+ * and a find box whose matches are marked. `entry` is what state.texts has for the item.
+ */
+function viewer(key, i, entry) {
+	const { mode, find = "", at = 0 } = state.viewers.get(key) ?? {};
+	const modes = [["text", "Text"], ["markdown", "Markdown"], ...(entry.json ? [["json", "JSON"]] : [])];
+	const picked = modes.some(([value]) => value === mode) ? mode : "text";
+	const shown = picked === "json" ? entry.json : entry.text;
+	const draw = (mark) => (picked === "markdown" ? `<div class="md">${markdown(shown, mark)}</div>` : `<pre>${mark(shown)}</pre>`);
+	const found = finder(find);
+	// The first pass counts the matches: a step past the last match goes to the first.
+	if (find) draw(found.mark);
+	const count = found.count;
+	found.at = count ? ((at % count) + count) % count : -1;
+	found.count = 0;
+	const buttons = modes.map(([value, label]) => `<button${value === picked ? ' class="on"' : ""} data-act="mode" data-i="${i}" data-mode="${value}">${label}</button>`);
+	const step = (by, label, tip) => `<button data-act="find" data-i="${i}" data-by="${by}"${count ? "" : " disabled"} title="${tip}">${label}</button>`;
+	const matches = find ? `<span class="muted">${count ? `${found.at + 1} of ${count}` : "No match"}</span>` : "";
+	const box = `<input type="search" data-find="${i}" data-focus="find${i}" placeholder="Find" value="${esc(find)}">${step(-1, "‹", "Previous match")}${step(1, "›", "Next match")}${matches}`;
+	return `<div class="viewer">${buttons.join("")}<button data-act="copy" data-i="${i}" title="Copy what is shown">Copy</button>${box}</div>${draw(found.mark)}`;
+}
 /** One item of the context. With `flat`, the item is in a list of all categories and shows its category. */
 function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const key = keyOf(row);
@@ -358,12 +606,13 @@ function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const category = flat ? `<i class="dot" style="background:${COLORS[row.cat]}" title="${esc(labels[row.cat])}"></i>` : "";
 	const line = `<div class="item${row.dropped ? " dropped" : ""}${flat ? " flat" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="pos" title="Position in the prompt">#${i + 1}</span>${category}<span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${first}${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
 	if (!open) return line;
-	const { text = "Loading…", call } = state.texts.get(key) ?? {};
+	const entry = state.texts.get(key);
+	const call = entry?.call;
 	// A tool result comes with its call: the tool, the outcome, the size of the result and the arguments.
 	const badge = call?.status === "error" ? `<span class="bad">error</span>` : `<span class="good">OK</span>`;
 	const about = call ? `<div class="call"><b>${esc(call.tool)}</b>${badge}<span class="muted">${call.lines} ${call.lines === 1 ? "line" : "lines"}</span></div>` : "";
 	const args = call?.args == null ? "" : `<small class="cap">Arguments</small><pre>${esc(call.args)}</pre><small class="cap">Result</small>`;
-	return `${line}${about}${args}<pre>${esc(text)}</pre>`;
+	return `${line}${about}${args}${entry ? viewer(key, i, entry) : "<pre>Loading…</pre>"}`;
 }
 
 function browserCard(d) {
@@ -381,6 +630,7 @@ function browserCard(d) {
 				["Output", tok(request.output)],
 				["Took", request.ms == null ? "?" : dur(request.ms)],
 				["Cost", cost(request.cost)],
+				...placePairs(request, view.place),
 			]),
 		);
 		if (request.miss) head.push(`<p class="warn">Cache miss: ${missText(request.miss)}.</p>`);
@@ -406,7 +656,9 @@ function browserCard(d) {
 		head.push(`<div class="controls">${chips("reply", list)}</div>`);
 	}
 	const passes = (row) => (!kind || row.cat === kind) && (!needle || `${row.label} ${row.preview}`.toLowerCase().includes(needle));
-	const items = view.rows.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" })).filter(({ row }) => passes(row));
+	// The list of what the request added and changed leaves the other items out.
+	const changes = order === "added";
+	const items = view.rows.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" })).filter(({ row, mark }) => passes(row) && (!changes || mark));
 	const all = totalOf(sumBy(view.rows));
 	const canDrop = !request && !d.readOnly;
 	// One band for each item, in reading order. Its width is the share of the item.
@@ -425,11 +677,12 @@ function browserCard(d) {
 	const gone = (row) =>
 		`<div class="item"><span class="mark bad">−</span><span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span><span class="tok">≈${tok(row.tokens * view.factor)}</span></div>`;
 	const removed = view.removed?.length ? `<h3>No longer in the request (${view.removed.length})</h3>${view.removed.slice(0, MAX_LIST).map(gone).join("")}` : "";
-	if (order === "flat") {
+	if (order === "flat" || changes) {
 		const badges = CATS.filter(badge).map((cat) => `<span class="pill"><i class="dot" style="background:${COLORS[cat]}"></i> ${esc(labels[cat])} ${badge(cat)}</span>`);
 		if (badges.length > 0) head.push(`<div class="pills">${badges.join("")}</div>`);
 		const list = items.map((item) => itemHtml(item, view.factor, canDrop, true)).join("");
-		return head.join("") + (list || `<p class="muted">Nothing matches.</p>`) + removed;
+		const none = !changes || needle || kind ? "Nothing matches." : !request ? "Select a request to see what it added and changed." : view.marks ? "The request added and changed nothing." : "";
+		return head.join("") + (list || `<p class="muted">${none}</p>`) + removed;
 	}
 	const groups = CATS.map((cat) => {
 		const own = items.filter((item) => item.row.cat === cat);
@@ -461,6 +714,8 @@ function hintsCard(d) {
 }
 
 function turnsCard(d) {
+	// The wait for the user's answers to questions has a column when an input waited.
+	const waited = d.inputs.some((input) => input.waitMs != null);
 	const rows = [...d.inputs].reverse().map((input) => [
 		input.first >= 0 ? `<a data-act="request" data-n="${d.requests[input.first].n}">#${input.n}</a>` : "#" + input.n,
 		clock(input.time),
@@ -471,12 +726,14 @@ function turnsCard(d) {
 		tok(input.output),
 		cost(input.cost),
 		dur(input.ms),
+		...(waited ? [input.waitMs == null ? "" : dur(input.waitMs)] : []),
 	]);
-	return table(["", "Time", "Input", ">Requests", ">Tools", ">Sent", ">Output", ">Cost", ">Took"], rows, "No input yet.");
+	const note = waited ? `<p class="muted">Waited: the part of the time that the input waited for the answers of the user to questions.</p>` : "";
+	return table(["", "Time", "Input", ">Requests", ">Tools", ">Sent", ">Output", ">Cost", ">Took", ...(waited ? [">Waited"] : [])], rows, "No input yet.") + note;
 }
 
 function eventsCard(d) {
-	if (d.events.length === 0) return `<p class="muted">No injection, compaction, drop, model or branch events on this branch.</p>`;
+	if (d.events.length === 0) return `<p class="muted">No injection, compaction, drop, question, delegation, task, model or branch events on this branch.</p>`;
 	const counts = new Map();
 	for (const event of d.events) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
 	const kind = counts.has(state.kind) ? state.kind : "";
@@ -488,6 +745,8 @@ function eventsCard(d) {
 	const sized = shown.filter((event) => event.delta != null);
 	const net = sized.length ? change(sized.reduce((sum, event) => sum + event.delta, 0)) : "not known";
 	const where = (event) => (event.after ? `<a data-act="request" data-n="${event.after}" title="Open the request in the Context Browser">#${event.after}</a>` : "start");
+	// A compaction tells how many messages its summary replaced.
+	const detail = (event) => esc(event.detail) + (event.replaced == null ? "" : ` <small>${event.replaced} ${event.replaced === 1 ? "message" : "messages"} replaced</small>`);
 	// The injections by the extension message type or the skill that made them, largest first.
 	const sums = new Map();
 	for (const event of shown) {
@@ -501,7 +760,7 @@ function eventsCard(d) {
 		(by.length ? table(["Injected by", ">Events", ">Tokens"], by) : "") +
 		table(
 			["Time", "After", "Kind", ">Change", "Detail"],
-			shown.map((event) => [clock(event.time), where(event), esc(event.kind), change(event.delta), esc(event.detail)]),
+			shown.map((event) => [clock(event.time), where(event), esc(event.kind), change(event.delta), detail(event)]),
 		)
 	);
 }
@@ -511,13 +770,19 @@ function filesCard(d) {
 	const last = (file) => file.ops.reduce((time, op) => Math.max(time, op.time), 0);
 	const names = Object.fromEntries(FILE_KINDS.map(([kind, , name]) => [kind, name]));
 	// The orders of fileRows() of src/analyze.ts.
-	const orders = { ops: (a, b) => ops(b) - ops(a), recent: (a, b) => last(b) - last(a), name: (a, b) => a.path.localeCompare(b.path) };
+	const orders = { ops: (a, b) => ops(b) - ops(a), recent: (a, b) => last(b) - last(a), name: (a, b) => a.path.localeCompare(b.path), lines: (a, b) => b.added + b.removed - (a.added + a.removed) };
 	const kind = state.fileKind;
-	const kinds = chips("fileKind", [["All", d.files.length, ""], ...FILE_KINDS.map(([each, label]) => [label, d.files.filter((file) => file[each] > 0).length, each])]);
+	// With "As of the request", the files as they were after the request of the Context Browser.
+	const then = state.asOf && state.then?.n === state.request ? state.then.files : undefined;
+	const files = then ?? d.files;
+	const needle = $("file-filter").value.trim().toLowerCase();
+	const kinds = chips("fileKind", [["All", files.length, ""], ...FILE_KINDS.map(([each, label]) => [label, files.filter((file) => file[each] > 0).length, each])]);
+	// A read of a part of the file tells its lines.
+	const part = (range) => (!range ? "" : range[1] ? ` of lines ${range[0]}–${range[0] + range[1] - 1}` : ` from line ${range[0]}`);
 	const added = (n) => (n == null ? "" : `<span class="good">+${n}</span>`);
 	const removed = (n) => (n == null ? "" : `<span class="bad">−${n}</span>`);
-	const rows = d.files
-		.filter((file) => !kind || file[kind] > 0)
+	const rows = files
+		.filter((file) => (!kind || file[kind] > 0) && (!needle || file.path.toLowerCase().includes(needle)))
 		.sort(orders[state.fileOrder] ?? orders.ops)
 		.flatMap((file) => {
 			const open = state.openFiles.has(file.path);
@@ -530,31 +795,36 @@ function filesCard(d) {
 				const result = `<a data-act="result" data-n="${op.request}" data-id="${esc(op.id)}" title="Show the tool result in the Context Browser">#${op.request}</a>`;
 				const failed = op.error ? ` <span class="bad">failed</span>` : "";
 				const hits = op.hits == null ? "" : `, ${op.hits} ${op.hits === 1 ? "hit" : "hits"}`;
-				return [`<span class="op">${clock(op.time)} ${result} ${names[op.op]} by ${esc(op.tool)}${hits}${failed}</span>`, "", "", "", "", "", added(op.added), removed(op.removed)];
+				return [`<span class="op">${clock(op.time)} ${result} ${names[op.op]}${part(op.range)} by ${esc(op.tool)}${hits}${failed}</span>`, "", "", "", "", "", added(op.added), removed(op.removed)];
 			});
 			return [row, ...log];
 		});
 	const note = d.unresolvedEdits ? `<p class="muted">${d.unresolvedEdits} edits by anchor could not be matched to a file.</p>` : "";
-	const empty = kind && d.files.length ? "No file with such an operation." : "No file activity yet.";
-	return `<div class="controls">${kinds}</div>` + table(["File", ">Reads", ">Writes", ">Edits", ">Searches", ">Images", ">Added", ">Removed"], rows, empty) + note;
+	const empty = !files.length ? "No file activity yet." : needle ? "No file matches." : "No file with such an operation.";
+	const when = !state.asOf ? "" : state.request == null ? "Select a request in the Context Browser to see the files as they were after it." : then ? `The files as they were after request #${state.request}.` : "Loading…";
+	return `<div class="controls">${kinds}</div>` + (when ? `<p class="muted">${when}</p>` : "") + table(["File", ">Reads", ">Writes", ">Edits", ">Searches", ">Images", ">Added", ">Removed"], rows, empty) + note;
 }
 
 function commandsCard(d) {
-	const programs = new Map();
-	for (const command of d.commands) programs.set(command.program, (programs.get(command.program) ?? 0) + 1);
 	const status = (ok) => (ok == null ? "" : ok ? `<span class="good">ok</span>` : `<span class="bad">failed</span>`);
-	// A short command shows tenths of a second.
-	const took = (ms) => (ms == null ? "" : ms < 10_000 ? (ms / 1000).toFixed(1) + "s" : dur(ms));
+	const took = (ms) => (ms == null ? "" : secs(ms));
 	const by = (command) =>
 		command.id
 			? `<a data-act="result" data-n="${command.request}" data-id="${esc(command.id)}" title="Show the tool result in the Context Browser">#${command.request}</a>`
 			: `<span class="muted">user</span>`;
+	// What sets a command apart: a long run, more than one line, a heredoc, a script given to an interpreter.
+	const marks = (command) => {
+		const shape = commandShape(command.command);
+		const list = [isSlow(command) ? "slow" : "", shape.lines > 1 ? `${shape.lines} lines` : "", shape.heredoc ? "heredoc" : "", shape.inline ? "inline script" : ""];
+		return list.filter(Boolean).map((mark) => `<span class="pill${mark === "slow" ? " warn" : ""}">${mark}</span> `).join("");
+	};
+	const needle = $("command-filter").value.trim().toLowerCase();
 	const counts = { ok: 0, failed: 0, unknown: 0 };
 	for (const command of d.commands) counts[commandStatus(command)]++;
 	// Newest first.
 	const listed = d.commands
 		.map((command, i) => ({ command, i }))
-		.filter(({ command }) => !state.commandStatus || commandStatus(command) === state.commandStatus)
+		.filter(({ command }) => (!state.commandStatus || commandStatus(command) === state.commandStatus) && (!needle || command.command.toLowerCase().includes(needle)))
 		.reverse();
 	// The table shows its first rows: it starts late enough to show the highlighted run.
 	const skip = Math.max(0, listed.findIndex(({ i }) => i === state.run) - MAX_LIST + 1);
@@ -565,19 +835,28 @@ function commandsCard(d) {
 			by(command),
 			status(command.ok),
 			took(command.ms),
-			esc(command.program),
-			clip(command.command, "mono"),
+			esc([...new Set(command.programs)].join(", ")),
+			marks(command) + clip(command.command, "mono"),
 		]);
 	const timed = d.commands.filter((command) => command.ms != null);
 	const failed = d.commands.filter((command) => command.ok === false).length;
 	const time = timed.length ? `, ${dur(timed.reduce((sum, command) => sum + command.ms, 0))}` : "";
-	const title = `${d.commands.length} runs of ${programs.size} programs, ${failed} failed${time}`;
+	const title = `${d.commands.length} runs of ${d.programs.length} programs, ${failed} failed${time}`;
 	const statuses = chips("commandStatus", [["All", d.commands.length, ""], ["OK", counts.ok, "ok"], ["Failed", counts.failed, "failed"], ["Unknown", counts.unknown, "unknown"]]);
 	const jump = (to, label, any, tip) => `<button data-act="run" data-to="${to}"${any ? "" : " disabled"} title="${tip}">${label}</button>`;
 	const jumps = `<span class="muted">Go to</span>${jump("failed", "Failed", counts.failed, "Highlight the newest failed run, then the one before it")}${jump("slowest", "Slowest", timed.length, "Highlight the run with the longest wall time")}`;
 	const newer = skip ? `<p class="muted">${skip} newer runs are not listed.</p>` : "";
-	const empty = d.commands.length ? "No run with this status." : "No command yet.";
-	return pills(title, [...programs]) + `<div class="controls">${statuses}${jumps}</div>` + newer + table(["Time", "Request", "", ">Took", "Program", "Command"], rows, empty);
+	const empty = !d.commands.length ? "No command yet." : needle ? "No run matches." : "No run with this status.";
+	// The runs that deserve a look.
+	const { slowest: slow, failing, repeated } = d.attention;
+	const look = [
+		d.commands[slow] ? `<a data-act="run" data-to="slowest" title="Highlight the run">the slowest run</a> took ${took(d.commands[slow].ms)}` : "",
+		failing ? `${esc(failing.program)} failed ${failing.count} times` : "",
+		repeated ? `${clip(repeated.command, "mono")} ran ${repeated.count} times` : "",
+	].filter(Boolean);
+	const attention = look.length ? `<p><span class="warn">Worth a look:</span> ${look.join(" · ")}</p>` : "";
+	const ranks = pills(title, d.programs.map((program) => [program.program, program.uses]));
+	return ranks + attention + `<div class="controls">${statuses}${jumps}</div>` + newer + table(["Time", "Request", "", ">Took", "Programs", "Command"], rows, empty);
 }
 
 function toolsCard(d) {
@@ -585,23 +864,50 @@ function toolsCard(d) {
 	const tools = d.toolRows.map((tool) => {
 		const undeclared = tool.undeclared + (d.declared.includes(tool.name) ? 0 : tool.unchecked);
 		const flag = undeclared ? ` <span class="warn" title="${undeclared} direct calls while the tool was not declared to the model">!</span>` : "";
-		return [esc(tool.name) + flag, esc(tool.source), size(tool.schema * d.factor), tool.calls || "", tool.nested || "", tool.errors || "", size(tool.callTokens), size(tool.resultTokens)];
+		const name = `<a data-act="tool" data-name="${esc(tool.name)}" title="Show the description and the parameters">${tool.name === state.tool ? "▾" : "▸"} ${esc(tool.name)}</a>`;
+		return [name + flag, esc(tool.source), size(tool.schema * d.factor), tool.calls || "", tool.nested || "", tool.errors || "", size(tool.callTokens), size(tool.resultTokens)];
 	});
+	// What pi knows now about the picked tool.
+	const doc = state.toolDoc?.name === state.tool ? state.toolDoc : undefined;
+	const listed = (doc?.params ?? []).map((param) => [esc(param.name), esc(param.type), param.required ? "required" : "", esc(param.description)]);
+	const about = !doc
+		? `<p class="muted">Loading…</p>`
+		: doc.error
+			? `<p class="muted">${esc(doc.error)}</p>`
+			: (doc.description ? `<pre>${esc(doc.description)}</pre>` : "") + table(["Parameter", "Type", "", "Description"], listed, "The tool has no parameters.");
 	const sources = d.schemaSources.map((group) => [esc(group.source || "unknown"), group.tools, "≈" + tok(group.tokens * d.factor)]);
 	const skills = d.skills.map((skill) => [clip(skill.name), skill.loads, "≈" + tok(skill.tokens)]);
 	const models = [...d.models].sort((a, b) => b.cost - a.cost).map((model) => [esc(model.model), model.requests, tok(model.sent), tok(model.output), cost(model.cost)]);
 	return [
 		table(["Tool", "Source", ">Schema", ">Calls", ">In scripts", ">Errors", ">Arguments", ">Results"], tools, "No tool yet."),
+		state.tool ? `<h3>Tool ${esc(state.tool)}</h3>${about}` : "",
 		sources.length ? "<h3>Tool schemas by source</h3>" + table(["Source", ">Tools", ">Tokens"], sources) : "",
 		skills.length ? "<h3>Skills</h3>" + table(["Skill", ">Loads", ">Tokens"], skills) : "",
-		"<h3>Models</h3>" + table(["Model", ">Requests", ">Sent", ">Output", ">Cost"], models, "No request yet."),
+		`<h3 id="models">Models</h3>` + table(["Model", ">Requests", ">Sent", ">Output", ">Cost"], models, "No request yet."),
 	].join("");
 }
 
 // The subagents and the tasks of the session.
 
 function agentsCard(d) {
-	if (d.agents.length === 0) return `<p class="muted">No subagent in this session.</p>`;
+	const { agents, running, items, messages } = d.fleet;
+	const summary = `<p>${agents} ${agents === 1 ? "agent" : "agents"}, ${running} running · ${items} ${items === 1 ? "item" : "items"} on the board · ${messages} ${messages === 1 ? "message" : "messages"} to and from the agents</p>`;
+	if (d.agents.length === 0) return summary + `<p class="muted">No subagent in this session.</p>`;
+	// What the picked agent was asked and answered, its tasks and its last events.
+	const detail = (agent) => {
+		if (agent.id !== state.agent) return "";
+		const info = state.agentInfo?.id === agent.id ? state.agentInfo : undefined;
+		if (!info) return `<p class="muted">Loading…</p>`;
+		if (info.error) return `<p class="bad">${esc(info.error)}</p>`;
+		const block = (title, text) => (text ? `<small class="cap">${title}</small><pre>${esc(text)}</pre>` : "");
+		const task = (item) =>
+			`<div class="row"><span class="pos">#${esc(item.id)}</span><span class="sub" title="${esc(item.subject)}">${esc(item.subject)}</span><span class="${statusCss(item.status)}">${esc(item.status.replace(/_/g, " "))}</span></div>`;
+		const event = (each) =>
+			`<div class="row"><span class="pos">${clock(each.time)}</span><span class="pill">${esc(each.kind)}</span><span class="sub" title="${esc(each.title)}">${esc(each.title)}</span></div>`;
+		const tasks = info.tasks.length ? `<h3>Tasks</h3>${info.tasks.map(task).join("")}` : "";
+		const events = info.events.length ? `<h3>Last events</h3>${info.events.map(event).join("")}` : "";
+		return block("Prompt", info.prompt) + block("Reply", info.reply) + tasks + events || `<p class="muted">The session tells nothing more about this agent.</p>`;
+	};
 	const ids = new Set(d.agents.map((agent) => agent.id));
 	// Each agent is followed by the agents that it started.
 	const under = (parent, level) =>
@@ -630,9 +936,9 @@ function agentsCard(d) {
 			agent.compactions ? ["Compactions", agent.compactions] : null,
 		].filter(Boolean);
 		const error = agent.error ? `<p class="bad">${esc(agent.error)}</p>` : "";
-		return `<div class="agent" style="margin-left:${(agent.depth ?? level) * 20}px"><div class="between"><b>${esc(agent.type)}</b><span class="${statusCss(agent.status)}">${esc(agent.status)}</span></div><div>${esc(agent.description)}</div><small class="mono">${esc(agent.model ?? "")}</small>${bar ? `<div class="bar">${bar}</div>` : ""}${pairs(facts)}${error}</div>`;
+		return `<div class="agent" style="margin-left:${(agent.depth ?? level) * 20}px"><div class="between" data-act="agent" data-id="${esc(agent.id)}" title="Show the prompt, the reply, the tasks and the last events of the agent"><b>${agent.id === state.agent ? "▾" : "▸"} ${esc(agent.type)}</b><span class="${statusCss(agent.status)}">${esc(agent.status)}</span></div><div>${esc(agent.description)}</div><small class="mono">${esc(agent.model ?? "")}</small>${bar ? `<div class="bar">${bar}</div>` : ""}${pairs(facts)}${error}${detail(agent)}</div>`;
 	};
-	return `<div class="agents">${under(undefined, 0).map(card).join("")}</div>`;
+	return `${summary}<div class="agents">${under(undefined, 0).map(card).join("")}</div>`;
 }
 
 /** Identifies an event of the timeline, so that it stays open when the data is loaded again. */
@@ -643,7 +949,13 @@ function timelineCard(d) {
 	// An agent shows as its type; its id is in the tooltip.
 	const who = (id) => (id ? (d.agents.find((agent) => agent.id === id)?.type ?? id.slice(0, 8)) : "");
 	const needle = $("fleet-search").value.trim().toLowerCase();
-	const found = d.timeline.filter((event) => !needle || `${event.kind} ${who(event.agent)} ${event.title} ${event.body ?? ""}`.toLowerCase().includes(needle));
+	const counts = new Map();
+	for (const event of d.timeline) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+	const kind = state.fleetKind;
+	const kinds = chips("fleetKind", [["All", d.timeline.length, ""], ...[...counts].map(([name, count]) => [esc(name), count, esc(name)])]);
+	const found = d.timeline.filter(
+		(event) => (!kind || event.kind === kind) && (!needle || `${event.kind} ${who(event.agent)} ${event.title} ${event.body ?? ""}`.toLowerCase().includes(needle)),
+	);
 	// The data has the earliest event first.
 	if (!state.earliest) found.reverse();
 	const line = (event) => {
@@ -653,7 +965,7 @@ function timelineCard(d) {
 		return open ? `${row}<pre>${esc(event.body)}</pre>` : row;
 	};
 	const more = found.length > MAX_LIST ? `<p class="muted">The first ${MAX_LIST} of ${found.length}.</p>` : "";
-	return found.length ? `<div class="scroll">${found.slice(0, MAX_LIST).map(line).join("")}</div>${more}` : `<p class="muted">No event matches.</p>`;
+	return `<div class="controls">${kinds}</div>` + (found.length ? `<div class="scroll">${found.slice(0, MAX_LIST).map(line).join("")}</div>${more}` : `<p class="muted">No event matches.</p>`);
 }
 
 function boardCard(d) {
@@ -661,30 +973,51 @@ function boardCard(d) {
 	if (items.length === 0) return `<p class="muted">No task and no delegation in this session.</p>`;
 	const picked = state.taskState;
 	const states = chips("taskState", [["All", items.length, ""], ...TASK_STATES.map(([value, label]) => [label, items.filter((item) => item.state === value).length, value])]);
+	const needle = $("board-search").value.trim().toLowerCase();
+	const matches = (item) => (!picked || item.state === picked) && (!needle || `${item.id} ${item.subject} ${item.description ?? ""} ${item.status}`.toLowerCase().includes(needle));
+	// A task of the chain that another task waits for, in the colour of its status.
+	const link = (id) => {
+		const task = items.find((item) => item.id === id && !item.agent);
+		return `<a class="${task ? statusCss(task.status) : ""}" data-act="blocker" data-id="${esc(id)}" title="${esc(task ? `${task.subject} (${task.status.replace(/_/g, " ")})` : "")}">#${esc(id)}</a>`;
+	};
 	const line = (item) => {
-		const more = item.description || item.reply;
+		// A task that waits for other tasks opens too: it shows their chain.
+		const waits = !item.agent && d.tasks.some((task) => task.id === item.id && task.blockedBy.length > 0);
+		const more = item.description || item.reply || waits;
 		const open = more && state.openTasks.has(item.id);
 		const blockers = item.blockedBy.map((id) => `<a data-act="blocker" data-id="${esc(id)}" title="Show the task">#${esc(id)}</a>`);
-		const blocked = blockers.length ? `<span class="warn">blocked by ${blockers.join(", ")}</span>` : "";
+		const ready = readiness(item);
+		const badge = ready ? `<span class="pill ${ready === "ready" ? "good" : "warn"}">${ready}</span>` : "";
+		const blocked = blockers.length ? `<span class="warn">${ready ? "" : "blocked "}by ${blockers.join(", ")}</span>` : "";
 		// A delegation has the id of its agent.
 		const id = item.agent ? item.id.slice(0, 8) : "#" + item.id;
-		const row = `<div class="item flat${item.id === state.task ? " hit" : ""}" data-act="task" data-id="${esc(item.id)}"><span class="fold">${more ? (open ? "▾" : "▸") : ""}</span><span class="pos" title="${esc(item.id)}">${esc(id)}</span><span class="sub" title="${esc(item.subject)}">${esc(item.subject)}</span>${blocked}<span class="${statusCss(item.status)}">${esc(item.status.replace(/_/g, " "))}</span></div>`;
+		const row = `<div class="item flat${item.id === state.task ? " hit" : ""}" data-act="task" data-id="${esc(item.id)}"><span class="fold">${more ? (open ? "▾" : "▸") : ""}</span><span class="pos" title="${esc(item.id)}">${esc(id)}</span><span class="sub" title="${esc(item.subject)}">${esc(item.subject)}</span>${badge}${blocked}<span class="${statusCss(item.status)}">${esc(item.status.replace(/_/g, " "))}</span></div>`;
 		if (!open) return row;
 		const reply = item.reply ? `<small class="cap">Reply</small><pre>${esc(item.reply)}</pre>` : "";
-		return row + (item.description ? `<pre>${esc(item.description)}</pre>` : "") + reply;
+		const chain = (waits && state.chains.get(item.id)) || [];
+		const before = chain.length ? `<small class="cap">Waits for ${chain.map(link).join(", ")}, the nearest first</small>` : "";
+		return row + before + (item.description ? `<pre>${esc(item.description)}</pre>` : "") + reply;
 	};
-	const groups = d.board.map((group) => [group.owner, group.items.filter((item) => !picked || item.state === picked)]).filter(([, own]) => own.length > 0);
+	const groups = d.board.map((group) => [group.owner, group.items.filter(matches)]).filter(([, own]) => own.length > 0);
 	const list = groups.map(([owner, own]) => `<h3>${esc(owner)} · ${own.length}</h3>${own.map(line).join("")}`).join("");
-	return `<div class="controls">${states}</div>` + (list || `<p class="muted">No task in this state.</p>`);
+	return `<div class="controls">${states}</div>` + (list || `<p class="muted">${needle ? "No task matches." : "No task in this state."}</p>`);
 }
 
 // The Insights page.
 
-/** A tally of tools, programs or skills: name, uses, time of the last use. A click on a name lists the sessions that used it. */
-const rank = (kind, items, empty) => {
+/**
+ * A tally of tools, programs or skills: name, sessions that used it, time of the last use, uses. A click on a name lists the sessions that used it.
+ * `info` gives a skill its path and where it comes from.
+ */
+const rank = (kind, items, empty, info = {}) => {
 	const on = (name) => (state.uses?.kind === kind && state.uses.name === name ? ' class="on"' : "");
-	const line = ([name, count, last]) =>
-		`<span${on(name)} data-act="uses" data-kind="${kind}" data-name="${esc(name)}" style="--w:${(count / items[0][1]) * 100}%" title="${esc(name)}: click to list only the sessions that used it">${esc(name)}</span><small title="Last used">${last ? date(last) : ""}</small><b class="tok">${count}</b>`;
+	const line = ([name, count, last, sessions]) => {
+		const [path, source] = Object.hasOwn(info, name) ? info[name] : [];
+		const badge = source ? ` <small class="pill" title="Where the skill comes from">${esc(source)}</small>` : "";
+		const where = path ? `<small class="mono path" title="${esc(path)}">${esc(path)}</small>` : "";
+		const used = sessions == null ? "" : `${sessions} ${sessions === 1 ? "session" : "sessions"}`;
+		return `<span${on(name)} data-act="uses" data-kind="${kind}" data-name="${esc(name)}" style="--w:${(count / items[0][1]) * 100}%" title="${esc(name)}: click to list only the sessions that used it">${esc(name)}${badge}</span><small title="Sessions that used it">${used}</small><small title="Last used">${last ? date(last) : ""}</small><b class="tok">${count}</b>${where}`;
+	};
 	return items.length ? `<div class="rank">${items.map(line).join("")}</div>` : `<p class="muted">${empty}</p>`;
 };
 
@@ -704,9 +1037,10 @@ function daysCard(ins) {
 	const peak = Math.max(...days.map((day) => day.tokens), 1);
 	const cell = (day) => {
 		if (!day) return "<span></span>";
-		const tip = `${day.day}: ${day.requests} requests, ${tok(day.tokens)} tokens, ${cost(day.cost)}`;
+		const tip = `${day.day}: ${day.sessions} sessions, ${day.requests} requests, ${tok(day.tokens)} tokens, ${cost(day.cost)}`;
 		const shade = day.tokens ? `<b style="opacity:${0.2 + (0.8 * day.tokens) / peak}"></b>` : "";
-		return `<i${day.day === ins.day ? ' class="on"' : ""} data-act="day" data-day="${day.day}" title="${tip}">${shade}</i>`;
+		const on = ins.until ? day.day >= ins.day && day.day <= ins.until : day.day === ins.day;
+		return `<i${on ? ' class="on"' : ""} data-act="day" data-day="${day.day}" title="${tip}">${shade}</i>`;
 	};
 	// The grid fills by column: a column of labels, then one column per week.
 	const cells = DAYS.map((name) => `<span>${name}</span>`);
@@ -719,13 +1053,13 @@ function daysCard(ins) {
 		last = name;
 		cells.push(...column.map(cell));
 	}
-	const note = "Click a day to narrow the page to it. Click it again to show the whole period.";
+	const note = "Click a day to narrow the page to it. Click another day with Shift to narrow the page to the days from the one to the other. Click the day again to show the whole period.";
 	return `<div class="scroll-x" data-keep="days"><div class="cal months" style="--weeks:${weeks}">${months.join("")}</div><div class="cal" style="--weeks:${weeks}">${cells.join("")}</div></div><p class="muted">${note}</p>`;
 }
 
 function renderInsights() {
 	for (const button of document.querySelectorAll('[data-act="days"]')) button.classList.toggle("on", button.dataset.days === String(state.days));
-	document.querySelector('[data-act="today"]').classList.toggle("on", state.day === today());
+	document.querySelector('[data-act="today"]').classList.toggle("on", state.day === today() && !state.until);
 	const ins = state.insights;
 	if (!ins) {
 		for (const id of INSIGHT_CARDS) paint(id, `<p class="muted">Reading the sessions…</p>`);
@@ -738,12 +1072,12 @@ function renderInsights() {
 			[ins.requests, "Requests"],
 			[tok(ins.tokens), "Tokens"],
 			[cost(ins.cost), "Cost"],
-			ins.day ? [ins.day, "Day"] : [ins.activeDays, "Active days"],
+			ins.until ? [`${ins.day.slice(5)} to ${ins.until.slice(5)}`, "Days"] : ins.day ? [ins.day, "Day"] : [ins.activeDays, "Active days"],
 			[pct(ins.cacheRate, 1), "Read from cache"],
 			[ins.userInputs, "Human inputs"],
 			[ins.toolCalls, "Tool calls"],
 			[dur(ins.activeMs), "Active time", "of the recorded turns"],
-		]) + (ins.day ? `<p>The figures cover ${ins.day} only. <a data-act="day" data-day="${ins.day}">Show the whole period</a></p>` : ""),
+		]) + (ins.day ? `<p>The figures cover ${ins.until ? `${ins.day} to ${ins.until}` : ins.day} only. <a data-act="day">Show the whole period</a></p>` : ""),
 	);
 	paint("i-days", daysCard(ins));
 	const sent = totalOf(ins.composition.sums);
@@ -751,11 +1085,11 @@ function renderInsights() {
 	const recorded = `${ins.composition.requests} of ${ins.requests} requests, those recorded by pi-context. Each request sends the whole context again.`;
 	paint(
 		"i-composition",
-		sent ? `<div class="split">${donut(parts, tok(sent), "sent")}${legend(parts)}</div><p class="muted">${recorded}</p>` : `<p class="muted">pi-context recorded no request ${ins.day ? "on this day" : "in the period"}.</p>`,
+		sent ? `<div class="split">${donut(parts, tok(sent), "sent")}${legend(parts)}</div><p class="muted">${recorded}</p>` : `<p class="muted">pi-context recorded no request ${ins.until ? "on these days" : ins.day ? "on this day" : "in the period"}.</p>`,
 	);
 	const most = Math.max(...ins.week.map((day) => day.tokens), 1);
 	const column = (day) =>
-		`<div title="${day.requests} requests"><span>${tok(day.tokens)}</span><i style="height:${(day.tokens / most) * 70}%"></i><span>${day.day.slice(5)}</span><span>${cost(day.cost)}</span></div>`;
+		`<div title="${day.requests} requests"><span>${tok(day.tokens)}</span><i style="height:${(day.tokens / most) * 60}%"></i><span>${day.day.slice(5)}</span><span>${cost(day.cost)}</span><span>${day.sessions} ${day.sessions === 1 ? "session" : "sessions"}</span></div>`;
 	paint("i-week", `<div class="week">${ins.week.map(column).join("")}</div>`);
 	const peak = Math.max(...ins.heat.flat(), 1);
 	const hours = "<span></span>" + Array.from({ length: 24 }, (_, hour) => `<span>${hour % 6 === 0 ? hour : ""}</span>`).join("");
@@ -780,9 +1114,9 @@ function renderInsights() {
 		),
 	);
 	paint("i-tools", rank("tools", ins.tools, "No tool call in the period."));
-	paint("i-programs", `<h3>Programs</h3>${rank("programs", ins.programs, "No command in the period.")}<h3>Skills</h3>${rank("skills", ins.skills, "No skill loaded in the period.")}`);
+	paint("i-programs", `<h3>Programs</h3>${rank("programs", ins.programs, "No command in the period.")}<h3>Skills</h3>${rank("skills", ins.skills, "No skill loaded in the period.", ins.skillInfo)}`);
 	const needle = $("search").value.trim().toLowerCase();
-	const found = ins.sessions.filter((session) => !needle || `${session.name} ${session.cwd}`.toLowerCase().includes(needle));
+	const found = ins.sessions.filter((session) => !needle || `${session.name} ${session.cwd} ${session.lastUser ?? ""}`.toLowerCase().includes(needle));
 	const card = (session) => {
 		const title = session.name || session.cwd.split("/").pop() || session.cwd;
 		const open = session.file ? ` data-act="session" data-file="${esc(session.file)}" data-title="${esc(title)}"` : "";
@@ -791,7 +1125,8 @@ function renderInsights() {
 		const sum = profile.reduce((total, tokens) => total + tokens, 0);
 		const bar = CATS.map((cat, i) => (profile[i] > 0 ? `<i style="width:${(profile[i] / sum) * 100}%;background:${COLORS[cat]}" title="${esc(labels[cat] ?? cat)} ≈${tok(profile[i])}"></i>` : "")).join("");
 		const context = `<div class="between"><div class="bar"${sum ? "" : ' title="The composition is not recorded"'}>${bar}</div><small class="tok" title="Tokens that the last request sent">context ${tok(session.context)}</small></div>`;
-		return `<div class="session"${open}><b>${esc(title)}</b><small class="mono">${esc(session.cwd)}</small>${context}<div class="between"><small>${date(session.end)}</small><span>${session.requests} requests · ${tok(session.tokens)} · ${cost(session.cost)}</span></div></div>`;
+		const asked = session.lastUser ? `<small class="asked" title="The last human input">${esc(session.lastUser)}</small>` : "";
+		return `<div class="session"${open}><b>${esc(title)}</b><small class="mono">${esc(session.cwd)}</small>${asked}${context}<div class="between"><small>${date(session.end)}</small><span>${session.requests} requests · ${tok(session.tokens)} · ${cost(session.cost)}</span></div></div>`;
 	};
 	const more = found.length > state.shown ? `<p><button data-act="more">Show more (${found.length - state.shown} left)</button></p>` : "";
 	const shown = found.slice(0, state.shown);
@@ -842,14 +1177,19 @@ function fillChoices(d) {
 	$("choices").innerHTML = html;
 }
 
-/** Makes the page show what view defaults say. `view` has some of period, trend, mode, tools, files and diff. */
+/** Makes the page show what view defaults say. `view` has some of period, trend, mode, fit, tools, files and diff. */
 function applyDefaults(view) {
 	if (view.period) {
 		state.days = view.period === "all" ? "all" : Number(view.period);
 		state.day = null;
+		state.until = null;
 	}
 	if (view.trend) state.trend.byTurn = view.trend === "input";
 	if (view.mode) state.trend.delta = view.mode === "change";
+	if (view.fit) {
+		state.trend.last = view.fit === "off" ? 0 : Number(view.fit);
+		state.trend.whole = false;
+	}
 	if (view.tools) state.toolOrder = view.tools;
 	if (view.files) state.fileOrder = view.files;
 	if (view.diff) state.diff = view.diff;
@@ -885,6 +1225,7 @@ function render() {
 	paint("stats", statsCard(d));
 	paint("tokens", tokensCard(d));
 	paint("timing", timingCard(d));
+	document.querySelector("[data-act=treemap]").classList.toggle("on", state.treemap);
 	paint("current", currentCard(d));
 	for (const button of document.querySelectorAll("[data-act=trend]")) button.classList.toggle("on", state.trend[button.dataset.key]);
 	paint("trend", trendCard(d));
@@ -893,6 +1234,7 @@ function render() {
 	paint("turns", turnsCard(d));
 	paint("events", eventsCard(d));
 	for (const button of document.querySelectorAll("[data-act=files]")) button.classList.toggle("on", state.fileOrder === button.dataset.order);
+	document.querySelector("[data-act=asOf]").classList.toggle("on", state.asOf);
 	paint("files", filesCard(d));
 	paint("commands", commandsCard(d));
 	for (const button of document.querySelectorAll("[data-act=order]")) button.classList.toggle("on", state.toolOrder === button.dataset.order);
@@ -939,6 +1281,8 @@ async function load() {
 		const request = d.requests.find((r) => r.n === state.request);
 		// Another branch can have another request under the same number.
 		if (state.request != null && state.view?.time !== request?.time) selectRequest(request?.n ?? null);
+		// The picked agent may have gone on since the last load.
+		if (state.agent) loadAgent();
 	} catch (error) {
 		setError(error.message);
 		// A saved session that cannot be opened gives way to the current one.
@@ -958,6 +1302,7 @@ async function load() {
 async function selectRequest(n) {
 	state.request = n;
 	state.view = null;
+	if (state.asOf) loadFiles();
 	render();
 	if (n == null) return;
 	try {
@@ -982,7 +1327,7 @@ async function openItem(i) {
 	if (state.texts.has(key)) return;
 	try {
 		const { text, call } = await api("text", params(live ? { i, v: state.data.version } : { i, n: state.request }));
-		state.texts.set(key, { call, text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
+		state.texts.set(key, { call, json: prettyJson(text), text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
 		if (state.texts.size > MAX_TEXTS) state.texts.delete(state.texts.keys().next().value);
 	} catch {
 		// The context changed after the page loaded it.
@@ -1000,6 +1345,10 @@ async function openSession(file, title) {
 	state.openItems.clear();
 	state.run = null;
 	state.task = null;
+	state.then = null;
+	state.tool = null;
+	state.agent = null;
+	state.chains.clear();
 	painted.clear();
 	location.hash = "";
 	scrollTo(0, 0);
@@ -1014,7 +1363,7 @@ async function loadInsights() {
 	render();
 	try {
 		const uses = state.uses ? `${state.uses.kind}:${state.uses.name}` : "";
-		const insights = await api("insights", { days: state.days, day: state.day ?? "", project: $("project").checked ? 1 : 0, sort: $("sort").value, uses });
+		const insights = await api("insights", { days: state.days, day: state.day ?? "", until: state.until ?? "", project: $("project").checked ? 1 : 0, sort: $("sort").value, uses });
 		if (mine === reading) state.insights = insights;
 	} catch (error) {
 		setError(error.message);
@@ -1022,6 +1371,44 @@ async function loadInsights() {
 	render();
 }
 
+/** Reads the files as they were after the request of the Context Browser, when File Activity shows them so. */
+async function loadFiles() {
+	const n = state.request;
+	state.then = null;
+	if (!state.asOf || n == null) return;
+	try {
+		const { files } = await api("files", params({ n }));
+		if (state.asOf && state.request === n) state.then = { n, files };
+	} catch (error) {
+		setError(error.message);
+	}
+	render();
+}
+
+/** Reads what the picked agent was asked and answered, its tasks and its last events. */
+async function loadAgent() {
+	const id = state.agent;
+	let info;
+	try {
+		info = await api("agent", params({ id }));
+	} catch (error) {
+		info = { error: error.message };
+	}
+	if (state.agent === id) state.agentInfo = { id, ...info };
+	render();
+}
+
+/** Changes how the content of the opened item `i` shows: `change` gets what state.viewers has for the item and gives what to set. */
+function setViewer(i, change) {
+	const row = shownRow(i);
+	if (!row) return;
+	const key = keyOf(row);
+	const now = state.viewers.get(key) ?? {};
+	state.viewers.set(key, { ...now, ...change(now) });
+	render();
+	// The current match of the find box comes into view.
+	document.querySelector(`#browser [data-find="${i}"]`)?.parentElement.nextElementSibling.querySelector("mark.at")?.scrollIntoView({ block: "nearest" });
+}
 function toggle(set, value) {
 	if (!set.delete(value)) set.add(value);
 	render();
@@ -1032,6 +1419,8 @@ const actions = {
 		location.hash = el.dataset.page === "insights" ? "#insights" : "";
 	},
 	request: (el) => selectRequest(Number(el.dataset.n)),
+	/** Goes to the card, or to the part of a card, that a figure belongs to. */
+	go: (el) => $(el.dataset.to)?.scrollIntoView({ behavior: "smooth" }),
 	step(el) {
 		const numbers = (state.data?.requests ?? []).map((request) => request.n);
 		const next = (state.request == null ? numbers.length : numbers.indexOf(state.request)) + Number(el.dataset.by);
@@ -1046,6 +1435,20 @@ const actions = {
 		if (key === "byTurn") state.view = null;
 		load();
 	},
+	/** Shows every bar of the trend, or again only the last ones that the view default allows. */
+	bars() {
+		state.trend.whole = !state.trend.whole;
+		render();
+	},
+	treemap() {
+		state.treemap = !state.treemap;
+		render();
+	},
+	/** Opens an item of the treemap in the Context Browser, which shows the current context for it. */
+	async cell(el) {
+		if (state.request != null) await selectRequest(null);
+		actions.band(el);
+	},
 	order(el) {
 		state.toolOrder = el.dataset.order;
 		load();
@@ -1053,6 +1456,12 @@ const actions = {
 	files(el) {
 		state.fileOrder = el.dataset.order;
 		render();
+	},
+	/** Shows the files as they were after the request of the Context Browser, or again as they are now. */
+	asOf() {
+		state.asOf = !state.asOf;
+		render();
+		loadFiles();
 	},
 	/** A chip: sets the value that it chooses. */
 	pick(el) {
@@ -1076,7 +1485,41 @@ const actions = {
 		render();
 	},
 	event: (el) => toggle(state.openEvents, el.dataset.key),
-	task: (el) => toggle(state.openTasks, el.dataset.id),
+	/** Opens or closes a task. An opened task reads the tasks that it waits for. */
+	async task(el) {
+		const { id } = el.dataset;
+		toggle(state.openTasks, id);
+		if (!state.openTasks.has(id) || !state.data.tasks.some((task) => task.id === id)) return;
+		try {
+			state.chains.set(id, (await api("chain", params({ id }))).ids);
+			render();
+		} catch (error) {
+			setError(error.message);
+		}
+	},
+	/** Shows what a subagent was asked and answered, its tasks and its last events. The same agent again hides them. */
+	agent(el) {
+		state.agent = state.agent === el.dataset.id ? null : el.dataset.id;
+		state.agentInfo = null;
+		render();
+		if (state.agent) loadAgent();
+	},
+	/** Shows the description and the parameters of a tool under the tool list. The same tool again hides them. */
+	async tool(el) {
+		const { name } = el.dataset;
+		state.tool = state.tool === name ? null : name;
+		state.toolDoc = null;
+		render();
+		if (!state.tool) return;
+		let doc;
+		try {
+			doc = await api("tool", params({ name }));
+		} catch (error) {
+			doc = { error: error.message };
+		}
+		if (state.tool === name) state.toolDoc = { name, ...doc };
+		render();
+	},
 	/** Shows the task that blocks another one. */
 	blocker(el) {
 		state.task = el.dataset.id;
@@ -1093,6 +1536,26 @@ const actions = {
 	},
 	cat: (el) => toggle(state.openCats, el.dataset.cat),
 	item: (el) => openItem(Number(el.dataset.i)),
+	/** Shows the content of an opened item as text, as Markdown or as JSON. */
+	mode: (el) => setViewer(Number(el.dataset.i), () => ({ mode: el.dataset.mode })),
+	/** Goes to the next or the previous match of the find box of an opened item. */
+	find: (el) => setViewer(Number(el.dataset.i), (viewer) => ({ at: (viewer.at ?? 0) + Number(el.dataset.by) })),
+	/** Copies the content of an opened item as it shows: the text, or the formatted JSON. */
+	async copy(el) {
+		const row = shownRow(Number(el.dataset.i));
+		const entry = row && state.texts.get(keyOf(row));
+		if (!entry) return;
+		const json = state.viewers.get(keyOf(row))?.mode === "json" && entry.json;
+		try {
+			await navigator.clipboard.writeText(json || entry.text);
+			el.textContent = "Copied";
+			setTimeout(() => {
+				el.textContent = "Copy";
+			}, 1500);
+		} catch {
+			setError("The browser did not allow the copy.");
+		}
+	},
 	/** Shows the item of a band of the strip: opens its category and its content, and scrolls to it. */
 	band(el) {
 		const i = Number(el.dataset.i);
@@ -1133,14 +1596,22 @@ const actions = {
 	days(el) {
 		state.days = el.dataset.days === "all" ? "all" : Number(el.dataset.days);
 		state.day = null;
+		state.until = null;
 		loadInsights();
 	},
 	today() {
-		state.day = state.day === today() ? null : today();
+		state.day = state.day === today() && !state.until ? null : today();
+		state.until = null;
 		loadInsights();
 	},
-	day(el) {
-		state.day = state.day === el.dataset.day ? null : el.dataset.day;
+	/** Narrows Insights to a day. With Shift, to the days from the selected day to this one. The selected day again, or no day, shows the whole period. */
+	day(el, event) {
+		const { day } = el.dataset;
+		if (event?.shiftKey && state.day && day && day !== state.day) [state.day, state.until] = [state.day, day].sort();
+		else {
+			state.day = !day || (state.day === day && !state.until) ? null : day;
+			state.until = null;
+		}
 		loadInsights();
 	},
 	session: (el) => openSession(el.dataset.file, el.dataset.title),
@@ -1166,7 +1637,7 @@ const actions = {
 
 document.addEventListener("click", (event) => {
 	const el = event.target.closest("[data-act]");
-	if (el) actions[el.dataset.act]?.(el);
+	if (el) actions[el.dataset.act]?.(el, event);
 });
 addEventListener("hashchange", () => {
 	state.page = location.hash === "#insights" ? "insights" : "context";
@@ -1174,7 +1645,16 @@ addEventListener("hashchange", () => {
 	else render();
 });
 $("request").addEventListener("change", (event) => selectRequest(event.target.value ? Number(event.target.value) : null));
-for (const id of ["order", "filter", "search", "group", "fleet-search"]) $(id).addEventListener("input", render);
+for (const id of ["order", "filter", "search", "group", "fleet-search", "file-filter", "command-filter", "board-search"]) $(id).addEventListener("input", render);
+// The find box of an opened item: the item is drawn again with the matches marked. Enter goes to the next match, with Shift to the one before.
+document.addEventListener("input", (event) => {
+	const i = event.target.dataset.find;
+	if (i != null) setViewer(Number(i), () => ({ find: event.target.value, at: 0 }));
+});
+document.addEventListener("keydown", (event) => {
+	const i = event.target.dataset.find;
+	if (i != null && event.key === "Enter") actions.find({ dataset: { i, by: event.shiftKey ? -1 : 1 } });
+});
 $("base").addEventListener("change", (event) => {
 	state.diff = event.target.value;
 	if (state.request == null) render();

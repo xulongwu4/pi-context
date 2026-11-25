@@ -34,6 +34,9 @@
 		</section>
 		<section class="card" id="current">
 			<h2>Current Context</h2>
+			<div class="controls">
+				<button data-act="treemap" title="One area for each item of the context, grouped by category">Treemap</button>
+			</div>
 			<div class="body"></div>
 		</section>
 		<section class="card tall" id="browser">
@@ -46,6 +49,7 @@
 					<option value="context">By category, in reading order</option>
 					<option value="size">By category, largest first</option>
 					<option value="flat">One list, in reading order</option>
+					<option value="added">Only added and changed items</option>
 				</select>
 				<select id="base" title="What the diff of a request compares with">
 					<option value="request">Diff: request before</option>
@@ -82,11 +86,17 @@
 				<button data-act="files" data-order="ops" title="Most operations first">Operations</button>
 				<button data-act="files" data-order="recent" title="Last used first">Last used</button>
 				<button data-act="files" data-order="name" title="By path">Path</button>
+				<button data-act="files" data-order="lines" title="Most changed lines first">Lines</button>
+				<button data-act="asOf" title="The files as they were after the request that the Context Browser shows">As of the request</button>
+				<input id="file-filter" type="search" placeholder="Filter paths">
 			</div>
 			<div class="body"></div>
 		</section>
 		<section class="card" id="commands">
 			<h2>Command Executions</h2>
+			<div class="controls">
+				<input id="command-filter" type="search" placeholder="Filter commands">
+			</div>
 			<div class="body"></div>
 		</section>
 		<section class="card" id="tools">
@@ -112,6 +122,9 @@
 		</section>
 		<section class="card" id="board">
 			<h2>Tasks Board</h2>
+			<div class="controls">
+				<input id="board-search" type="search" placeholder="Search tasks">
+			</div>
 			<div class="body"></div>
 		</section>
 		<section class="card wide" id="settings">

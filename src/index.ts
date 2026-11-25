@@ -22,6 +22,8 @@ import {
 	estimate,
 	fileOp,
 	LABELS,
+	paramsOf,
+	type Rates,
 	recordedDeclarations,
 	recordedSources,
 	type Row,
@@ -31,6 +33,7 @@ import {
 	sumByCategory,
 	sumTokens,
 	TURN_ENTRY,
+	type ToolDoc,
 	toolSource,
 	type TurnData,
 	type ViewData,
@@ -58,6 +61,7 @@ import { aggregate, branchOf, parseEntries, type SessionSummary, scan, summarize
 import { ContextOverlay, type OverlayHost, type SettingRequest, type Tab } from "./overlay.ts";
 import { droppedOf, PRUNE_ENTRY, prune, prunedOf } from "./prune.ts";
 import { report, SECTIONS } from "./report.ts";
+import { StreamClock } from "./stream.ts";
 import { type Outcome, openBrowser, startWeb, type WebServer } from "./web.ts";
 
 const MAX_SNAPSHOTS = 200;
@@ -127,6 +131,8 @@ export default function (pi: ExtensionAPI) {
 	let pendingMessages: any[] = [];
 	let pendingRows: Row[] = [];
 	let requestStart = 0;
+	/** Times the stream of the reply in progress. */
+	let clock: StreamClock | undefined;
 	/** Tool declarations of the last request, by name with their size. Undefined until one is known. */
 	let declared: Record<string, number> | undefined;
 	/** The declarations last written to the session, as JSON. */
@@ -140,7 +146,7 @@ export default function (pi: ExtensionAPI) {
 	let turnToolMs = 0;
 	let turnPaths: Record<string, string> = {};
 	let turnLines: Record<string, [number, number]> = {};
-	let turnRequest: { time: number; ms: number; sums: Record<Category, number> } | undefined;
+	let turnRequest: Pick<TurnData, "time" | "ms" | "sums" | "ttft" | "spans"> | undefined;
 	let running = false;
 	let warned = false;
 	let overBudget = false;
@@ -239,12 +245,30 @@ export default function (pi: ExtensionAPI) {
 			.flatMap((agent) => family(agent));
 	}
 
-	/** The context window of a model, named "provider/id" or by its id alone. */
-	function windowOf(ctx: ExtensionContext, model?: string): number | undefined {
+	/** A model that pi knows, named "provider/id" or by its id alone. */
+	function modelOf(ctx: ExtensionContext, model?: string) {
 		if (!model) return undefined;
 		const slash = model.indexOf("/");
 		const named = slash > 0 ? ctx.modelRegistry.find(model.slice(0, slash), model.slice(slash + 1)) : undefined;
-		return (named ?? ctx.modelRegistry.getAll().find((each) => each.id === model))?.contextWindow;
+		return named ?? ctx.modelRegistry.getAll().find((each) => each.id === model);
+	}
+
+	const windowOf = (ctx: ExtensionContext, model?: string): number | undefined => modelOf(ctx, model)?.contextWindow;
+
+	/** The prices of the models that made the requests. */
+	function ratesOf(ctx: ExtensionContext, analysis: Analysis): Record<string, Rates> {
+		const rates: Record<string, Rates> = {};
+		for (const { model } of analysis.requests) {
+			if (!model || model in rates) continue;
+			const cost = modelOf(ctx, model)?.cost;
+			if (cost) rates[model] = { input: cost.input, output: cost.output, cacheRead: cost.cacheRead, cacheWrite: cost.cacheWrite };
+		}
+		return rates;
+	}
+
+	function toolDoc(name: string): ToolDoc | undefined {
+		const tool = pi.getAllTools().find((each) => each.name === name);
+		return tool && { description: tool.description, params: paramsOf(tool.parameters) };
 	}
 
 	/** The tokens of the window that pi keeps free: before it compacts, and for the reply of the model. */
@@ -303,6 +327,8 @@ export default function (pi: ExtensionAPI) {
 			timeline: timelineOf(branch, agents),
 			tasks: readTasks(taskFile(ctx.cwd, ctx.sessionManager.getSessionId(), getAgentDir())),
 			parentSession: ctx.sessionManager.getHeader()?.parentSession,
+			rates: ratesOf(ctx, analysis),
+			toolDoc,
 			reconstruct: (request) =>
 				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
 		};
@@ -657,16 +683,21 @@ export default function (pi: ExtensionAPI) {
 	// The payload is the only place that shows which tool declarations the request carries.
 	pi.on("before_provider_request", (event, ctx) => {
 		requestStart = Date.now();
+		clock = new StreamClock(requestStart);
 		const found = declaredTools(event.payload);
 		if (!found) return;
 		declared = found;
 		pendingRows = rowsFor(pendingMessages, ctx);
 	});
 
+	pi.on("message_update", (event) => {
+		clock?.note(event.assistantMessageEvent.type, Date.now());
+	});
+
 	pi.on("message_end", (event) => {
 		const message = event.message;
 		if (message.role !== "assistant" || !requestStart) return;
-		turnRequest = { time: message.timestamp, ms: Date.now() - requestStart, sums: sumByCategory(pendingRows) };
+		turnRequest = { time: message.timestamp, ms: Date.now() - requestStart, sums: sumByCategory(pendingRows), ...clock?.result(Date.now()) };
 		requestStart = 0;
 		snapshots.set(message.timestamp, pendingRows);
 		web?.changed();

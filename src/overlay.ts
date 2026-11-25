@@ -3,6 +3,7 @@ import { matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi }
 import { basename } from "node:path";
 import {
 	type AgentRec,
+	attentionOf,
 	bands,
 	baselineOf,
 	briefOf,
@@ -15,6 +16,7 @@ import {
 	type CommandStatus,
 	callOf,
 	callView,
+	commandShape,
 	commandStatus,
 	diffRows,
 	eventKinds,
@@ -24,10 +26,16 @@ import {
 	type FileOp,
 	type FileOrder,
 	type FileRec,
+	familyTotals,
 	fileRows,
 	injectors,
 	introducedAt,
+	isSlow,
 	LABELS,
+	MARK_KINDS,
+	type MarkKind,
+	placeOf,
+	programRanks,
 	REPLY_KINDS,
 	type ReplyKind,
 	type RequestRec,
@@ -40,13 +48,14 @@ import {
 	sumTokens,
 	TOOL_ORDERS,
 	textOf,
+	tokensPerSecond,
 	toolRows,
 	trendBars,
 	undeclared,
 	type ViewData,
 } from "./analyze.ts";
 import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
-import { type BoardItem, boardOf, type FleetEvent, TASK_STATES, type TaskState } from "./fleet.ts";
+import { agentDetail, type BoardItem, boardOf, chainOf, type FleetEvent, fleetSummary, readiness, TASK_STATES, type TaskState } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
 import { bar, fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens, sparkline } from "./format.ts";
 import { hintTotal } from "./hints.ts";
@@ -91,13 +100,22 @@ const REFRESH_MS = 1000;
 const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Fleet", "Insights"];
 /** Names of the kinds of reply that the Browser tab can list alone. */
 const REPLY_NAMES: Record<ReplyKind, string> = { reasoning: "thinking", toolCalls: "tool calls", answers: "answers" };
-const FILE_ORDER_NAMES: Record<FileOrder, string> = { ops: "most operations first", recent: "last used first", name: "by path" };
-/** Marks of the Trend tab for what happened since the bar before. */
-const TREND_MARKS = [
-	["compaction", "✂"],
-	["drop", "▾"],
-	["restore", "▴"],
-] as const;
+const FILE_ORDER_NAMES: Record<FileOrder, string> = { ops: "most operations first", recent: "last used first", name: "by path", lines: "most changed lines first" };
+/** Marks of the Trend tab with their names in the legend: what happened since the bar before, and what sets the bar apart. */
+const TREND_MARKS: Record<MarkKind, [mark: string, name: string]> = {
+	compaction: ["✂", "compaction"],
+	drop: ["▾", "drop"],
+	restore: ["▴", "restore"],
+	"task done": ["✓", "task done"],
+	task: ["□", "task created"],
+	question: ["?", "question"],
+	longest: ["◷", "took longest"],
+	growth: ["↑", "largest growth"],
+	delegation: ["→", "delegation"],
+	agent: ["←", "subagent message"],
+	skill: ["◆", "skill loaded"],
+	model: ["⇄", "model change"],
+};
 /** Views of the Fleet tab. */
 const FLEET_VIEWS = ["Agents", "Timeline", "Tasks"] as const;
 const TASK_STATE_NAMES: Record<TaskState, string> = { in_progress: "in progress", pending: "pending", done: "done" };
@@ -149,7 +167,7 @@ export interface SettingRequest {
 	clear: boolean;
 }
 
-/** An entry of the list in the Insights or Fleet tab. */
+/** An entry of the list in the Tools, Fleet or Insights tab. */
 interface Entry {
 	/** Body line of the entry. */
 	line: number;
@@ -178,6 +196,9 @@ export function ago(time: number, now = Date.now()): string {
 	return `${Math.floor(minutes / 1440)}d ago`;
 }
 
+/** A duration. One under ten seconds shows tenths of a second. */
+const fmtShort = (ms: number) => (ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : fmtDuration(ms));
+
 function pad(line: string, width: number): string {
 	const cut = truncateToWidth(line, width);
 	return cut + " ".repeat(Math.max(0, width - visibleWidth(cut)));
@@ -203,8 +224,10 @@ export class ContextOverlay {
 	private request: number;
 	/** Selected entry of the list that the tab shows. */
 	private item = 0;
-	/** The entries of the list in the Insights or Fleet tab, as of the last render. */
+	/** The entries of the list in the Tools, Fleet or Insights tab, as of the last render. */
 	private picks: Entry[] = [];
+	/** The selection of such a list moved: the Fleet tab must bring the detail of the selected agent into view. */
+	private moved = false;
 	/** Entries of the list in the Hints tab, as of the last render. */
 	private hintList: { ids: string[]; dropped: boolean }[] = [];
 	/** Text that the lists of the tab must contain. */
@@ -365,7 +388,7 @@ export class ContextOverlay {
 				else if (command) this.notice = "The user ran this command: it has no tool result.";
 			}
 			else if (this.name === "Current" || this.name === "Browser") this.openItem();
-			else if (this.name === "Fleet" && this.fleetView > 0) this.openEntry();
+			else if (this.name === "Tools" || (this.name === "Fleet" && this.fleetView > 0)) this.openEntry();
 			else if (this.name === "Insights" || this.name === "Fleet") this.openSession();
 			else if (this.name === "Settings") {
 				this.close({ setting: SETTINGS[this.item], clear: false });
@@ -475,7 +498,7 @@ export class ContextOverlay {
 			Events: "↑/↓ scroll  k kind",
 			Files: this.opened ? "↑/↓ select  enter result  esc files" : "↑/↓ select  enter operations  / filter  k kind  s order",
 			Commands: "↑/↓ select  enter result  / filter  k status  f next failed  s slowest",
-			Tools: "↑/↓ scroll  / filter  s sort",
+			Tools: "↑/↓ select  enter description  / filter  s sort",
 			Fleet: [
 				"↑/↓ select  enter open  v timeline",
 				`↑/↓ select  enter inspect  o ${this.latestFirst ? "earliest" : "latest"} first  / filter  v tasks`,
@@ -531,6 +554,7 @@ export class ContextOverlay {
 		this.scroll = 0;
 		this.item = 0;
 		this.picks = [];
+		this.moved = false;
 		this.opened = undefined;
 		this.filterText = "";
 		// A tab that selects an item of the Browser tab must find it in the list.
@@ -635,7 +659,7 @@ export class ContextOverlay {
 			t.fg(
 				"dim",
 				chosen
-					? `  [] ${chosen.day}: ${chosen.requests} requests, ${fmtTokens(chosen.tokens)} tokens, ${fmtCost(chosen.cost)}. [ ] change the day; ] on today shows the whole period.`
+					? `  [] ${chosen.day}: ${chosen.sessions} sessions, ${chosen.requests} requests, ${fmtTokens(chosen.tokens)} tokens, ${fmtCost(chosen.cost)}. [ ] change the day; ] on today shows the whole period.`
 					: `  Shaded by the tokens of the day. [ selects today, then [ ] change the day.${hidden > 0 ? ` ${hidden} earlier weeks do not fit.` : ""}`,
 			),
 		];
@@ -678,7 +702,7 @@ export class ContextOverlay {
 			this.selectRequest(bars[next]?.index ?? 0);
 		}
 		else if (listed.includes(this.name)) this.item = Math.max(0, this.item + delta);
-		else if (this.name === "Insights" || this.name === "Fleet") this.pick(delta);
+		else if (this.name === "Tools" || this.name === "Fleet" || this.name === "Insights") this.pick(delta);
 		else this.scroll = Math.max(0, this.scroll + delta);
 	}
 
@@ -695,6 +719,7 @@ export class ContextOverlay {
 			return;
 		}
 		this.item = next;
+		this.moved = true;
 		const line = this.picks[next].line;
 		if (line < this.scroll) this.scroll = line;
 		else if (line >= this.scroll + height) this.scroll = line - height + 1;
@@ -740,7 +765,7 @@ export class ContextOverlay {
 		this.toResult = id;
 	}
 
-	/** The selected entry of the Insights or Fleet tab. An entry that the user cannot see comes into view instead. */
+	/** The selected entry of the Tools, Fleet or Insights tab. An entry that the user cannot see comes into view instead. */
 	private picked(): Entry | undefined {
 		const pick = this.picks[this.item];
 		if (!pick) return undefined;
@@ -754,7 +779,7 @@ export class ContextOverlay {
 		return pick;
 	}
 
-	/** Shows the content of the selected event or task of the Fleet tab in the inspector. */
+	/** Shows the content of the selected tool of the Tools tab, or of the selected event or task of the Fleet tab, in the inspector. */
 	private openEntry(): void {
 		const pick = this.picked();
 		if (!pick) return;
@@ -930,7 +955,7 @@ export class ContextOverlay {
 			case "Tools":
 				return { lines: this.tools() };
 			case "Fleet":
-				return { lines: this.fleet() };
+				return this.fleet();
 			case "Insights":
 				return { lines: this.insightsTab() };
 			case "Settings":
@@ -939,13 +964,35 @@ export class ContextOverlay {
 	}
 
 	private stats(): string[] {
-		const { analysis, usage, model } = this.data;
+		const { analysis, usage, model, agents, rates } = this.data;
 		const timing = analysis.timing;
 		const totals = analysis.totals;
+		const pair = (key: string, value: string) => `${this.theme.fg("muted", key)} ${value}`;
+		const family = familyTotals(totals, agents);
+		const sized = (sum: { tokens: number; cost: number }) => `${fmtTokens(sum.tokens)} tokens, ${fmtCost(sum.cost)}`;
+		const speed = tokensPerSecond(timing);
+		const spanMs = REPLY_KINDS.reduce((sum, kind) => sum + timing.spans[kind][0], 0);
+		const stream = timing.streamed
+			? this.wrap([
+					pair("First token", `after ${fmtShort(timing.ttftMs / timing.streamed)} on average (${timing.streamed} requests timed)`),
+					...(speed === undefined ? [] : [pair("Output", `${speed < 10 ? speed.toFixed(1) : Math.round(speed)} tokens per second`)]),
+					...REPLY_KINDS.filter((kind) => timing.spans[kind][0] > 0).map((kind) =>
+						pair(`Stream, ${REPLY_NAMES[kind]}`, `${fmtDuration(timing.spans[kind][0])} (${fmtPercent(timing.spans[kind][0], spanMs)})`),
+					),
+				])
+			: [];
+		const cell = (value: string | number, width: number) => String(value).padStart(width);
+		const models = [...analysis.models].sort((a, b) => b.cost - a.cost || b.sent - a.sent);
+		const price = (rate: number) => `$${+rate.toFixed(4)}`;
+		const priced = models.flatMap((m) => {
+			const rate = rates?.[m.model];
+			return rate
+				? [`  ${cell(price(rate.input), 8)} ${cell(price(rate.output), 8)} ${cell(price(rate.cacheRead), 10)} ${cell(price(rate.cacheWrite), 11)}  ${m.model}`]
+				: [];
+		});
 		const cache = cacheStats(analysis);
 		const overhead = Math.max(0, timing.activeMs - timing.modelMs - timing.toolMs);
 		const share = (ms: number) => `${fmtDuration(ms)} (${fmtPercent(ms, timing.activeMs)})`;
-		const cell = (value: string | number, width: number) => String(value).padStart(width);
 		const window = !usage
 			? "  unknown"
 			: usage.contextWindow > 0
@@ -973,6 +1020,13 @@ export class ContextOverlay {
 				["Tool calls", `${analysis.toolCalls} (${analysis.toolErrors} errors)`],
 				["Cost", fmtCost(totals.cost)],
 			]),
+			...(agents.length
+				? this.wrap([
+						pair(`With ${agents.length} ${agents.length === 1 ? "subagent" : "subagents"}`, sized(family)),
+						pair("Session alone", sized(family.own)),
+						pair("Subagents", sized(family.agents)),
+					])
+				: []),
 			"",
 			this.head("Tokens (provider-reported)"),
 			this.pairs([
@@ -992,12 +1046,15 @@ export class ContextOverlay {
 			"",
 			this.head("Models"),
 			this.theme.fg("muted", `  ${cell("requests", 8)} ${cell("sent", 8)} ${cell("output", 8)} ${cell("cost", 10)}  model`),
-			...[...analysis.models]
-				.sort((a, b) => b.cost - a.cost || b.sent - a.sent)
-				.map(
-					(m) =>
-						`  ${cell(m.requests, 8)} ${cell(fmtTokens(m.sent), 8)} ${cell(fmtTokens(m.output), 8)} ${cell(fmtCost(m.cost), 10)}  ${m.model}`,
-				),
+			...models.map(
+				(m) => `  ${cell(m.requests, 8)} ${cell(fmtTokens(m.sent), 8)} ${cell(fmtTokens(m.output), 8)} ${cell(fmtCost(m.cost), 10)}  ${m.model}`,
+			),
+			...(priced.length
+				? [
+						this.theme.fg("muted", `  ${cell("input", 8)} ${cell("output", 8)} ${cell("cache read", 10)} ${cell("cache write", 11)}  model, price per million tokens`),
+						...priced,
+					]
+				: []),
 			"",
 			this.head("Timing (turns recorded by pi-context)"),
 			this.pairs([
@@ -1006,6 +1063,7 @@ export class ContextOverlay {
 				["Tool runs", share(timing.toolMs)],
 				["Overhead", share(overhead)],
 			]),
+			...stream,
 		];
 	}
 
@@ -1189,10 +1247,12 @@ export class ContextOverlay {
 			[3, 8, 5, 5, 7, 7, 9, 7].map((width, i) => (i === 1 ? String(cells[i]).padEnd(width) : String(cells[i]).padStart(width))).join(" ");
 		const top = [
 			this.head("Human inputs, newest first, and the work each one caused"),
+			...(inputs.some((input) => input.waitMs) ? [t.fg("dim", "  waited: the part of took that the input waited for the user's answers to questions.")] : []),
 			t.fg("muted", `   ${cells(["#", "time", "reqs", "tools", "sent", "output", "cost", "took"])}  input`),
 		];
 		const lines = inputs.map((input, i) => {
-			const line = `${cells([input.n, fmtTime(input.time), input.requests, input.toolCalls, fmtTokens(input.sent), fmtTokens(input.output), fmtCost(input.cost), fmtDuration(input.ms)])}  ${t.fg("dim", input.preview)}`;
+			const waited = input.waitMs ? `${t.fg("muted", `waited ${fmtDuration(input.waitMs)}`)}  ` : "";
+			const line = `${cells([input.n, fmtTime(input.time), input.requests, input.toolCalls, fmtTokens(input.sent), fmtTokens(input.output), fmtCost(input.cost), fmtDuration(input.ms)])}  ${waited}${t.fg("dim", input.preview)}`;
 			return i === this.item ? `${t.fg("accent", "▶")}  ${line}` : `   ${line}`;
 		});
 		return { lines: [...top, ...lines], cursor: this.item === 0 ? 0 : top.length + this.item };
@@ -1212,11 +1272,18 @@ export class ContextOverlay {
 		const what = this.byTurn ? "the last request of each human input" : "each request";
 		// The whole session in one line, with a mark under the selected bar.
 		const line = sparkline(bars.map((bar) => requests[bar.index].context), Math.max(1, this.width - 2));
+		// Only the kinds of marks that occur take room, in the legend and in the rows.
+		const present = MARK_KINDS.filter((kind) => bars.some((bar) => bar.marks?.includes(kind)));
+		const wide = Math.max(0, ...bars.map((bar) => bar.marks?.length ?? 0));
 		const lines = [
 			this.head(this.delta ? `Change of the tokens sent, from one bar to the next: ${what}` : `Tokens sent by ${what} (provider-reported)`),
 			`  ${t.fg("muted", line)}`,
 			`  ${" ".repeat(Math.floor((selected * line.length) / bars.length))}${t.fg("accent", "▲")}`,
-			t.fg("dim", `  took: the recorded duration.   ${TREND_MARKS.map(([kind, mark]) => `${mark} ${kind}`).join("   ")}, since the bar before.`),
+			...this.wrap([
+				"took: the recorded duration.",
+				...(present.length ? ["Marks, since the bar before:"] : []),
+				...present.map((kind) => TREND_MARKS[kind].join(" ")),
+			]).map((legend) => t.fg("dim", legend)),
 		];
 		const above = lines.length;
 		/** Lines under the selected bar. */
@@ -1240,13 +1307,21 @@ export class ContextOverlay {
 				? `reqs ${String(input.requests).padStart(3)}  out ${fmtTokens(input.output).padStart(6)}  ${fmtCost(input.cost)}  ${paint("dim", input.preview)}`
 				: `out ${fmtTokens(r.output).padStart(6)}  cache ${fmtPercent(r.cacheRead, r.context).padStart(4)}  ${fmtCost(r.cost)}${miss}${stop}`;
 			const took = entry.ms === undefined ? " ".repeat(11) : `took ${fmtDuration(entry.ms).padStart(6)}`;
-			const marks = paint("warning", TREND_MARKS.map(([kind, mark]) => (entry.marks?.includes(kind) ? mark : " ")).join(""));
+			const marks = paint(
+				"warning",
+				MARK_KINDS.filter((kind) => entry.marks?.includes(kind))
+					.map((kind) => TREND_MARKS[kind][0])
+					.join("")
+					.padEnd(wide),
+			);
 			const row = `#${String(entry.n).padStart(3)} ${fmtTime(input?.time ?? r.time)} ${size} ${marks} ${took}  ${figures}`;
 			lines.push(on ? t.fg("accent", `▶ ${row}`) : `  ${row}`);
 			if (!on) return;
 			const from = lines.length;
 			const brief = briefOf(this.data.analysis, entry.index, this.byTurn);
 			if (brief) lines.push(...BRIEF.map(([name, key]) => `      ${t.fg("muted", name.padEnd(6))}${brief[key]}`));
+			const where = this.byTurn ? [] : this.placePairs(entry.index);
+			if (where.length) lines.push(`    ${this.pairs(where)}`);
 			lines.push(
 				`      ${t.fg("muted", "Usage ")}input ${fmtTokens(r.input)}  cache read ${fmtTokens(r.cacheRead)}  cache write ${fmtTokens(r.cacheWrite)}  output ${fmtTokens(r.output)}  ${t.fg("dim", "(provider-reported)")}`,
 			);
@@ -1260,6 +1335,16 @@ export class ContextOverlay {
 			below = lines.length - from;
 		});
 		return { lines, cursor: selected === 0 ? 0 : above + selected, span: below };
+	}
+
+	/** The human input a request belongs to with its place in it, and its time to the first token, as far as they are known. */
+	private placePairs(index: number): [string, string][] {
+		const place = placeOf(this.data.analysis, index);
+		const ttft = this.data.analysis.requests[index]?.ttft;
+		return [
+			...(place ? [["Place", `input ${place.input}, step ${place.step} of ${place.steps}`] as [string, string]] : []),
+			...(ttft === undefined ? [] : [["First token", `after ${fmtShort(ttft)}`] as [string, string]]),
+		];
 	}
 
 	private browser(): Body {
@@ -1276,6 +1361,8 @@ export class ContextOverlay {
 				["Took", request.ms == null ? "?" : fmtDuration(request.ms)],
 			]),
 		];
+		const where = this.placePairs(this.request);
+		if (where.length) top.push(this.pairs(where));
 		if (request.miss) top.push(this.theme.fg("warning", `  Cache miss: ${this.missText(request.miss)}.`));
 		const rows = request.rows ?? this.rebuiltRows(request);
 		if (rows.length === 0 && !request.sums) {
@@ -1336,7 +1423,7 @@ export class ContextOverlay {
 	private events(): string[] {
 		const t = this.theme;
 		const events = this.data.analysis.events;
-		if (events.length === 0) return ["No injection, compaction, drop, model or branch events on this branch."];
+		if (events.length === 0) return ["No injection, compaction, drop, model, branch, question, delegation or task events on this branch."];
 		const kinds = eventKinds(events);
 		if (!kinds.some(([kind]) => kind === this.kind)) this.kind = "";
 		const shown = events.filter((e) => !this.kind || e.kind === this.kind);
@@ -1356,7 +1443,7 @@ export class ContextOverlay {
 				? ["", this.head("Injected by"), ...by.map((sum) => `  ${sum.producer.padEnd(name)}  ${`${sum.count}×`.padStart(5)}  ≈${fmtTokens(sum.tokens).padStart(6)}`)]
 				: []),
 			"",
-			...shown.map((e) => `  ${fmtTime(e.time)}  ${t.fg("muted", where(e).padEnd(width))}  ${t.fg("accent", e.kind.padEnd(14))} ${change(e.delta, 8)}  ${e.detail}`),
+			...shown.map((e) => `  ${fmtTime(e.time)}  ${t.fg("muted", where(e).padEnd(width))}  ${t.fg("accent", e.kind.padEnd(14))} ${change(e.delta, 8)}  ${e.detail}${e.replaced === undefined ? "" : `, ${e.replaced} messages replaced`}`),
 		];
 	}
 
@@ -1375,6 +1462,9 @@ export class ContextOverlay {
 			this.ops = [...file.ops].reverse();
 			this.item = Math.min(this.item, this.ops.length - 1);
 			const names = { reads: "read", writes: "write", edits: "edit", searches: "search", images: "image" };
+			// A partial read: its first line, and the number of lines, where 0 is no limit.
+			const range = ([first, count]: [number, number]) =>
+				t.fg("dim", `  ${count === 0 ? `from line ${first}` : count === 1 ? `line ${first}` : `lines ${first}-${first + count - 1}`}`);
 			return select(
 				[
 					this.head(file.path),
@@ -1391,7 +1481,7 @@ export class ContextOverlay {
 				],
 				this.ops.map(
 					(op) =>
-						`${fmtTime(op.time)}  ${`#${op.request}`.padEnd(7)}  ${names[op.op].padEnd(6)}  ${op.hits === undefined ? changed(op.added, op.removed) : `${op.hits} ${op.hits === 1 ? "hit" : "hits"}`.padStart(16)}  ${op.tool}${op.error ? t.fg("error", "  failed") : ""}`,
+						`${fmtTime(op.time)}  ${`#${op.request}`.padEnd(7)}  ${names[op.op].padEnd(6)}  ${op.hits === undefined ? changed(op.added, op.removed) : `${op.hits} ${op.hits === 1 ? "hit" : "hits"}`.padStart(16)}  ${op.tool}${op.range ? range(op.range) : ""}${op.error ? t.fg("error", "  failed") : ""}`,
 				),
 			);
 		}
@@ -1426,15 +1516,24 @@ export class ContextOverlay {
 		const t = this.theme;
 		const commands = this.data.analysis.commands;
 		if (commands.length === 0) return { lines: ["No commands yet."] };
-		const counts = new Map<string, number>();
-		for (const c of commands) counts.set(c.program, (counts.get(c.program) ?? 0) + 1);
-		const programs = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 10);
+		const programs = programRanks(commands)
+			.slice(0, 10)
+			.map(({ program, uses, runs }) => `${program} ×${uses}${runs < uses ? t.fg("dim", ` in ${runs} ${runs === 1 ? "command" : "commands"}`) : ""}`);
+		const attention = attentionOf(commands);
+		const slowest = attention.slowest === undefined ? undefined : commands[attention.slowest];
+		const brief = (command: string) => truncateToWidth(command.replace(/\s+/g, " "), 40);
+		const notes = [
+			...(slowest ? [`${t.fg("muted", "Slowest")} ${fmtShort(slowest.ms ?? 0)}  ${brief(slowest.command)}`] : []),
+			...(attention.failing ? [`${t.fg("muted", "Fails most")} ${attention.failing.program} ×${attention.failing.count}`] : []),
+			...(attention.repeated ? [`${t.fg("muted", "Repeated most")} ×${attention.repeated.count}  ${brief(attention.repeated.command)}`] : []),
+		];
 		const mark = (ok?: boolean) => (ok === undefined ? t.fg("dim", "…") : ok ? t.fg("success", "✓") : t.fg("error", "✗"));
 		const timed = commands.filter((c) => c.ms !== undefined);
 		// Newest first.
 		this.commandList = commands.filter((c) => (!this.status || commandStatus(c) === this.status) && this.matches(c.command)).reverse();
 		this.item = Math.max(0, Math.min(this.item, this.commandList.length - 1));
 		const top = [
+			...(notes.length ? [this.head("Attention"), ...this.wrap(notes), ""] : []),
 			this.pairs([
 				["Commands", commands.length],
 				["Failed", commands.filter((c) => c.ok === false).length],
@@ -1446,16 +1545,19 @@ export class ContextOverlay {
 			]),
 			"",
 			this.head("Programs"),
-			`  ${programs.map(([name, n]) => `${name} ×${n}`).join("   ")}`,
+			...this.wrap(programs),
 			"",
 			this.head("Executions (newest first)"),
+			...(commands.some(isSlow) ? [t.fg("dim", "  A highlighted time is 10 seconds or more.")] : []),
 			t.fg("muted", `    ${"time".padEnd(8)}  ${"request".padEnd(7)}  ${"took".padStart(6)}  command`),
 		];
 		const lines = this.commandList.map((c, i) => {
 			const request = (c.id ? `#${c.request}` : "user").padEnd(7);
-			// A short command shows tenths of a second.
-			const took = (c.ms === undefined ? "" : c.ms < 10_000 ? `${(c.ms / 1000).toFixed(1)}s` : fmtDuration(c.ms)).padStart(6);
-			return `${i === this.item ? t.fg("accent", "▶") : " "} ${mark(c.ok)} ${fmtTime(c.time)}  ${t.fg("muted", request)}  ${took}  ${c.command.replace(/\s+/g, " ")}`;
+			const took = (c.ms === undefined ? "" : fmtShort(c.ms)).padStart(6);
+			const shape = commandShape(c.command);
+			const tags = [...(shape.lines > 1 ? [`${shape.lines} lines`] : []), ...(shape.heredoc ? ["heredoc"] : []), ...(shape.inline ? ["inline script"] : [])];
+			const tag = tags.length ? `${t.fg("muted", `[${tags.join(", ")}]`)} ` : "";
+			return `${i === this.item ? t.fg("accent", "▶") : " "} ${mark(c.ok)} ${fmtTime(c.time)}  ${t.fg("muted", request)}  ${isSlow(c) ? t.fg("warning", took) : took}  ${tag}${c.command.replace(/\s+/g, " ")}`;
 		});
 		if (lines.length === 0) lines.push("  No command matches the filter.");
 		return { lines: [...top, ...lines], cursor: this.item === 0 ? 0 : top.length + this.item };
@@ -1477,11 +1579,23 @@ export class ContextOverlay {
 			return calls ? this.theme.fg("warning", `${tool.name}  ! ${calls} not declared`) : tool.name;
 		};
 		const groups = schemaSources(schemas, sources);
+		// What pi knows about the tool now, as the text of the inspector.
+		const doc = (name: string) => {
+			const doc = this.data.toolDoc?.(name);
+			if (!doc) return undefined;
+			return [
+				...(doc.description ? [doc.description, ""] : []),
+				...(doc.params.length ? ["Parameters:"] : []),
+				...doc.params.map((param) => `  ${param.name}: ${param.type}${param.required ? ", required" : ""}${param.description ? `\n      ${param.description}` : ""}`),
+			].join("\n");
+		};
+		this.item = Math.min(this.item, Math.max(0, tools.length - 1));
+		this.picks = tools.map((tool, i) => ({ line: 1 + i, title: `Tool · ${tool.name}`, text: doc(tool.name) }));
 		const lines = [
 			this.head(`${"calls".padStart(9)}${"nested".padStart(8)}${"errors".padStart(8)}${"call".padStart(10)}${"result".padStart(10)}${"schema".padStart(10)}  ${"source".padEnd(wide)}  tool`),
 			...tools.map(
-				(tool) =>
-					`  ${count(tool.calls)} ${count(tool.nested)} ${tool.errors ? this.theme.fg("error", count(tool.errors)) : count(0)} ${size(tool.callTokens)} ${size(tool.resultTokens)} ${size(tool.schema)}  ${this.theme.fg("muted", tool.source.padEnd(wide))}  ${name(tool)}`,
+				(tool, i) =>
+					`${i === this.item ? this.theme.fg("accent", "▶") : " "} ${count(tool.calls)} ${count(tool.nested)} ${tool.errors ? this.theme.fg("error", count(tool.errors)) : count(0)} ${size(tool.callTokens)} ${size(tool.resultTokens)} ${size(tool.schema)}  ${this.theme.fg("muted", tool.source.padEnd(wide))}  ${name(tool)}`,
 			),
 			...(flagged ? [this.theme.fg("warning", "  ! Direct calls that the model made while the tool was not declared to it.")] : []),
 			this.theme.fg("dim", `  Sorted by ${order === "calls" ? "calls" : order === "schema" ? "the size of the schema" : "name"}. Session totals; token figures are estimates.`),
@@ -1532,10 +1646,20 @@ export class ContextOverlay {
 			...this.wrap(details, `${indent}  `),
 		];
 		if (agent.error) lines.push(`${indent}  ${t.fg("error", agent.error.replace(/\s+/g, " "))}`);
+		if (!selected) return lines;
+		const { timeline, tasks, agents } = this.data;
+		const more = agentDetail(agent, timeline, boardOf(tasks, agents));
+		const flat = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, this.width);
+		// The key stands on the first line of its values.
+		const row = (key: string, value: string) => lines.push(`${indent}  ${t.fg("muted", key.padEnd(7))}${value}`);
+		if (more.prompt) row("Prompt", flat(more.prompt));
+		if (more.reply && more.reply !== agent.error) row("Reply", flat(more.reply));
+		more.tasks.forEach((task, i) => row(i ? "" : "Tasks", `#${task.id} ${flat(task.subject)}  ${t.fg("dim", task.status)}`));
+		more.events.forEach((event, i) => row(i ? "" : "Events", `${fmtDay(event.time).slice(5)} ${fmtTime(event.time)}  ${event.kind}  ${flat(event.title)}`));
 		return lines;
 	}
 
-	private fleet(): string[] {
+	private fleet(): Body {
 		const { analysis, agents, usage, model, running, parentSession, timeline, tasks } = this.data;
 		const t = this.theme;
 		const context =
@@ -1551,9 +1675,22 @@ export class ContextOverlay {
 		];
 		if (parentSession) lines.push(`  ${this.pairs([["Parent session", parentSession]])}`);
 		const view = FLEET_VIEWS[this.fleetView];
-		const counts = { Agents: agents.length, Timeline: timeline.length, Tasks: boardOf(tasks, agents).reduce((sum, group) => sum + group.items.length, 0) };
-		lines.push("", ...this.wrap(FLEET_VIEWS.map((name) => this.chip(name, counts[name], name === view))));
+		const summary = fleetSummary(agents, timeline, boardOf(tasks, agents));
+		const counts = { Agents: agents.length, Timeline: timeline.length, Tasks: summary.items };
+		lines.push("");
+		if (summary.agents + summary.items + summary.messages > 0) {
+			lines.push(
+				this.pairs([
+					["Subagents", `${summary.agents} (${summary.running} running)`],
+					["Tasks and delegations", summary.items],
+					["Messages", summary.messages],
+				]),
+			);
+		}
+		lines.push(...this.wrap(FLEET_VIEWS.map((name) => this.chip(name, counts[name], name === view))));
 		this.picks = [];
+		/** Lines of the selected agent after its first. */
+		let span = 0;
 		if (view === "Timeline") this.timeline(lines);
 		else if (view === "Tasks") this.board(lines);
 		else {
@@ -1562,10 +1699,15 @@ export class ContextOverlay {
 			this.item = Math.min(this.item, Math.max(0, agents.length - 1));
 			agents.forEach((agent, i) => {
 				this.picks.push({ line: lines.length, file: agent.sessionFile, title: `${agent.type}: ${agent.description}` });
-				lines.push(...this.agentLines(agent, i === this.item));
+				const block = this.agentLines(agent, i === this.item);
+				if (i === this.item) span = block.length - 1;
+				lines.push(...block);
 			});
 		}
-		return lines;
+		// After a move, the selected entry comes into view whole. Otherwise the tab scrolls freely.
+		const pick = this.moved ? this.picks[this.item] : undefined;
+		this.moved = false;
+		return { lines, cursor: pick?.line, span };
 	}
 
 	/** The timeline view of the Fleet tab: adds the events that pass the filter. An event opens into its content. */
@@ -1604,6 +1746,12 @@ export class ContextOverlay {
 						? t.fg("success", "✓")
 						: t.fg("error", "✗");
 		const ids = (list: string[]) => list.map((id) => `#${id}`).join(", ");
+		// The tasks that a task waits for, with the blockers of its blockers. A delegation waits for none.
+		const chain = (item: BoardItem) =>
+			(item.agent ? [] : chainOf(tasks, item.id)).map((id) => {
+				const task = tasks.find((task) => task.id === id);
+				return `  #${id}${task ? ` ${task.subject.replace(/\s+/g, " ")} (${task.status})` : ""}`;
+			});
 		lines.push(
 			"",
 			...this.wrap([
@@ -1618,12 +1766,17 @@ export class ContextOverlay {
 				const text = [
 					`Status: ${item.status}`,
 					...(item.blockedBy.length ? [`Blocked by: ${ids(item.blockedBy)}`] : []),
+					...(chain(item).length ? ["Depends on, nearest first:", ...chain(item)] : []),
 					...(item.description ? [`\nDescription:\n${item.description}`] : []),
 					...(item.reply ? [`\nReply:\n${item.reply}`] : []),
 				].join("\n");
 				const selected = this.picks.length === this.item;
 				this.picks.push({ line: lines.length, title: `${owner} · ${item.subject.replace(/\s+/g, " ")}`, text });
-				const blocked = item.blockedBy.length ? `  ${t.fg("warning", `blocked by ${ids(item.blockedBy)}`)}` : "";
+				const blocked = item.blockedBy.length
+					? `  ${t.fg("warning", `blocked by ${ids(item.blockedBy)}`)}`
+					: readiness(item) === "ready"
+						? `  ${t.fg("success", "ready")}`
+						: "";
 				// A delegation has the id of its agent, which is long.
 				const subject = `${item.agent ? "" : `#${item.id} `}${item.subject.replace(/\s+/g, " ")}`;
 				lines.push(`${selected ? t.fg("accent", "▶") : " "} ${mark(item)} ${subject}  ${t.fg("muted", item.status)}${blocked}${item.agent ? `  ${t.fg("dim", item.id)}` : ""}`);
@@ -1647,13 +1800,15 @@ export class ContextOverlay {
 		const span = s.day ? `${s.day} (${WEEKDAYS[(new Date(year, month - 1, date).getDay() + 6) % 7]}) of ${period.toLowerCase()}` : period;
 		const recorded = s.composition.requests;
 		const uses = this.uses;
-		// The entry that narrows the list of sessions is marked. The time tells the last use.
+		// The entry that narrows the list of sessions is marked. After it: the sessions that used it, the last use, and the source of a skill.
 		const top = (kind: NonNullable<InsightsFilter["uses"]>["kind"]) =>
 			this.wrap(
-				s[kind].map(([name, n, last]) => {
+				s[kind].map(([name, n, last, sessions]) => {
 					const text = `${name} ×${n}`;
 					const on = uses?.kind === kind && uses.name === name;
-					return `${on ? t.bold(t.fg("accent", `[${text}]`)) : text}${last ? ` ${t.fg("dim", ago(last))}` : ""}`;
+					const source = kind === "skills" ? s.skillInfo[name]?.[1] : undefined;
+					const notes = [`in ${sessions} ${sessions === 1 ? "session" : "sessions"}`, ...(last ? [ago(last)] : []), ...(source ? [source] : [])];
+					return `${on ? t.bold(t.fg("accent", `[${text}]`)) : text} ${t.fg("dim", notes.join(", "))}`;
 				}),
 			);
 		const used = uses ? `, sessions that used the ${uses.kind.slice(0, -1)} ${uses.name}` : "";
@@ -1683,7 +1838,7 @@ export class ContextOverlay {
 			this.head("Last 7 days"),
 			...s.week.map(
 				(day) =>
-					`  ${day.day.slice(5)} ${t.fg("accent", bar(day.tokens / max, 24))} ${fmtTokens(day.tokens).padStart(7)}  ${fmtCost(day.cost).padStart(9)}  ${day.requests} requests`,
+					`  ${day.day.slice(5)} ${t.fg("accent", bar(day.tokens / max, 24))} ${fmtTokens(day.tokens).padStart(7)}  ${fmtCost(day.cost).padStart(9)}  ${String(day.requests).padStart(5)} requests  ${day.sessions} sessions`,
 			),
 			"",
 			this.head("Requests by weekday and hour"),
@@ -1716,7 +1871,8 @@ export class ContextOverlay {
 			...top("programs"),
 			this.head("Top skills"),
 			...top("skills"),
-			t.fg("dim", "  The time is the last use. t, c, k: list only the sessions that used the next tool, program or skill. x: all sessions."),
+			t.fg("dim", "  After the uses: the sessions that used it, the last use, and for a skill where it comes from."),
+			t.fg("dim", "  t, c, k: list only the sessions that used the next tool, program or skill. x: all sessions."),
 			"",
 			this.head(`Sessions (${SORTS[this.sort][1]}${this.grouped ? ", by project" : ""}${used.replace(", sessions", ",")})`),
 			t.fg("dim", "  ctx: the tokens that the last request of the session sent. The bar shows the estimated composition of that request:"),

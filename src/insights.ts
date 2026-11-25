@@ -5,13 +5,20 @@ import { fmtDay } from "./format.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 const TOP = 10;
 /** Days that the list of days covers at most: 53 weeks. */
 const MAX_DAYS = 371;
 /** Cached summaries of files older than this are dropped. */
 const KEEP_DAYS = 120;
 
+export type SkillSource = "project" | "package" | "user";
+
+/** Where a skill comes from: the project that the session ran in, an installed package, or the user's own skills. */
+export function skillSource(path: string, cwd: string): SkillSource {
+	if (cwd && path.startsWith(`${cwd}/`)) return "project";
+	return /\/(node_modules|git)\//.test(path) ? "package" : "user";
+}
 /** What Insights keeps of one session file. */
 export interface SessionSummary {
 	id: string;
@@ -45,6 +52,10 @@ export interface SessionSummary {
 	context: number;
 	/** Estimated tokens of the last recorded request, in the order of CATEGORIES. */
 	profile?: number[];
+	/** Start of the last human input. */
+	lastUser: string;
+	/** Skill to its path and where it comes from. */
+	skillInfo: Record<string, [path: string, source: SkillSource]>;
 	/** Time of the last use of each tool, program and skill. */
 	lastUsed: Record<"tools" | "programs" | "skills", Record<string, number>>;
 	/** Path of the session file. `scan` sets it; it is not cached. */
@@ -56,6 +67,8 @@ export interface DayStat {
 	requests: number;
 	tokens: number;
 	cost: number;
+	/** Sessions with a request on the day. */
+	sessions: number;
 }
 
 export type SessionSort = "recent" | "cost" | "tokens" | "context";
@@ -67,6 +80,8 @@ export interface InsightsFilter {
 	sort?: SessionSort;
 	/** Count only this day of the period, as `fmtDay` writes it. `daily`, `week` and `activeDays` still cover the period. */
 	day?: string;
+	/** With `day`: count the days from `day` to this day, both included. */
+	until?: string;
 	/** List only the sessions that used this tool, program or skill. The figures still cover all sessions. */
 	uses?: { kind: "tools" | "programs" | "skills"; name: string };
 }
@@ -74,8 +89,9 @@ export interface InsightsFilter {
 export interface Insights {
 	/** Length of the period in days. Infinite when the period has no start. */
 	days: number;
-	/** The day that the figures are narrowed to. */
+	/** The day that the figures are narrowed to, or with `until` the first and the last day. */
 	day?: string;
+	until?: string;
 	/** Sessions with a request in the period. */
 	sessions: SessionSummary[];
 	requests: number;
@@ -100,10 +116,12 @@ export interface Insights {
 	models: [string, number, number, number][];
 	/** Working directory, sessions, requests, tokens and cost in the period; the most expensive first. */
 	projects: [string, number, number, number, number][];
-	/** Name, uses in the sessions of the period, and the time of the last use. The most used first. */
-	tools: [string, number, number][];
-	programs: [string, number, number][];
-	skills: [string, number, number][];
+	/** Name, uses in the sessions of the period, the time of the last use, and the sessions that used it. The most used first. */
+	tools: [string, number, number, number][];
+	programs: [string, number, number, number][];
+	skills: [string, number, number, number][];
+	/** Skill to its path and where it comes from. */
+	skillInfo: Record<string, [path: string, source: SkillSource]>;
 }
 
 interface Cache {
@@ -155,6 +173,8 @@ export function summarize(entries: any[]): SessionSummary {
 		composition: {},
 		activity: {},
 		context: 0,
+		lastUser: analysis.inputs.findLast((input) => input.preview)?.preview ?? "",
+		skillInfo: {},
 		lastUsed: { tools: {}, programs: {}, skills: {} },
 	};
 	const hourOf = (time: number) => (summary.activity[Math.floor(time / HOUR)] ??= [0, 0, 0, 0, 0]);
@@ -196,12 +216,15 @@ export function summarize(entries: any[]): SessionSummary {
 		used("tools", tool.name, tool.last);
 	}
 	for (const command of analysis.commands) {
-		summary.programs[command.program] = (summary.programs[command.program] ?? 0) + 1;
-		used("programs", command.program, command.time);
+		for (const program of command.programs) {
+			summary.programs[program] = (summary.programs[program] ?? 0) + 1;
+			used("programs", program, command.time);
+		}
 	}
 	for (const skill of analysis.skills) {
 		summary.skills[skill.name] = (summary.skills[skill.name] ?? 0) + skill.loads;
 		used("skills", skill.name, skill.last);
+		summary.skillInfo[skill.name] = [skill.path, skillSource(skill.path, summary.cwd)];
 	}
 	return summary;
 }
@@ -215,6 +238,7 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	const insights: Insights = {
 		days,
 		day: filter.day,
+		until: filter.until,
 		sessions: [],
 		requests: 0,
 		tokens: 0,
@@ -233,11 +257,13 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		tools: [],
 		programs: [],
 		skills: [],
+		skillInfo: {},
 	};
 	const models = new Map<string, [string, number, number, number]>();
 	const projects = new Map<string, [string, number, number, number, number]>();
-	/** Name to the count and the time of the last use. */
-	const tally = () => new Map<string, [number, number]>();
+	/** Name to the count, the time of the last use, and the sessions. */
+	const tally = () => new Map<string, [number, number, number]>();
+	const inRange = (day: string) => !filter.day || (filter.until ? day >= filter.day && day <= filter.until : day === filter.day);
 	const counts = { tools: tally(), programs: tally(), skills: tally() };
 	/** Prompt tokens of the counted requests, and those of them read from the cache. */
 	let sent = 0;
@@ -245,6 +271,7 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	for (const summary of summaries) {
 		if (filter.cwd && summary.cwd !== filter.cwd && !summary.cwd.startsWith(`${filter.cwd}/`)) continue;
 		let active = false;
+		const days = new Set<string>();
 		const project = projects.get(summary.cwd) ?? [summary.cwd, 0, 0, 0, 0];
 		for (const [name, hours] of Object.entries(summary.models)) {
 			for (const [hour, [requests, tokens, cost]] of Object.entries(hours)) {
@@ -252,13 +279,15 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 				if (time + HOUR <= since) continue;
 				const date = new Date(time);
 				const day = fmtDay(time);
-				const stat = byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 };
+				const stat = byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0, sessions: 0 };
+				if (!days.has(day)) stat.sessions++;
+				days.add(day);
 				stat.requests += requests;
 				stat.tokens += tokens;
 				stat.cost += cost;
 				byDay.set(day, stat);
 				first = Math.min(first, time);
-				if (filter.day && day !== filter.day) continue;
+				if (!inRange(day)) continue;
 				active = true;
 				const model = models.get(name) ?? [name, 0, 0, 0];
 				model[1] += requests;
@@ -280,7 +309,7 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		insights.sessions.push(summary);
 		for (const [hour, sent] of Object.entries(summary.composition ?? {})) {
 			const time = Number(hour) * HOUR;
-			if (time + HOUR <= since || (filter.day && fmtDay(time) !== filter.day)) continue;
+			if (time + HOUR <= since || !inRange(fmtDay(time))) continue;
 			insights.composition.requests += sent[0];
 			CATEGORIES.forEach((cat, i) => {
 				insights.composition.sums[cat] += sent[i + 1];
@@ -288,17 +317,18 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 		}
 		for (const [hour, [inputs, toolCalls, activeMs, hourSent, hourRead]] of Object.entries(summary.activity ?? {})) {
 			const time = Number(hour) * HOUR;
-			if (time + HOUR <= since || (filter.day && fmtDay(time) !== filter.day)) continue;
+			if (time + HOUR <= since || !inRange(fmtDay(time))) continue;
 			insights.userInputs += inputs;
 			insights.toolCalls += toolCalls;
 			insights.activeMs += activeMs;
 			sent += hourSent;
 			cacheRead += hourRead;
 		}
+		Object.assign(insights.skillInfo, summary.skillInfo);
 		for (const key of ["tools", "programs", "skills"] as const) {
 			for (const [name, n] of Object.entries(summary[key])) {
-				const [count, last] = counts[key].get(name) ?? [0, 0];
-				counts[key].set(name, [count + n, Math.max(last, summary.lastUsed?.[key][name] ?? 0)]);
+				const [count, last, sessions] = counts[key].get(name) ?? [0, 0, 0];
+				counts[key].set(name, [count + n, Math.max(last, summary.lastUsed?.[key][name] ?? 0), sessions + 1]);
 			}
 		}
 	}
@@ -318,7 +348,7 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	insights.activeDays = byDay.size;
 	for (let i = 6; i >= 0; i--) {
 		const day = fmtDay(now - i * DAY);
-		insights.week.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 });
+		insights.week.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0, sessions: 0 });
 	}
 	// Step by calendar day, so that a day of 23 or 25 hours counts once.
 	const last = new Date(now);
@@ -326,12 +356,12 @@ export function aggregate(summaries: SessionSummary[], now: number, days: number
 	date.setHours(0, 0, 0, 0);
 	for (; date <= last; date.setDate(date.getDate() + 1)) {
 		const day = fmtDay(date.getTime());
-		insights.daily.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0 });
+		insights.daily.push(byDay.get(day) ?? { day, requests: 0, tokens: 0, cost: 0, sessions: 0 });
 	}
 	insights.daily = insights.daily.slice(-MAX_DAYS);
 	for (const key of ["tools", "programs", "skills"] as const) {
 		insights[key] = [...counts[key]]
-			.map(([name, [count, last]]): [string, number, number] => [name, count, last])
+			.map(([name, [count, last, sessions]]): [string, number, number, number] => [name, count, last, sessions])
 			.sort((a, b) => b[1] - a[1])
 			.slice(0, TOP);
 	}

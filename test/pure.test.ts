@@ -410,7 +410,7 @@ test("analyze applies the turn records pi-context saved", () => {
 		turn({ time: HOUR, ms: 2000, toolMs: 1000, activeMs: 4000, sums, paths: { "c5/2": "/a.ts" } }),
 	];
 	const a = analyze(entries);
-	expect(a.timing).toEqual({ activeMs: 9000, modelMs: 6000, toolMs: 1500 });
+	expect(a.timing).toEqual({ activeMs: 9000, modelMs: 6000, toolMs: 1500, ttftMs: 0, streamMs: 0, streamed: 0, streamOutput: 0, spans: { reasoning: [0, 0], toolCalls: [0, 0], answers: [0, 0] } });
 	expect(a.requests.map((r) => [r.ms, r.sums?.system, r.parentId])).toEqual([[4000, 100, "p1"], [2000, 100, "p2"]]);
 	expect(a.files.find((f) => f.path === "/a.ts")).toMatchObject({ path: "/a.ts", reads: 0, writes: 0, edits: 1 });
 	// c5/3 succeeded but no record names its file; the failed c5/4 changed nothing.
@@ -446,12 +446,12 @@ test("summarize and aggregate build the cross-session figures", () => {
 	expect(insights.sessions.map((s) => s.id)).toEqual(["recent"]);
 	expect(insights).toMatchObject({ requests: 2, tokens: 2020, cost: 0.75, activeDays: 1 });
 	expect(insights.week).toHaveLength(7);
-	expect(insights.week[6]).toEqual({ day: "2026-06-10", requests: 0, tokens: 0, cost: 0 });
-	expect(insights.week[5]).toEqual({ day: "2026-06-09", requests: 2, tokens: 2020, cost: 0.75 });
+	expect(insights.week[6]).toEqual({ day: "2026-06-10", requests: 0, tokens: 0, cost: 0, sessions: 0 });
+	expect(insights.week[5]).toEqual({ day: "2026-06-09", requests: 2, tokens: 2020, cost: 0.75, sessions: 1 });
 	// 26 and 25 hours before Wednesday noon: Tuesday 10:00 and 11:00.
 	expect(insights.heat[1].slice(9, 13)).toEqual([0, 1, 1, 0]);
-	expect(insights.tools[0]).toEqual(["read", 2, now - 25 * HOUR + 1000]);
-	expect(insights.skills).toEqual([["x", 2, now - 25 * HOUR + 1000]]);
+	expect(insights.tools[0]).toEqual(["read", 2, now - 25 * HOUR + 1000, 1]);
+	expect(insights.skills).toEqual([["x", 2, now - 25 * HOUR + 1000, 1]]);
 	expect(insights.models).toEqual([["m1", 2, 2020, 0.75]]);
 });
 
@@ -1264,13 +1264,13 @@ test("trendBars carry the recorded duration and mark compactions, drops and rest
 		at(assistant(40)),
 	]);
 	expect(a.requests[0].activeMs).toBe(305);
-	expect(trendBars(a, false, false).map((bar) => [bar.ms, bar.marks])).toEqual([[300, undefined], [200, ["drop"]], [undefined, ["compaction", "restore"]]]);
-	expect(trendBars(a, true, false).map((bar) => [bar.ms, bar.marks])).toEqual([[500, ["drop"]], [undefined, ["compaction", "restore"]]]);
+	expect(trendBars(a, false, false).map((bar) => [bar.ms, bar.marks])).toEqual([[300, ["longest"]], [200, ["drop"]], [undefined, ["compaction", "restore"]]]);
+	expect(trendBars(a, true, false).map((bar) => [bar.ms, bar.marks])).toEqual([[500, ["drop", "longest"]], [undefined, ["compaction", "restore"]]]);
 });
 
 test("a view default is its first value until another is stored, and only its values are accepted", () => {
 	const config: Config = {};
-	expect(CHOICE_SETTINGS.map((setting) => choiceOf(config, setting))).toEqual(["30", "request", "total", "calls", "ops", "request"]);
+	expect(CHOICE_SETTINGS.map((setting) => choiceOf(config, setting))).toEqual(["30", "request", "total", "off", "calls", "ops", "request"]);
 	expect(setChoice(config, "trend", "input")).toBe(true);
 	expect(setChoice(config, "period", "all")).toBe(true);
 	expect(setChoice(config, "diff", "turn")).toBe(false);
@@ -1297,7 +1297,7 @@ test("aggregate counts inputs, tool runs, active time and cache reads, and lists
 	const insights = aggregate([first, second], now, 30);
 	expect(insights).toMatchObject({ userInputs: 2, toolCalls: first.toolCalls, activeMs: 4000 });
 	expect(insights.cacheRate).toBeCloseTo(1800 / 2050);
-	expect(insights.programs).toEqual([["git", 1, now - 26 * HOUR + 1000]]);
+	expect(insights.programs).toEqual([["git", 1, now - 26 * HOUR + 1000, 1]]);
 	expect(aggregate([first, second], now, 30, { day: fmtDay(now) })).toMatchObject({ userInputs: 1, toolCalls: 0, activeMs: 0, cacheRate: 0 });
 	expect(insights.sessions.map((s) => s.id)).toEqual(["second", "first"]);
 	expect(aggregate([first, second], now, 30, { sort: "context" }).sessions.map((s) => s.id)).toEqual(["first", "second"]);

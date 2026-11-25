@@ -29,6 +29,8 @@ const view = (other?: string): ViewData => ({
 	timeline: [],
 	tasks: [],
 	running: false,
+	rates: { m1: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
+	toolDoc: (name) => (name === "bash" ? { description: "Runs a command.", params: [{ name: "command", type: "string", required: true, description: "" }] } : undefined),
 	other,
 	// The context of a request: the messages before its answer.
 	reconstruct: (request) => rowsOf(messages.slice(0, request.n === 1 ? 1 : 3), undefined, [], true),
@@ -120,7 +122,7 @@ test("web data carries the session without the content of the items", async () =
 });
 
 test("web data carries the bars of the trend that the page asked for", async () => {
-	expect((await get("data")).body.trend).toEqual([{ index: 0, n: 1, value: 100 }, { index: 1, n: 2, value: 150 }]);
+	expect((await get("data")).body.trend).toEqual([{ index: 0, n: 1, value: 100 }, { index: 1, n: 2, value: 150, marks: ["growth"] }]);
 	expect((await get("data", { delta: 1 })).body.trend.map((bar: any) => bar.value)).toEqual([100, 50]);
 	expect((await get("data", { turn: 1 })).body.trend).toEqual([{ index: 1, n: 1, value: 150 }]);
 });
@@ -223,7 +225,7 @@ test("web gives the content of a tool result with its call", async () => {
 
 test("web data carries the view defaults, the reply kinds and the fleet", async () => {
 	const body = (await get("data")).body;
-	expect(body.view).toEqual({ period: "30", trend: "request", mode: "total", tools: "calls", files: "ops", diff: "request" });
+	expect(body.view).toEqual({ period: "30", trend: "request", mode: "total", fit: "off", tools: "calls", files: "ops", diff: "request" });
 	expect(body.choices.diff).toMatchObject({ label: "Diff baseline", values: ["request", "input"] });
 	expect(body.replies).toEqual({ reasoning: 0, toolCalls: 1, answers: 1 });
 	expect(body).toMatchObject({ timeline: [], tasks: [], board: [] });
@@ -235,11 +237,32 @@ test("web lists the sessions that used a tool, with the figures of all sessions"
 	expect(used.sessions[0].activity).toBeUndefined();
 	expect(used.sessions[0].lastUsed).toBeUndefined();
 	expect(used).toMatchObject({ userInputs: 1, toolCalls: 1, activeMs: 900, cacheRate: 0.2 });
-	expect(used.tools).toEqual([["bash", 1, summary.lastUsed.tools.bash]]);
+	expect(used.tools).toEqual([["bash", 1, summary.lastUsed.tools.bash, 1]]);
 	const unused = (await get("insights", { days: 7, uses: "tools:read" })).body;
 	expect(unused).toMatchObject({ sessions: [], requests: 2 });
 	// A use that names no kind of the tallies is ignored.
 	expect((await get("insights", { days: 7, uses: "models:m1" })).body.sessions).toHaveLength(1);
+});
+
+test("web serves the totals with subagents, the place of a request, tool documents and the files as of a request", async () => {
+	const body = (await get("data")).body;
+	expect(body.family).toEqual({ own: { tokens: 270, cost: 0.02 }, agents: { count: 0, tokens: 0, cost: 0 }, tokens: 270, cost: 0.02 });
+	expect(body.fleet).toEqual({ agents: 0, running: 0, items: 0, messages: 0 });
+	expect(body.programs).toEqual([{ program: "ls", uses: 1, runs: 1 }]);
+	expect(body.attention).toEqual({});
+	expect(body.rates.m1.output).toBe(15);
+	expect(body.markKinds).toContain("growth");
+	expect((await get("request", { n: 2 })).body.place).toEqual({ input: 1, step: 2, steps: 2 });
+	expect((await get("tool", { name: "bash" })).body.params[0]).toMatchObject({ name: "command", required: true });
+	expect((await get("tool", { name: "none" })).status).toBe(400);
+	expect((await get("files", { n: 1 })).body).toEqual({ files: [] });
+	expect((await get("agent", { id: "none" })).status).toBe(400);
+	expect((await get("chain", { id: "1" })).body).toEqual({ ids: [] });
+});
+
+test("web takes a range of days for Insights only when it ends after its first day", async () => {
+	expect((await get("insights", { days: 7, day: "2020-01-01", until: "2020-01-03" })).body).toMatchObject({ until: "2020-01-03", sessions: [] });
+	expect((await get("insights", { days: 7, day: "2020-01-03", until: "2020-01-01" })).body.until).toBeUndefined();
 });
 test("web tells an open page that the session changed", async () => {
 	const response = await fetch(address("api/events"));
