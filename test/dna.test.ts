@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { type RequestRec, type Row, type RowSource, rowsOf } from "../src/analyze.ts";
-import { Dna, listOf, runsOf } from "../src/dna.ts";
+import { type RequestRec, type Row, type RowSource, rowsOf, sumByCategory, sumTokens } from "../src/analyze.ts";
+import { Dna, type DnaSession, listOf, type Project, projector, runsOf } from "../src/dna.ts";
 
 const assistant = (timestamp: number, content: any[]) => ({ role: "assistant", timestamp, content });
 const result = (timestamp: number, toolCallId: string, toolName: string, text: string) => ({ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], isError: false, timestamp });
@@ -131,4 +131,127 @@ test("changes tell the items that came and grew, and those that left and shrank"
 	const [only] = await dna.bars([requests[0]], { ...source, messages: (request) => messages.slice(0, request.n === 9 ? 8 : 2) }, true, first);
 	expect(pairs(only.up)).toEqual([["2 tool schemas", before.tools - after.tools]]);
 	expect(pairs(only.down).length).toBeGreaterThan(3);
+});
+
+/** What pi tells of a session up to an entry, in short: a compaction stands first with the messages it kept, and a context edit rewrites an earlier message. */
+function fakeProject(count: { calls: number }): Project {
+	return (entries, leafId) => {
+		count.calls++;
+		const byId = new Map<string, any>(entries.map((entry) => [entry.id, entry]));
+		const path: any[] = [];
+		for (let entry = byId.get(leafId); entry; entry = byId.get(entry.parentId)) path.unshift(entry);
+		const at = path.findLastIndex((entry) => entry.type === "compaction");
+		const kept = at < 0 ? [] : path.slice(path.findIndex((entry) => entry.id === path[at].firstKeptEntryId), at).filter((entry) => entry.type === "message");
+		const context = at < 0 ? path : [path[at], ...kept, ...path.slice(at + 1)];
+		const edits = new Map<string, string | null>();
+		for (const entry of context) if (entry.type === "context_edit") edits.set(entry.targetId, entry.replacement);
+		const told = context.map((entry) => {
+			if (entry.type === "compaction") return { sourceEntry: entry, messages: [{ role: "compactionSummary", summary: entry.summary }] };
+			if (entry.type !== "message") return { sourceEntry: entry, messages: [] };
+			if (!edits.has(entry.id)) return { sourceEntry: entry, messages: [entry.message] };
+			const text = edits.get(entry.id);
+			return { sourceEntry: entry, messages: text == null ? [] : [{ ...entry.message, content: text }] };
+		});
+		return { entries: told, messages: told.flatMap((each) => each.messages) };
+	};
+}
+
+test("the messages up to each entry of a branch come from one reading of each stretch between context changes", () => {
+	const said = (id: string) => ({ type: "message", id, message: { role: "user", content: id } });
+	const chain = [
+		said("m0"),
+		said("m1"),
+		said("m2"),
+		said("m3"),
+		{ type: "context_edit", id: "edit1", targetId: "m2", replacement: null },
+		said("m4"),
+		{ type: "context_edit", id: "edit2", targetId: "m1", replacement: "shorter" },
+		said("m5"),
+		{ type: "compaction", id: "cut", firstKeptEntryId: "m4", summary: "what happened" },
+		said("m6"),
+		{ type: "custom", id: "note" },
+		said("m7"),
+	].map((entry, i, list) => ({ ...entry, parentId: i ? list[i - 1].id : null }));
+	// An entry of another branch.
+	const entries = [...chain, { ...said("side"), parentId: "m1" }];
+	const direct = fakeProject({ calls: 0 });
+	const count = { calls: 0 };
+	const told = projector(entries, "m7", fakeProject(count));
+	for (const entry of chain) expect([entry.id, told(entry.id)]).toEqual([entry.id, direct(entries, entry.id).messages]);
+	expect(told("m3").map((message) => message.content)).toEqual(["m0", "m1", "m2", "m3"]);
+	expect(told("m5").map((message) => message.content)).toEqual(["m0", "shorter", "m3", "m4", "m5"]);
+	expect(told("cut").map((message) => message.content ?? message.summary)).toEqual(["what happened", "m4", "m5"]);
+	// Four stretches: the start, one from each context edit, one from the compaction.
+	expect(count.calls).toBe(4);
+	// The messages of an entry are the same objects each time, so that each is read once.
+	expect(told("m3")[1]).toBe(told("m1")[1]);
+	// An entry outside the branch is told by pi.
+	expect(told("side").map((message) => message.content)).toEqual(["m0", "m1", "side"]);
+	expect(count.calls).toBe(5);
+	expect(projector(entries, undefined, direct)("m1").map((message) => message.content)).toEqual(["m0", "m1"]);
+});
+
+/** A session whose requests send ever more messages, with the sizes that the provider reported. */
+function grown(contexts: number[], extra: (i: number) => Partial<RequestRec> = () => ({})) {
+	const said = [
+		{ role: "user", content: "x".repeat(40000), timestamp: 1000 },
+		assistant(2000, [{ type: "text", text: "a".repeat(4000) }]),
+		{ role: "user", content: "y".repeat(4000), timestamp: 3000 },
+		assistant(4000, [{ type: "text", text: "b".repeat(4000) }]),
+		{ role: "user", content: "z".repeat(4000), timestamp: 5000 },
+		assistant(6000, [{ type: "text", text: "c".repeat(4000) }]),
+		{ role: "user", content: "w".repeat(4000), timestamp: 7000 },
+	];
+	const list = contexts.map((context, i) => ({ n: i + 1, time: 2000 + i * 2000, context, model: "m1", ...extra(i) }) as unknown as RequestRec);
+	const from: RowSource = { messages: (request) => said.slice(0, request.n * 2 - 1), rows: (rows) => rowsOf(rows) };
+	const session = (compacted: number[] = []): DnaSession => ({ requests: list, compacted: new Set(compacted) });
+	return { said, list, from, session };
+}
+const doubts = (bars: { since?: number; extra?: number }[]) => bars.map((bar) => bar.since ?? bar.extra ?? null);
+
+test("rebuilt items are in doubt from the request at which the context shrank without the session telling why", async () => {
+	// The context falls at request 3, and the session holds nothing that left.
+	const { list, from, session } = grown([10000, 11000, 4000, 5000]);
+	expect(doubts(await new Dna().bars(list, from, false, undefined, session()))).toEqual([null, null, 3, 3]);
+	// Without the session, the bars tell nothing of it.
+	expect(doubts(await new Dna().bars(list, from))).toEqual([null, null, null, null]);
+	// The bars asked for may be a part of the requests: the doubt comes from all of them.
+	expect(doubts(await new Dna().bars(list.slice(3), from, false, undefined, session()))).toEqual([3]);
+	// A compaction explains the fall, and ends an earlier doubt.
+	expect(doubts(await new Dna().bars(list, from, false, undefined, session([2])))).toEqual([null, null, null, null]);
+	expect(doubts(await new Dna().bars(list, from, false, undefined, session([3])))).toEqual([null, null, 3, null]);
+	// A small fall is no sign: a provider may count the same context a little lower.
+	const small = grown([10000, 11000, 9500, 10500]);
+	expect(doubts(await new Dna().bars(small.list, small.from, false, undefined, small.session()))).toEqual([null, null, null, null]);
+	// Another model counts in another way.
+	const other = grown([10000, 11000, 4000, 5000], (i) => (i >= 2 ? { model: "m2" } : {}));
+	expect(doubts(await new Dna().bars(other.list, other.from, false, undefined, other.session()))).toEqual([null, null, null, null]);
+	// A request with recorded rows ends the doubt: its items are those that it sent.
+	const kept = grown([10000, 11000, 4000, 5000, 6000]);
+	kept.list[3].rows = rowsOf(kept.said.slice(4, 7));
+	expect(doubts(await new Dna().bars(kept.list, kept.from, false, undefined, kept.session()))).toEqual([null, null, 3, null, null]);
+});
+
+test("a context that shrank by the items that left is not in doubt", async () => {
+	const { said, list, session } = grown([11000, 12000, 3000, 4000]);
+	// From request 3 on, the session tells the context without its large first message, as after a context edit.
+	const from: RowSource = { messages: (request) => said.slice(request.n > 2 ? 1 : 0, request.n * 2 - 1), rows: (rows) => rowsOf(rows) };
+	expect(doubts(await new Dna().bars(list, from, false, undefined, session()))).toEqual([null, null, null, null]);
+});
+
+test("rebuilt items that do not add up to the recorded size of their request are in doubt", async () => {
+	const { said, list, from, session } = grown([10000, 11000, 4000, 5000]);
+	// pi-context recorded what request 3 sent: the messages without the large one. Request 4 sent what the session tells.
+	const sent = rowsOf(said.slice(1, 5));
+	list[2].sums = sumByCategory(sent);
+	list[3].sums = sumByCategory(rowsOf(said.slice(0, 7)));
+	const bars = await new Dna().bars(list, from, false, undefined, session());
+	const more = sumTokens(rowsOf(said.slice(0, 5))) - sumTokens(sent);
+	expect(bars[2].extra).toBe(Math.round((more * 4000) / sumTokens(sent)));
+	expect(bars[2].since).toBeUndefined();
+	// Items that add up to the recorded size are those that the request sent, whatever happened before.
+	expect(doubts(bars)).toEqual([null, null, bars[2].extra as number, null]);
+	// Items that hold less than was recorded: the difference is below 0.
+	list[3].sums = sumByCategory([...rowsOf(said.slice(0, 7)), ...rowsOf(said.slice(0, 1))]);
+	expect((await new Dna().bars(list, from, false, undefined, session()))[3].extra).toBeLessThan(0);
 });

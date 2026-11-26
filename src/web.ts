@@ -250,7 +250,9 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			const last = Math.max(0, Math.round(Number(query.get("last")) || 0));
 			const hidden = last ? Math.max(0, all.length - last) : 0;
 			const dna = dnaOf(file);
-			const bars = await dna.bars(all.slice(hidden), data.source, query.get("delta") === "1", all[hidden - 1]);
+			// A compaction rewrites the context: the items after it are not in doubt for what happened before it.
+			const compacted = new Set(data.analysis.events.filter((event) => event.kind === "compaction").map((event) => event.after));
+			const bars = await dna.bars(all.slice(hidden), data.source, query.get("delta") === "1", all[hidden - 1], { requests, compacted });
 			const had = Math.round(Number(query.get("items")) || 0);
 			const from = query.get("id") === dna.id && had > 0 && had <= dna.items.length ? had : 0;
 			return { id: dna.id, from, items: dna.items.slice(from), bars };

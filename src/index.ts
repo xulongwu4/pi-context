@@ -53,6 +53,7 @@ import {
 	saveConfig,
 	setChoice,
 } from "./config.ts";
+import { projector } from "./dna.ts";
 import { exportJson, exportMarkdown } from "./export.ts";
 import { readTasks, taskFile, timelineOf } from "./fleet.ts";
 import { expiryText, expiryWarnAt, type FooterStats, footerItems, footerText } from "./footer.ts";
@@ -298,6 +299,7 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 		const projection = ctx.sessionManager.buildSessionProjection().messages;
+		const told = projector(ctx.sessionManager.getEntries(), branch.at(-1)?.id, buildSessionProjection);
 		const messages = prune(projection, pruned);
 		const current = rowsFor(messages, ctx, true);
 		for (const row of current) if (row.id && pruned.has(row.id)) row.dropped = true;
@@ -334,7 +336,7 @@ export default function (pi: ExtensionAPI) {
 			reconstruct: (request) =>
 				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
 			source: {
-				messages: (request) => (request.parentId ? buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages : []),
+				messages: (request) => (request.parentId ? told(request.parentId) : []),
 				rows: (messages) => rowsFor(messages, ctx),
 			},
 		};
@@ -352,6 +354,7 @@ export default function (pi: ExtensionAPI) {
 		const then = recordedDeclarations(branch);
 		const sources = recordedSources(branch) ?? {};
 		const projection = buildSessionProjection(entries, leaf).messages;
+		const told = projector(entries, leaf, buildSessionProjection);
 		const messages = prune(projection, ids);
 		const current = rowsOf(messages, then, [], true, sources);
 		const schemas = Object.fromEntries([...schemasOf(messages, then)].map(([name, chars]) => [name, estimate(chars)]));
@@ -379,7 +382,7 @@ export default function (pi: ExtensionAPI) {
 			tasks: header?.cwd && header?.id ? readTasks(taskFile(header.cwd, header.id, getAgentDir())) : [],
 			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true, sources) : []),
 			source: {
-				messages: (request) => (request.parentId ? buildSessionProjection(entries, request.parentId).messages : []),
+				messages: (request) => (request.parentId ? told(request.parentId) : []),
 				rows: (messages) => rowsOf(messages, then, [], false, sources),
 			},
 		};

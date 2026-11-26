@@ -539,10 +539,12 @@ function trendCard(d) {
 			marks.length ? `marks: ${marks.map((kind) => MARKS[kind]?.[1] ?? kind).join(", ")}` : "",
 			miss ? "cache miss: " + missText(miss) : "",
 			strand?.rebuilt ? "items rebuilt from the session" : "",
+			// The changes of a bar are items that the session tells of: the doubt is about the items that stand.
+			strand && !delta ? doubtOf(strand) : "",
 		];
 		const on = covered.some((r) => r.n === state.request);
 		// A DNA bar tells of its request in the tip of its bands.
-		return `<div class="col${on ? " on" : ""}" data-up="${more}" data-down="${less}" data-act="request" data-n="${request.n}" ${strand ? "data-tip" : "title"}="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
+		return `<div class="col${on ? " on" : ""}${strand && !delta && doubtOf(strand) ? " doubt" : ""}" data-up="${more}" data-down="${less}" data-act="request" data-n="${request.n}" ${strand ? "data-tip" : "title"}="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
 	};
 	// The selected request: what the provider reported, and the estimates of pi-context with the categories.
 	const picked = d.requests.find((request) => request.n === state.request);
@@ -565,7 +567,7 @@ function trendCard(d) {
 	const banded = bars.map(strandOf).filter(Boolean);
 	const strands = state.trend.dna
 		? known
-			? ` DNA: one band for each item, in the order the model reads the items, the first one at the bottom. Point at a band to read its item and to light the item in every bar; click the band to show the item in the Context Browser.${delta ? " With Changes, the bands above the line are the items that came or grew, and those below it the items that left or shrank. A bar whose items do not explain its change shows without bands." : ""}${banded.some((strand) => strand.rebuilt) ? " The items of a request that pi-context did not record are rebuilt from the session: they do not show what extensions changed in the context." : ""}${banded.length ? "" : " The items of these requests are not known."}`
+			? ` DNA: one band for each item, in the order the model reads the items, the first one at the bottom. Point at a band to read its item and to light the item in every bar; click the band to show the item in the Context Browser.${delta ? " With Changes, the bands above the line are the items that came or grew, and those below it the items that left or shrank. A bar whose items do not explain its change shows without bands." : ""}${banded.some((strand) => strand.rebuilt) ? " The items of a request that pi-context did not record are rebuilt from the session: they do not show what extensions changed in the context." : ""}${!delta && banded.some(doubtOf) ? " A hatched bar: its items are in doubt. The context shrank at an earlier request without the session telling why, or the items do not add up to the size that pi-context recorded, so the bar may show items that had left the context." : ""}${banded.length ? "" : " The items of these requests are not known."}`
 			: " DNA: reading the items of the bars…"
 		: "";
 	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${strands}${zoomed ? " Adaptive: the tallest bar in view fills the chart, and the axis tells its size." : ""}${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
@@ -651,6 +653,13 @@ async function loadDna() {
 /** With changes, a bar shows its items when its estimated change, times a factor in this range, is the change that the provider reported. */
 const MIN_FACTOR = 0.25;
 const MAX_FACTOR = 2.5;
+
+/** Why the items of a rebuilt bar may not be those that its request sent, or "". */
+function doubtOf(strand) {
+	if (strand.since != null) return `items in doubt since request #${strand.since}: the context shrank there, and the session does not tell why`;
+	if (strand.extra != null) return `items in doubt: they hold ≈${tok(Math.abs(strand.extra))} tokens ${strand.extra > 0 ? "more" : "less"} than pi-context recorded for the request`;
+	return "";
+}
 
 const strandBands = new WeakMap();
 /**

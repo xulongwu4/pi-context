@@ -323,6 +323,32 @@ test("web gives the items of the bars of the trend, and only the new items to a 
 	expect((await get("dna", { turn: 1 })).body.bars.map((bar: any) => bar.n)).toEqual([2]);
 });
 
+test("web tells which bars of the trend hold items in doubt, up to the next compaction", async () => {
+	const said: any[] = [];
+	const log: any[] = [];
+	const add = (entry: object) => log.push({ id: `d${log.length}`, parentId: log.length ? `d${log.length - 1}` : null, timestamp: new Date(1000 + log.length * 1000).toISOString(), ...entry });
+	// The context falls at request 3 with nothing in the session to tell why, and a compaction comes before request 4.
+	[10000, 11000, 3000, 2000].forEach((input, i) => {
+		if (i === 3) add({ type: "compaction", summary: "what happened", tokensBefore: 3000, firstKeptEntryId: "d0" });
+		const turn = [{ role: "user", content: "q".repeat(4000), timestamp: 1000 + i * 2000 }, assistant(2000 + i * 2000, input, [{ type: "text", text: "a".repeat(400) }])];
+		for (const message of turn) add({ type: "message", message });
+		said.push(...turn);
+	});
+	const data: ViewData = { ...view(), analysis: analyze(log), source: { messages: (request) => said.slice(0, request.n * 2 - 1), rows: (list) => rowsOf(list) } };
+	expect(data.analysis.requests.map((request) => request.context)).toEqual([10000, 11000, 3000, 2000]);
+	const other = await startWeb({ ...host, collect: () => data });
+	try {
+		const key = new URL(other.url).searchParams.get("t") ?? "";
+		const read = async (query: Record<string, string | number> = {}) =>
+			(await (await fetch(new URL(`api/dna?${new URLSearchParams({ t: key, ...query } as Record<string, string>)}`, other.url))).json()) as any;
+		expect((await read()).bars.map((bar: any) => bar.since ?? null)).toEqual([null, null, 3, null]);
+		// The doubt of a bar comes from all the requests, also from those that have no bar.
+		expect((await read({ last: 2 })).bars.map((bar: any) => [bar.n, bar.since ?? null])).toEqual([[3, 3], [4, null]]);
+	} finally {
+		other.close();
+	}
+});
+
 test("web gives the images of an item with their data, the rows without it, and the file operations by kind", async () => {
 	const bytes = Buffer.alloc(33);
 	bytes.writeUInt32BE(0x89504e47, 0);
