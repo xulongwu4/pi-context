@@ -41,6 +41,8 @@ const MARKS = {
 /** Width of the treemap of the current context, in units of its height. */
 const MAP_RATIO = 2.5;
 const TASK_STATES = [["in_progress", "In progress"], ["pending", "Pending"], ["done", "Done"]];
+/** How a command ended that did not end by itself. */
+const STOPS = { timeout: "timed out", aborted: "aborted" };
 
 const state = {
 	page: location.hash === "#insights" ? "insights" : "context",
@@ -67,8 +69,11 @@ const state = {
 	/** File Activity shows the files as they were after the request of the Context Browser: `then` holds them as { n, files }. */
 	asOf: false,
 	then: null,
-	/** The status whose runs Command Executions lists. Empty: every run. */
-	commandStatus: "",
+	/** What Command Executions lists, as the CommandLens of src/analyze.ts: some of status, slow, program, text and slowest. */
+	lens: {},
+	/** Indexes of the commands whose row is open, and what the server said about their outputs: { text } or { error }. */
+	openRuns: new Set(),
+	outputs: new Map(),
 	/** Index in the commands of the run that Command Executions highlights. */
 	run: null,
 	/** What the diff of a request compares with: the request before it, or with "input" the last request before its human input. */
@@ -76,7 +81,13 @@ const state = {
 	/** The tool whose description the tool list shows, and what the server said about it: { name, description, params } or { name, error }. */
 	tool: null,
 	toolDoc: null,
-	/** The subagent whose detail Agents shows, and what the server said about it: { id, prompt, reply, tasks, events } or { id, error }. */
+	/** Context Browser, the tools that a request declared: what the search box holds, and the order: size, name or calls. */
+	declFind: "",
+	declOrder: "size",
+	/**
+	 * The subagent whose detail Agents shows, and what the server said about it: { id, prompt, reply, tasks, events, timeline, board } or { id, error }.
+	 * Collaboration Timeline and Tasks Board show its `timeline` and its `board` in place of those of the session.
+	 */
 	agent: null,
 	agentInfo: null,
 	/** The kind of event that Collaboration Timeline lists. Empty: every kind. */
@@ -105,6 +116,8 @@ const state = {
 	/** The kind of event that Context Events lists. Empty: every kind. */
 	kind: "",
 	insights: null,
+	/** What the calendar of Insights is shaded by: requests, tokens, sessions or cost. */
+	dayMetric: "tokens",
 	/** Length of the Insights period in days, or "all". */
 	days: 30,
 	/** The day that Insights is narrowed to, as YYYY-MM-DD, or with `until` the first and the last day. Null: the whole period. */
@@ -212,27 +225,31 @@ const catParts = (sums, factor = 1) =>
 
 const pairs = (list) => `<dl class="pairs">${list.map(([name, value]) => `<div><dt>${esc(name)}</dt><dd>${esc(value)}</dd></div>`).join("")}</dl>`;
 
-/** One tile for each [value, label, sub, to]. A tile with `to` goes to the card, or the part of a card, with that id. */
+/**
+ * One tile for each [value, label, sub, to, part]. A tile with `to` goes to the card, or the part of a card, with that id.
+ * With `part`, the sub line is about a part of the card: it goes to the card with the filter that the attributes `part` set. See the action "go".
+ */
 const tiles = (list) =>
-	`<div class="tiles">${list.map(([value, label, sub = "", to]) => `<div class="tile"${to ? ` data-act="go" data-to="${to}" title="Go to the card"` : ""}><b>${esc(value)}</b><span>${esc(label)}</span><small>${esc(sub)}</small></div>`).join("")}</div>`;
+	`<div class="tiles">${list.map(([value, label, sub = "", to, part]) => `<div class="tile"${to ? ` data-act="go" data-to="${to}" title="Go to the card"` : ""}><b>${esc(value)}</b><span>${esc(label)}</span><small>${part ? `<a data-act="go" data-to="${to}" ${part} title="Go to the card and list only these">${esc(sub)}</a>` : esc(sub)}</small></div>`).join("")}</div>`;
 
-/** Names with counts, the largest first. */
-function pills(title, items, max = 8) {
+/** Names with counts, the largest first. With `attrs`, each is a button with the attributes that `attrs` gives for its name. */
+function pills(title, items, max = 8, attrs) {
 	if (items.length === 0) return "";
 	const sorted = [...items].sort((a, b) => b[1] - a[1]);
 	const more = sorted.length > max ? `<span class="pill muted">+${sorted.length - max} more</span>` : "";
-	const shown = sorted.slice(0, max).map(([name, count]) => `<span class="pill">${esc(name)} <b>${count}</b></span>`);
+	const tag = attrs ? "button" : "span";
+	const shown = sorted.slice(0, max).map(([name, count]) => `<${tag} class="pill"${attrs ? " " + attrs(name) : ""}>${esc(name)} <b>${count}</b></${tag}>`);
 	return `<div class="pills"><span class="muted">${title}</span>${shown.join("")}${more}</div>`;
 }
 
-/** A table. Cells are HTML. A heading that starts with ">" aligns its column to the right. */
+/** A table. Cells are HTML. A heading that starts with ">" aligns its column to the right. A row that is a string is one cell over all columns. */
 function table(head, rows, empty = "Nothing yet.") {
 	if (rows.length === 0) return `<p class="muted">${empty}</p>`;
 	const right = head.map((title) => title.startsWith(">"));
 	const cells = (row, tag) => row.map((cell, i) => `<${tag}${right[i] ? ' class="r"' : ""}>${cell}</${tag}>`).join("");
 	const titles = cells(head.map((title) => title.replace(/^>/, "")), "th");
 	const more = rows.length > MAX_LIST ? `<p class="muted">The first ${MAX_LIST} of ${rows.length}.</p>` : "";
-	const lines = rows.slice(0, MAX_LIST).map((row) => `<tr>${cells(row, "td")}</tr>`);
+	const lines = rows.slice(0, MAX_LIST).map((row) => `<tr>${typeof row === "string" ? `<td colspan="${head.length}">${row}</td>` : cells(row, "td")}</tr>`);
 	return `<div class="scroll"><table><thead><tr>${titles}</tr></thead><tbody>${lines.join("")}</tbody></table></div>${more}`;
 }
 
@@ -253,6 +270,30 @@ const commandStatus = (command) => (command.ok == null ? "unknown" : command.ok 
 
 /** As isSlow() of src/analyze.ts: the run took ten seconds or more. */
 const isSlow = (command) => (command.ms ?? 0) >= 10_000;
+
+/** As commandRows() of src/analyze.ts: the indexes of the commands that the lens lets through, in its order. */
+function commandRows(commands, lens) {
+	const text = lens.text?.toLowerCase();
+	const rows = commands
+		.map((_, index) => index)
+		.filter((index) => {
+			const command = commands[index];
+			if (lens.status && commandStatus(command) !== lens.status) return false;
+			if (lens.slow && !isSlow(command)) return false;
+			if (lens.program && !command.programs.includes(lens.program)) return false;
+			return !text || command.command.toLowerCase().includes(text);
+		});
+	return lens.slowest ? rows.sort((a, b) => (commands[b].ms ?? -1) - (commands[a].ms ?? -1)) : rows;
+}
+
+/** The attribute that carries parts of a lens to the actions "lens" and "go". */
+const lensData = (parts) => `data-lens="${esc(JSON.stringify(parts))}"`;
+
+/** Sets what Command Executions lists. The filter box shows the text of the lens. */
+function setLens(lens) {
+	state.lens = lens;
+	$("command-filter").value = lens.text ?? "";
+}
 
 /** As commandShape() of src/analyze.ts: the lines of a command, and whether it holds a heredoc or a script given to an interpreter on the command line. */
 const commandShape = (text) => ({
@@ -275,10 +316,21 @@ function slowest(commands) {
 
 const missText = (miss) => `≈${tok(miss.tokens)} tokens billed again, ≈${cost(miss.cost)} extra, after ${dur(miss.idleMs)} without a request`;
 
+/** Number of a request to its place among the requests of its human input: { input, step, steps }. */
+let placed = new Map();
+/** The coordinate of request `n`: "#12 · 3.2" for step 2 of human input 3. Only the number when the place is not known. */
+const coord = (n) => (placed.get(n) ? `#${n} · ${placed.get(n).input}.${placed.get(n).step}` : `#${n}`);
+/** The long form of a coordinate. */
+const placeText = (place) => `input ${place.input}, step ${place.step} of ${place.steps}`;
+/** A link that names request `n` by its coordinate. `attrs` are the attributes of its action; the tooltip tells `tip` and the long form of the coordinate. */
+const requestLink = (n, attrs, tip) => `<a class="tok" ${attrs} title="${esc([tip, placed.get(n) && placeText(placed.get(n))].filter(Boolean).join(": "))}">${coord(n)}</a>`;
+
 // The cards of the Context page. Each returns HTML for the data `d` of a session.
 
 function statsCard(d) {
-	const compactions = d.events.filter((event) => /compact/i.test(event.kind)).length;
+	const compactions = d.events.filter((event) => event.kind === "compaction").length;
+	const failed = d.commands.filter((command) => command.ok === false).length;
+	const edited = d.files.filter((file) => file.edits > 0).length;
 	const misses = d.cache.misses ? `${d.cache.misses} misses, ≈${cost(d.cache.cost)} extra` : "no misses";
 	// The session with its subagents.
 	const { own, agents } = d.family;
@@ -291,7 +343,9 @@ function statsCard(d) {
 		[tok(own.tokens), "Tokens", family(tok(d.family.tokens)), "tokens"],
 		[cost(own.cost), "Cost", family(cost(d.family.cost)), "models"],
 		[pct(d.cache.rate, 1), "Read from cache", misses, "tokens"],
-		[d.events.length, "Context events", `${compactions} compactions`, "events"],
+		[d.events.length, "Context events", `${compactions} compactions`, "events", compactions ? `data-key="kind" data-value="compaction"` : ""],
+		...(d.commands.length ? [[d.commands.length, "Commands", `${failed} failed`, "commands", failed ? lensData({ status: "failed" }) : ""]] : []),
+		...(d.files.length ? [[d.files.length, "Files", `${edited} edited`, "files", edited ? `data-key="fileKind" data-value="edits"` : ""]] : []),
 		...(agents.count ? [[agents.count, "Subagents", `${d.fleet.running} running`, "agents"]] : []),
 		// The reply streams that pi-context timed.
 		...(timing.streamed ? [[secs(timing.ttftMs / timing.streamed), "To the first token", `average of ${timing.streamed} requests`, "timing"]] : []),
@@ -305,8 +359,8 @@ function statsCard(d) {
 	const link = (to, text) => `<a data-act="go" data-to="${to}" title="Go to the card">${text}</a>`;
 	return (
 		top +
-		pills(link("tools", "Tools"), d.tools.map((tool) => [tool.name, tool.calls + tool.nested])) +
-		pills(link("commands", "Programs"), d.programs.map((program) => [program.program, program.uses])) +
+		pills(link("tools", "Tools"), d.tools.map((tool) => [tool.name, tool.calls + tool.nested]), 8, (name) => `data-act="go" data-to="tools" data-name="${esc(name)}" title="Show the tool in its card"`) +
+		pills(link("commands", "Programs"), d.programs.map((program) => [program.program, program.uses]), 8, (name) => `data-act="go" data-to="commands" ${lensData({ program: name })} title="List the runs of the program"`) +
 		prices
 	);
 }
@@ -445,7 +499,7 @@ function trendCard(d) {
 			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack" style="flex:0 0 ${(size / most) * 100}%">${stack(sign)}</div>` : ""}</div>`;
 		const tip = [
 			input ? `input #${input.n} · ${input.requests} requests · ${input.preview}` : "",
-			`#${request.n} · ${clock(request.time)} · ${request.model}`,
+			`${coord(request.n)} · ${clock(request.time)} · ${request.model}`,
 			delta ? `change ${bar.value < 0 ? "−" : "+"}${tok(Math.abs(bar.value))}` : "",
 			`sent ${tok(request.context)}, ${pct(request.cacheRead, request.context)} from cache · output ${tok(request.output)} · ${cost(request.cost)}`,
 			bar.ms == null ? "" : `took ${dur(bar.ms)}`,
@@ -459,7 +513,7 @@ function trendCard(d) {
 	// The selected request: what the provider reported, and the estimates of pi-context with the categories.
 	const picked = d.requests.find((request) => request.n === state.request);
 	const reported = picked
-		? pairs([[`#${picked.n}, provider-reported`, ""], ["Input", tok(picked.input)], ["Cache read", tok(picked.cacheRead)], ["Cache write", tok(picked.cacheWrite)], ["Output", tok(picked.output)]])
+		? pairs([[`${coord(picked.n)}, provider-reported`, ""], ["Input", tok(picked.input)], ["Cache read", tok(picked.cacheRead)], ["Cache write", tok(picked.cacheWrite)], ["Output", tok(picked.output)]])
 		: "";
 	// Where the request stands among the requests of its human input, and how long its first token took.
 	const where = picked ? placePairs(picked, state.view?.place) : [];
@@ -474,7 +528,7 @@ function trendCard(d) {
 	const glyphs = seen.length ? ` Marks: ${seen.join(", ")}. A bar shows the first of its marks; its tooltip lists all.` : "";
 	const some = hidden ? `The last ${bars.length} of ${all.length} bars.` : `All ${all.length} bars.`;
 	const cut = last && all.length > last ? `<p class="muted">${some} <a data-act="bars">${hidden ? "Show all" : `Show the last ${last}`}</a></p>` : "";
-	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request #${picked.n}.` : ""}`;
+	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
 	const axis = `<div class="axis${longest ? " timed" : ""}"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
 	// What the selected request did. Each line opens what it tells of in the Context Browser.
 	const brief = state.view?.brief;
@@ -490,7 +544,7 @@ const firstRequest = (row) => (row.time == null ? undefined : state.data.request
 
 /** The pairs that tell where a request stands among the requests of its human input, and how long its first token took. */
 const placePairs = (request, place) => [
-	...(place ? [["Place", `input ${place.input}, step ${place.step} of ${place.steps}`]] : []),
+	...(place ? [["Place", placeText(place)]] : []),
 	...(request.ttft == null ? [] : [["To the first token", secs(request.ttft)]]),
 ];
 
@@ -602,7 +656,7 @@ function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const open = state.openItems.has(key);
 	const button = canDrop && row.id ? dropButton([row.id], !row.dropped) : "";
 	const from = firstRequest(row);
-	const first = from == null ? "" : `<span class="from" title="Request #${from} was the first to carry this item">@${from}</span>`;
+	const first = from == null ? "" : `<span class="from" title="Request ${coord(from)} was the first to carry this item">@${from}</span>`;
 	const category = flat ? `<i class="dot" style="background:${COLORS[row.cat]}" title="${esc(labels[row.cat])}"></i>` : "";
 	const line = `<div class="item${row.dropped ? " dropped" : ""}${flat ? " flat" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="pos" title="Position in the prompt">#${i + 1}</span>${category}<span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${first}${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
 	if (!open) return line;
@@ -615,6 +669,24 @@ function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	return `${line}${about}${args}${entry ? viewer(key, i, entry) : "<pre>Loading…</pre>"}`;
 }
 
+/** The tools that the request of the browser declared, one row for each: the name, who provides it, the calls of the request, the size of the schema. A row opens what pi knows about the tool. */
+function declaredHtml(view) {
+	const needle = state.declFind.trim().toLowerCase();
+	const orders = { size: (a, b) => b.tokens - a.tokens, name: (a, b) => a.name.localeCompare(b.name), calls: (a, b) => b.calls - a.calls || b.tokens - a.tokens };
+	const found = view.tools.filter((tool) => !needle || `${tool.name} ${tool.source}`.toLowerCase().includes(needle)).sort(orders[state.declOrder]);
+	const row = (tool) => {
+		const open = tool.name === state.tool;
+		const called = tool.calls ? `<span class="warn" title="Calls of the tool in this request">called ${tool.calls}×</span>` : "";
+		const line = `<div class="item" data-act="tool" data-name="${esc(tool.name)}" title="Show the description and the parameters"><span class="fold">${open ? "▾" : "▸"}</span><span class="lbl mono">${esc(tool.name)}</span><span class="pv">${esc(tool.source)}</span>${called}<span class="tok">≈${tok(tool.tokens * view.factor)}</span></div>`;
+		return open ? line + toolAbout() : line;
+	};
+	const sorts = [["size", "Size", "Largest schema first"], ["name", "Name", "By name"], ["calls", "Calls", "Most calls in this request first"]]
+		.map(([value, label, tip]) => `<button${value === state.declOrder ? ' class="on"' : ""} data-act="pick" data-key="declOrder" data-value="${value}" title="${tip}">${label}</button>`)
+		.join("");
+	const bar = `<div class="viewer"><b>Declared tools</b><input type="search" data-decls data-focus="decls" value="${esc(state.declFind)}" placeholder="Search tools">${sorts}<span class="muted">${found.length} of ${view.tools.length}</span></div>`;
+	return bar + (found.map(row).join("") || `<p class="muted">No tool matches.</p>`);
+}
+
 function browserCard(d) {
 	const request = d.requests.find((r) => r.n === state.request);
 	const view = request ? state.view : { rows: d.current, factor: d.factor };
@@ -623,6 +695,7 @@ function browserCard(d) {
 	if (request) {
 		head.push(
 			pairs([
+				["Request", coord(request.n)],
 				["Time", clock(request.time)],
 				["Model", request.model],
 				["Sent", tok(request.context)],
@@ -638,7 +711,7 @@ function browserCard(d) {
 		if (view.marks) {
 			const count = (mark) => view.marks.filter((m) => m === mark).length;
 			const base = view.base === "input" ? "the last request before the human input" : "the request before";
-			head.push(pairs([["Compared with", `#${view.since}, ${base}`], ["+ added", count("+")], ["~ changed", count("~")], ["− removed", view.removed.length]]));
+			head.push(pairs([["Compared with", `${coord(view.since)}, ${base}`], ["+ added", count("+")], ["~ changed", count("~")], ["− removed", view.removed.length]]));
 		} else {
 			head.push(`<p class="muted">No request ${view.base === "input" ? "before the human input" : "before this one"} to compare with.</p>`);
 		}
@@ -693,7 +766,9 @@ function browserCard(d) {
 		const open = needle || kind ? true : state.openCats.has(cat);
 		const delta = badge(cat);
 		const title = `<div class="cat" data-act="cat" data-cat="${cat}"><span>${open ? "▾" : "▸"}</span><i class="dot" style="background:${COLORS[cat]}"></i><b>${esc(labels[cat])} <small>${own.length} items</small></b>${delta}<span class="tok">≈${tok(tokens * view.factor)}</span><span class="share">${pct(tokens, all)}</span></div>`;
-		return open ? title + own.map((item) => itemHtml(item, view.factor, canDrop)).join("") : title;
+		// The tool declarations list the tools that the request declared, when pi-context recorded them.
+		const declared = cat === "tools" && view.tools?.length ? declaredHtml(view) : "";
+		return open ? title + own.map((item) => itemHtml(item, view.factor, canDrop)).join("") + declared : title;
 	});
 	return head.join("") + (groups.join("") || `<p class="muted">Nothing matches.</p>`) + removed;
 }
@@ -717,7 +792,7 @@ function turnsCard(d) {
 	// The wait for the user's answers to questions has a column when an input waited.
 	const waited = d.inputs.some((input) => input.waitMs != null);
 	const rows = [...d.inputs].reverse().map((input) => [
-		input.first >= 0 ? `<a data-act="request" data-n="${d.requests[input.first].n}">#${input.n}</a>` : "#" + input.n,
+		input.first >= 0 ? requestLink(d.requests[input.first].n, `data-act="request" data-n="${d.requests[input.first].n}"`, "Open the first request of the input in the Context Browser") : `<span class="muted">input ${input.n}</span>`,
 		clock(input.time),
 		clip(input.preview),
 		input.requests,
@@ -728,8 +803,8 @@ function turnsCard(d) {
 		dur(input.ms),
 		...(waited ? [input.waitMs == null ? "" : dur(input.waitMs)] : []),
 	]);
-	const note = waited ? `<p class="muted">Waited: the part of the time that the input waited for the answers of the user to questions.</p>` : "";
-	return table(["", "Time", "Input", ">Requests", ">Tools", ">Sent", ">Output", ">Cost", ">Took", ...(waited ? [">Waited"] : [])], rows, "No input yet.") + note;
+	const note = waited ? `<p class="muted">Waited: the time that the input waited for the answers of the user to questions. Took does not include it.</p>` : "";
+	return table(["Request", "Time", "Input", ">Requests", ">Tools", ">Sent", ">Output", ">Cost", ">Took", ...(waited ? [">Waited"] : [])], rows, "No input yet.") + note;
 }
 
 function eventsCard(d) {
@@ -744,9 +819,10 @@ function eventsCard(d) {
 	const change = (delta) => (delta == null ? "" : `<span class="${delta < 0 ? "good" : "warn"}">≈${delta < 0 ? "−" : "+"}${tok(Math.abs(delta))}</span>`);
 	const sized = shown.filter((event) => event.delta != null);
 	const net = sized.length ? change(sized.reduce((sum, event) => sum + event.delta, 0)) : "not known";
-	const where = (event) => (event.after ? `<a data-act="request" data-n="${event.after}" title="Open the request in the Context Browser">#${event.after}</a>` : "start");
-	// A compaction tells how many messages its summary replaced.
-	const detail = (event) => esc(event.detail) + (event.replaced == null ? "" : ` <small>${event.replaced} ${event.replaced === 1 ? "message" : "messages"} replaced</small>`);
+	const where = (event) => (event.after ? requestLink(event.after, `data-act="request" data-n="${event.after}"`, "Open the request in the Context Browser") : "start");
+	// A compaction tells how many messages its summary replaced, and their estimated size.
+	const detail = (event) =>
+		esc(event.detail) + (event.replaced == null ? "" : ` <small>${event.replaced} ${event.replaced === 1 ? "message" : "messages"} replaced${event.removed == null ? "" : `, about ${tok(event.removed)} tokens`}</small>`);
 	// The injections by the extension message type or the skill that made them, largest first.
 	const sums = new Map();
 	for (const event of shown) {
@@ -792,7 +868,7 @@ function filesCard(d) {
 			if (!open) return [row];
 			// Newest first.
 			const log = [...file.ops].reverse().map((op) => {
-				const result = `<a data-act="result" data-n="${op.request}" data-id="${esc(op.id)}" title="Show the tool result in the Context Browser">#${op.request}</a>`;
+				const result = requestLink(op.request, `data-act="result" data-n="${op.request}" data-id="${esc(op.id)}"`, "Show the tool result in the Context Browser");
 				const failed = op.error ? ` <span class="bad">failed</span>` : "";
 				const hits = op.hits == null ? "" : `, ${op.hits} ${op.hits === 1 ? "hit" : "hits"}`;
 				return [`<span class="op">${clock(op.time)} ${result} ${names[op.op]}${part(op.range)} by ${esc(op.tool)}${hits}${failed}</span>`, "", "", "", "", "", added(op.added), removed(op.removed)];
@@ -801,16 +877,19 @@ function filesCard(d) {
 		});
 	const note = d.unresolvedEdits ? `<p class="muted">${d.unresolvedEdits} edits by anchor could not be matched to a file.</p>` : "";
 	const empty = !files.length ? "No file activity yet." : needle ? "No file matches." : "No file with such an operation.";
-	const when = !state.asOf ? "" : state.request == null ? "Select a request in the Context Browser to see the files as they were after it." : then ? `The files as they were after request #${state.request}.` : "Loading…";
+	const when = !state.asOf ? "" : state.request == null ? "Select a request in the Context Trend or the Context Browser to see the files as they were after it." : then ? `The files as they were after request ${coord(state.request)}. The list follows the request that the Context Trend and the Context Browser show.` : "Loading…";
 	return `<div class="controls">${kinds}</div>` + (when ? `<p class="muted">${when}</p>` : "") + table(["File", ">Reads", ">Writes", ">Edits", ">Searches", ">Images", ">Added", ">Removed"], rows, empty) + note;
 }
 
 function commandsCard(d) {
-	const status = (ok) => (ok == null ? "" : ok ? `<span class="good">ok</span>` : `<span class="bad">failed</span>`);
+	const lens = state.lens;
+	// A failed run tells how it ended, when the session tells it.
+	const status = (command) =>
+		command.ok == null ? "" : command.ok ? `<span class="good">ok</span>` : `<span class="bad tok">${command.exit != null ? "exit " + command.exit : (STOPS[command.stopped] ?? "failed")}</span>`;
 	const took = (ms) => (ms == null ? "" : secs(ms));
 	const by = (command) =>
 		command.id
-			? `<a data-act="result" data-n="${command.request}" data-id="${esc(command.id)}" title="Show the tool result in the Context Browser">#${command.request}</a>`
+			? requestLink(command.request, `data-act="result" data-n="${command.request}" data-id="${esc(command.id)}"`, "Show the tool result in the Context Browser")
 			: `<span class="muted">user</span>`;
 	// What sets a command apart: a long run, more than one line, a heredoc, a script given to an interpreter.
 	const marks = (command) => {
@@ -818,45 +897,90 @@ function commandsCard(d) {
 		const list = [isSlow(command) ? "slow" : "", shape.lines > 1 ? `${shape.lines} lines` : "", shape.heredoc ? "heredoc" : "", shape.inline ? "inline script" : ""];
 		return list.filter(Boolean).map((mark) => `<span class="pill${mark === "slow" ? " warn" : ""}">${mark}</span> `).join("");
 	};
-	const needle = $("command-filter").value.trim().toLowerCase();
+	// An open run: how it ended, the whole command, and its output as the session holds it.
+	const detail = (command, i) => {
+		const output = state.outputs.get(i);
+		const badges = [
+			command.exit == null ? "" : `<span class="pill bad">exit ${command.exit}</span>`,
+			command.stopped ? `<span class="pill bad">${STOPS[command.stopped]}</span>` : "",
+			command.truncated ? `<span class="pill warn" title="pi cut the output for the model">output truncated</span>` : "",
+			command.lines == null ? "" : `<span class="pill">${command.lines} ${command.lines === 1 ? "line" : "lines"} of output</span>`,
+		].join("");
+		const shown = !output
+			? `<pre>Loading…</pre>`
+			: output.error
+				? `<p class="muted">${esc(output.error)}</p>`
+				: output.text
+					? `<pre>${esc(output.text)}</pre>`
+					: `<p class="muted">The command printed nothing.</p>`;
+		return `${badges ? `<div class="pills">${badges}</div>` : ""}<small class="cap">Command</small><pre>${esc(command.command)}</pre><small class="cap">Output</small>${shown}`;
+	};
 	const counts = { ok: 0, failed: 0, unknown: 0 };
 	for (const command of d.commands) counts[commandStatus(command)]++;
-	// Newest first.
-	const listed = d.commands
-		.map((command, i) => ({ command, i }))
-		.filter(({ command }) => (!state.commandStatus || commandStatus(command) === state.commandStatus) && (!needle || command.command.toLowerCase().includes(needle)))
-		.reverse();
+	const found = commandRows(d.commands, lens);
+	// The session has the oldest run first. The list has the newest first, or with the lens the slowest.
+	const listed = lens.slowest ? found : found.reverse();
 	// The table shows its first rows: it starts late enough to show the highlighted run.
-	const skip = Math.max(0, listed.findIndex(({ i }) => i === state.run) - MAX_LIST + 1);
-	const rows = listed
-		.slice(skip)
-		.map(({ command, i }) => [
+	const skip = Math.max(0, listed.indexOf(state.run) - MAX_LIST + 1);
+	const rows = listed.slice(skip).flatMap((i) => {
+		const command = d.commands[i];
+		const open = state.openRuns.has(i);
+		const name = `<a data-act="output" data-i="${i}" title="Show the whole command and its output">${open ? "▾" : "▸"} ${clip(command.command, "mono")}</a>`;
+		const row = [
 			`<span class="run${i === state.run ? " hit" : ""}">${clock(command.time)}</span>`,
 			by(command),
-			status(command.ok),
+			status(command),
 			took(command.ms),
 			esc([...new Set(command.programs)].join(", ")),
-			marks(command) + clip(command.command, "mono"),
-		]);
+			marks(command) + name,
+		];
+		return open ? [row, detail(command, i)] : [row];
+	});
 	const timed = d.commands.filter((command) => command.ms != null);
-	const failed = d.commands.filter((command) => command.ok === false).length;
 	const time = timed.length ? `, ${dur(timed.reduce((sum, command) => sum + command.ms, 0))}` : "";
-	const title = `${d.commands.length} runs of ${d.programs.length} programs, ${failed} failed${time}`;
-	const statuses = chips("commandStatus", [["All", d.commands.length, ""], ["OK", counts.ok, "ok"], ["Failed", counts.failed, "failed"], ["Unknown", counts.unknown, "unknown"]]);
+	const title = `${d.commands.length} runs of ${d.programs.length} programs, ${counts.failed} failed${time}`;
+	// A control that sets parts of the lens.
+	const set = (label, parts, on, tip) => `<button${on ? ' class="on"' : ""} data-act="lens" ${lensData(parts)} title="${tip}">${label}</button>`;
+	const statuses = [["All", d.commands.length, "", "Every run"], ["OK", counts.ok, "ok", "Only the runs that ended well"], ["Failed", counts.failed, "failed", "Only the failed runs"], ["Unknown", counts.unknown, "unknown", "Only the runs whose outcome the session does not tell"]]
+		.map(([label, count, value, tip]) => set(`${label} ${count}`, { status: value }, value === (lens.status ?? ""), tip))
+		.join("");
+	const slow = set(`Slow ${d.commands.filter(isSlow).length}`, { slow: !lens.slow }, lens.slow, "Only the runs that took ten seconds or more");
+	const order = `<span class="muted">Order</span>${set("Latest", { slowest: false }, !lens.slowest, "The newest run first")}${set("Slowest", { slowest: true }, lens.slowest, "The run with the longest wall time first")}`;
 	const jump = (to, label, any, tip) => `<button data-act="run" data-to="${to}"${any ? "" : " disabled"} title="${tip}">${label}</button>`;
-	const jumps = `<span class="muted">Go to</span>${jump("failed", "Failed", counts.failed, "Highlight the newest failed run, then the one before it")}${jump("slowest", "Slowest", timed.length, "Highlight the run with the longest wall time")}`;
-	const newer = skip ? `<p class="muted">${skip} newer runs are not listed.</p>` : "";
-	const empty = !d.commands.length ? "No command yet." : needle ? "No run matches." : "No run with this status.";
-	// The runs that deserve a look.
-	const { slowest: slow, failing, repeated } = d.attention;
+	const jumps = `<span class="muted">Go to</span>${jump("failed", "Next failed", counts.failed, "Highlight the newest failed run, then the one before it")}${jump("slowest", "Slowest run", timed.length, "Highlight the run with the longest wall time")}`;
+	// The parts of the lens that no other control shows. The filter box cannot show a text of more than one line.
+	const pill = (label, part) => `<button class="pill on" data-act="lens" ${lensData({ [part]: "" })} title="Remove this filter">${label} ×</button>`;
+	const active = (lens.program ? pill(`Program: ${esc(lens.program)}`, "program") : "") + (lens.text && lens.text !== $("command-filter").value.trim() ? pill(`Command: ${clip(lens.text, "mono")}`, "text") : "");
+	const newer = skip ? `<p class="muted">${skip} ${lens.slowest ? "slower" : "newer"} runs are not listed.</p>` : "";
+	const empty = d.commands.length ? "No run matches." : "No command yet.";
+	// The runs that deserve a look: each entry lists them.
+	const { slowest: slowestRun, failing, repeated } = d.attention;
+	const entry = (name, tip, label) => `<button data-act="lens" data-whole="1" ${lensData(d.lenses[name])} title="${tip}">${label}</button>`;
 	const look = [
-		d.commands[slow] ? `<a data-act="run" data-to="slowest" title="Highlight the run">the slowest run</a> took ${took(d.commands[slow].ms)}` : "",
-		failing ? `${esc(failing.program)} failed ${failing.count} times` : "",
-		repeated ? `${clip(repeated.command, "mono")} ran ${repeated.count} times` : "",
+		d.commands[slowestRun] ? entry("slowest", "List the slowest runs first", `the slowest run took ${took(d.commands[slowestRun].ms)}`) : "",
+		failing ? entry("failing", "List the failed runs of the program", `${esc(failing.program)} failed ${failing.count} times`) : "",
+		repeated ? entry("repeated", "List the runs of the command", `${clip(repeated.command, "mono")} ran ${repeated.count} times`) : "",
 	].filter(Boolean);
-	const attention = look.length ? `<p><span class="warn">Worth a look:</span> ${look.join(" · ")}</p>` : "";
-	const ranks = pills(title, d.programs.map((program) => [program.program, program.uses]));
-	return ranks + attention + `<div class="controls">${statuses}${jumps}</div>` + newer + table(["Time", "Request", "", ">Took", "Programs", "Command"], rows, empty);
+	const attention = look.length ? `<div class="pills"><span class="warn">Worth a look</span>${look.join("")}</div>` : "";
+	const ranks = pills(title, d.programs.map((program) => [program.program, program.uses]), 8, (name) => `data-act="lens" ${lensData({ program: name === lens.program ? "" : name })} title="List only the runs of the program"`);
+	return (
+		ranks +
+		attention +
+		`<div class="controls">${statuses}${slow}${order}${jumps}${active}</div>` +
+		newer +
+		table(["Time", "Request", "", ">Took", "Programs", "Command"], rows, empty)
+	);
+}
+
+/** What pi knows now about the picked tool: its description and its parameters. */
+function toolAbout() {
+	const doc = state.toolDoc?.name === state.tool ? state.toolDoc : undefined;
+	const listed = (doc?.params ?? []).map((param) => [esc(param.name), esc(param.type), param.required ? "required" : "", esc(param.description)]);
+	return !doc
+		? `<p class="muted">Loading…</p>`
+		: doc.error
+			? `<p class="muted">${esc(doc.error)}</p>`
+			: (doc.description ? `<pre>${esc(doc.description)}</pre>` : "") + table(["Parameter", "Type", "", "Description"], listed, "The tool has no parameters.");
 }
 
 function toolsCard(d) {
@@ -867,20 +991,12 @@ function toolsCard(d) {
 		const name = `<a data-act="tool" data-name="${esc(tool.name)}" title="Show the description and the parameters">${tool.name === state.tool ? "▾" : "▸"} ${esc(tool.name)}</a>`;
 		return [name + flag, esc(tool.source), size(tool.schema * d.factor), tool.calls || "", tool.nested || "", tool.errors || "", size(tool.callTokens), size(tool.resultTokens)];
 	});
-	// What pi knows now about the picked tool.
-	const doc = state.toolDoc?.name === state.tool ? state.toolDoc : undefined;
-	const listed = (doc?.params ?? []).map((param) => [esc(param.name), esc(param.type), param.required ? "required" : "", esc(param.description)]);
-	const about = !doc
-		? `<p class="muted">Loading…</p>`
-		: doc.error
-			? `<p class="muted">${esc(doc.error)}</p>`
-			: (doc.description ? `<pre>${esc(doc.description)}</pre>` : "") + table(["Parameter", "Type", "", "Description"], listed, "The tool has no parameters.");
 	const sources = d.schemaSources.map((group) => [esc(group.source || "unknown"), group.tools, "≈" + tok(group.tokens * d.factor)]);
 	const skills = d.skills.map((skill) => [clip(skill.name), skill.loads, "≈" + tok(skill.tokens)]);
 	const models = [...d.models].sort((a, b) => b.cost - a.cost).map((model) => [esc(model.model), model.requests, tok(model.sent), tok(model.output), cost(model.cost)]);
 	return [
 		table(["Tool", "Source", ">Schema", ">Calls", ">In scripts", ">Errors", ">Arguments", ">Results"], tools, "No tool yet."),
-		state.tool ? `<h3>Tool ${esc(state.tool)}</h3>${about}` : "",
+		state.tool ? `<h3>Tool ${esc(state.tool)}</h3>${toolAbout()}` : "",
 		sources.length ? "<h3>Tool schemas by source</h3>" + table(["Source", ">Tools", ">Tokens"], sources) : "",
 		skills.length ? "<h3>Skills</h3>" + table(["Skill", ">Loads", ">Tokens"], skills) : "",
 		`<h3 id="models">Models</h3>` + table(["Model", ">Requests", ">Sent", ">Output", ">Cost"], models, "No request yet."),
@@ -888,6 +1004,16 @@ function toolsCard(d) {
 }
 
 // The subagents and the tasks of the session.
+
+/** What the server said that the timeline and the board hold about the picked agent, as { timeline, board }. Undefined: no agent is picked, or the answer is not there yet. */
+const narrowed = () => (state.agent && state.agentInfo?.id === state.agent && state.agentInfo.timeline ? state.agentInfo : undefined);
+
+/** The pill of a card that shows only what is about the picked agent. A click shows everything again. */
+function agentPill(d) {
+	if (!state.agent) return "";
+	const type = d.agents.find((agent) => agent.id === state.agent)?.type ?? state.agent.slice(0, 8);
+	return `<button class="pill on" data-act="agent" data-id="${esc(state.agent)}" title="Show every agent, event and task again">Filtered to ${esc(type)} ×</button>`;
+}
 
 function agentsCard(d) {
 	const { agents, running, items, messages } = d.fleet;
@@ -936,9 +1062,10 @@ function agentsCard(d) {
 			agent.compactions ? ["Compactions", agent.compactions] : null,
 		].filter(Boolean);
 		const error = agent.error ? `<p class="bad">${esc(agent.error)}</p>` : "";
-		return `<div class="agent" style="margin-left:${(agent.depth ?? level) * 20}px"><div class="between" data-act="agent" data-id="${esc(agent.id)}" title="Show the prompt, the reply, the tasks and the last events of the agent"><b>${agent.id === state.agent ? "▾" : "▸"} ${esc(agent.type)}</b><span class="${statusCss(agent.status)}">${esc(agent.status)}</span></div><div>${esc(agent.description)}</div><small class="mono">${esc(agent.model ?? "")}</small>${bar ? `<div class="bar">${bar}</div>` : ""}${pairs(facts)}${error}${detail(agent)}</div>`;
+		return `<div class="agent" style="margin-left:${(agent.depth ?? level) * 20}px"><div class="between" data-act="agent" data-id="${esc(agent.id)}" title="Show the prompt, the reply, the tasks and the last events of the agent, and only its events and tasks in the timeline and on the board"><b>${agent.id === state.agent ? "▾" : "▸"} ${esc(agent.type)}</b><span class="${statusCss(agent.status)}">${esc(agent.status)}</span></div><div>${esc(agent.description)}</div><small class="mono">${esc(agent.model ?? "")}</small>${bar ? `<div class="bar">${bar}</div>` : ""}${pairs(facts)}${error}${detail(agent)}</div>`;
 	};
-	return `${summary}<div class="agents">${under(undefined, 0).map(card).join("")}</div>`;
+	const pill = agentPill(d);
+	return `${summary}${pill && `<p>${pill}</p>`}<div class="agents">${under(undefined, 0).map(card).join("")}</div>`;
 }
 
 /** Identifies an event of the timeline, so that it stays open when the data is loaded again. */
@@ -946,14 +1073,18 @@ const eventKey = (event) => [event.time, event.kind, event.agent ?? "", event.ti
 
 function timelineCard(d) {
 	if (d.timeline.length === 0) return `<p class="muted">No delegation, message or task event in this session.</p>`;
+	// With a picked agent, only its events.
+	const timeline = narrowed()?.timeline ?? d.timeline;
 	// An agent shows as its type; its id is in the tooltip.
 	const who = (id) => (id ? (d.agents.find((agent) => agent.id === id)?.type ?? id.slice(0, 8)) : "");
 	const needle = $("fleet-search").value.trim().toLowerCase();
 	const counts = new Map();
-	for (const event of d.timeline) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+	for (const event of timeline) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
 	const kind = state.fleetKind;
-	const kinds = chips("fleetKind", [["All", d.timeline.length, ""], ...[...counts].map(([name, count]) => [esc(name), count, esc(name)])]);
-	const found = d.timeline.filter(
+	// The chip of the picked kind stays when the agent has no such event.
+	if (kind && !counts.has(kind)) counts.set(kind, 0);
+	const kinds = chips("fleetKind", [["All", timeline.length, ""], ...[...counts].map(([name, count]) => [esc(name), count, esc(name)])]);
+	const found = timeline.filter(
 		(event) => (!kind || event.kind === kind) && (!needle || `${event.kind} ${who(event.agent)} ${event.title} ${event.body ?? ""}`.toLowerCase().includes(needle)),
 	);
 	// The data has the earliest event first.
@@ -965,12 +1096,15 @@ function timelineCard(d) {
 		return open ? `${row}<pre>${esc(event.body)}</pre>` : row;
 	};
 	const more = found.length > MAX_LIST ? `<p class="muted">The first ${MAX_LIST} of ${found.length}.</p>` : "";
-	return `<div class="controls">${kinds}</div>` + (found.length ? `<div class="scroll">${found.slice(0, MAX_LIST).map(line).join("")}</div>${more}` : `<p class="muted">No event matches.</p>`);
+	return `<div class="controls">${kinds}${agentPill(d)}</div>` + (found.length ? `<div class="scroll">${found.slice(0, MAX_LIST).map(line).join("")}</div>${more}` : `<p class="muted">No event matches.</p>`);
 }
 
 function boardCard(d) {
-	const items = d.board.flatMap((group) => group.items);
-	if (items.length === 0) return `<p class="muted">No task and no delegation in this session.</p>`;
+	// With a picked agent, only its tasks and its delegation.
+	const board = narrowed()?.board ?? d.board;
+	const items = board.flatMap((group) => group.items);
+	const pill = agentPill(d);
+	if (items.length === 0) return (pill && `<div class="controls">${pill}</div>`) + `<p class="muted">No task and no delegation ${narrowed() ? "of this agent" : "in this session"}.</p>`;
 	const picked = state.taskState;
 	const states = chips("taskState", [["All", items.length, ""], ...TASK_STATES.map(([value, label]) => [label, items.filter((item) => item.state === value).length, value])]);
 	const needle = $("board-search").value.trim().toLowerCase();
@@ -998,9 +1132,9 @@ function boardCard(d) {
 		const before = chain.length ? `<small class="cap">Waits for ${chain.map(link).join(", ")}, the nearest first</small>` : "";
 		return row + before + (item.description ? `<pre>${esc(item.description)}</pre>` : "") + reply;
 	};
-	const groups = d.board.map((group) => [group.owner, group.items.filter(matches)]).filter(([, own]) => own.length > 0);
+	const groups = board.map((group) => [group.owner, group.items.filter(matches)]).filter(([, own]) => own.length > 0);
 	const list = groups.map(([owner, own]) => `<h3>${esc(owner)} · ${own.length}</h3>${own.map(line).join("")}`).join("");
-	return `<div class="controls">${states}</div>` + (list || `<p class="muted">${needle ? "No task matches." : "No task in this state."}</p>`);
+	return `<div class="controls">${states}${pill}</div>` + (list || `<p class="muted">${needle ? "No task matches." : "No task in this state."}</p>`);
 }
 
 // The Insights page.
@@ -1027,18 +1161,22 @@ const today = () => {
 	return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 };
 
-/** The days of the period as a calendar: one column per week, Monday first, shaded by the tokens of the day. */
+/** What the calendar of Insights can be shaded by: the field of a day, its name, and how a value reads. */
+const DAY_METRICS = [["requests", "Requests", String], ["tokens", "Tokens", (n) => tok(n)], ["sessions", "Sessions", String], ["cost", "Cost", (n) => cost(n)]];
+
+/** The days of the period as a calendar: one column per week, Monday first, shaded by the requests, the tokens, the sessions or the cost of the day. */
 function daysCard(ins) {
 	const days = ins.daily;
 	if (days.length === 0) return `<p class="muted">No day in the period.</p>`;
 	const [year, month, date] = days[0].day.split("-").map(Number);
 	const offset = (new Date(year, month - 1, date).getDay() + 6) % 7;
 	const weeks = Math.ceil((offset + days.length) / 7);
-	const peak = Math.max(...days.map((day) => day.tokens), 1);
+	const [metric, name, show] = DAY_METRICS.find(([each]) => each === state.dayMetric);
+	const peak = Math.max(...days.map((day) => day[metric]), 0);
 	const cell = (day) => {
 		if (!day) return "<span></span>";
 		const tip = `${day.day}: ${day.sessions} sessions, ${day.requests} requests, ${tok(day.tokens)} tokens, ${cost(day.cost)}`;
-		const shade = day.tokens ? `<b style="opacity:${0.2 + (0.8 * day.tokens) / peak}"></b>` : "";
+		const shade = day[metric] > 0 ? `<b style="opacity:${0.2 + (0.8 * day[metric]) / peak}"></b>` : "";
 		const on = ins.until ? day.day >= ins.day && day.day <= ins.until : day.day === ins.day;
 		return `<i${on ? ' class="on"' : ""} data-act="day" data-day="${day.day}" title="${tip}">${shade}</i>`;
 	};
@@ -1054,7 +1192,11 @@ function daysCard(ins) {
 		cells.push(...column.map(cell));
 	}
 	const note = "Click a day to narrow the page to it. Click another day with Shift to narrow the page to the days from the one to the other. Click the day again to show the whole period.";
-	return `<div class="scroll-x" data-keep="days"><div class="cal months" style="--weeks:${weeks}">${months.join("")}</div><div class="cal" style="--weeks:${weeks}">${cells.join("")}</div></div><p class="muted">${note}</p>`;
+	const metrics = DAY_METRICS.map(([value, label]) => `<button${value === metric ? ' class="on"' : ""} data-act="pick" data-key="dayMetric" data-value="${value}">${label}</button>`).join("");
+	// The legend names what shades the days, from a day with nothing to the day with the most.
+	const scale = [0.2, 0.4, 0.6, 0.8, 1].map((opacity) => `<i><b style="opacity:${opacity}"></b></i>`).join("");
+	const key = `<div class="pills shades"><span>${name} of a day: 0</span><i></i>${scale}<span>${show(peak)}</span></div>`;
+	return `<div class="controls"><span class="muted">Shaded by</span>${metrics}</div><div class="scroll-x" data-keep="days"><div class="cal months" style="--weeks:${weeks}">${months.join("")}</div><div class="cal" style="--weeks:${weeks}">${cells.join("")}</div></div>${key}<p class="muted">${note}</p>`;
 }
 
 function renderInsights() {
@@ -1123,10 +1265,17 @@ function renderInsights() {
 		// The composition of the last recorded request of the session.
 		const profile = session.profile ?? [];
 		const sum = profile.reduce((total, tokens) => total + tokens, 0);
-		const bar = CATS.map((cat, i) => (profile[i] > 0 ? `<i style="width:${(profile[i] / sum) * 100}%;background:${COLORS[cat]}" title="${esc(labels[cat] ?? cat)} ≈${tok(profile[i])}"></i>` : "")).join("");
-		const context = `<div class="between"><div class="bar"${sum ? "" : ' title="The composition is not recorded"'}>${bar}</div><small class="tok" title="Tokens that the last request sent">context ${tok(session.context)}</small></div>`;
+		// The bar is the window of the model when it is known, else the context.
+		const used = session.window ? Math.min(1, session.context / session.window) : 1;
+		const parts = CATS.map((cat, i) => (profile[i] > 0 ? `<i style="width:${(profile[i] / sum) * used * 100}%;background:${COLORS[cat]}" title="${esc(labels[cat] ?? cat)} ≈${tok(profile[i])}"></i>` : "")).join("");
+		const bar = sum || !session.window ? parts : `<i style="width:${used * 100}%;background:#9ca3af"></i>`;
+		const share = session.window ? ` · ${pct(session.context, session.window)}` : "";
+		const tip = session.window ? `Tokens that the last request sent: ${pct(session.context, session.window)} of the window of ${tok(session.window)} of ${session.model}` : "Tokens that the last request sent";
+		const context = `<div class="between"><div class="bar"${sum ? "" : ' title="The composition is not recorded"'}>${bar}</div><small class="tok" title="${esc(tip)}">context ${tok(session.context)}${share}</small></div>`;
+		const current = session.current ? `<span class="badge" title="The session that is open in pi">current</span> ` : "";
+		const count = (n, one) => `${n} ${n === 1 ? one : one + "s"}`;
 		const asked = session.lastUser ? `<small class="asked" title="The last human input">${esc(session.lastUser)}</small>` : "";
-		return `<div class="session"${open}><b>${esc(title)}</b><small class="mono">${esc(session.cwd)}</small>${asked}${context}<div class="between"><small>${date(session.end)}</small><span>${session.requests} requests · ${tok(session.tokens)} · ${cost(session.cost)}</span></div></div>`;
+		return `<div class="session"${open}><b>${current}${esc(title)}</b><small class="mono">${esc(session.cwd)}</small>${asked}${context}<div class="between"><small>${date(session.end)}</small><span>${count(session.userInputs, "input")} · ${count(session.requests, "request")} · ${tok(session.tokens)} · ${cost(session.cost)}</span></div></div>`;
 	};
 	const more = found.length > state.shown ? `<p><button data-act="more">Show more (${found.length - state.shown} left)</button></p>` : "";
 	const shown = found.slice(0, state.shown);
@@ -1195,12 +1344,36 @@ function applyDefaults(view) {
 	if (view.diff) state.diff = view.diff;
 }
 
+/**
+ * The requests that the picker of the Context Browser finds for what is typed, as [number, preview of the human input], at most 8:
+ * the request with that number, the request at that coordinate ("3.2", or "3" for the first step of input 3), and the first requests of the inputs whose preview holds the text.
+ */
+function pickRequests(d, typed) {
+	const found = new Map();
+	const add = (i) => {
+		if (d.requests[i] && !found.has(d.requests[i].n)) found.set(d.requests[i].n, d.inputs[d.places[i]?.input - 1]?.preview ?? "");
+	};
+	const [, first, step] = /^#?(\d+)(?:\.(\d+))?$/.exec(typed) ?? [];
+	if (first && !step) add(d.requests.findIndex((request) => request.n === Number(first)));
+	if (first) add(d.places.findIndex((place) => place?.input === Number(first) && place.step === Number(step ?? 1)));
+	for (const input of d.inputs) if (input.preview.toLowerCase().includes(typed.toLowerCase())) add(input.first);
+	return [...found].slice(0, 8);
+}
+
+/** Lists under the picker of the Context Browser the requests that it finds. */
+function fillPicks(d) {
+	const typed = $("pick").value.trim();
+	const rows = typed ? pickRequests(d, typed) : [];
+	const list = rows.map(([n, preview]) => `<div class="item flat" data-act="goto" data-n="${n}" title="${esc(placed.get(n) ? placeText(placed.get(n)) : "")}"><span class="lbl">${coord(n)}</span><span class="pv">${esc(preview)}</span></div>`);
+	$("picks").innerHTML = !typed ? "" : list.join("") || `<p class="muted">No request matches.</p>`;
+}
+
 function syncRequests(d) {
 	const select = $("request");
 	const made = `${state.session?.file ?? ""}:${d.requests.length}`;
 	if (select.dataset.made !== made) {
 		select.dataset.made = made;
-		const options = [...d.requests].reverse().map((r) => `<option value="${r.n}">#${r.n} · ${clock(r.time)} · ${tok(r.context)}</option>`);
+		const options = [...d.requests].reverse().map((r) => `<option value="${r.n}">${coord(r.n)} · ${clock(r.time)} · ${tok(r.context)}</option>`);
 		select.innerHTML = `<option value="">Current context</option>${options.join("")}`;
 	}
 	select.value = state.request ?? "";
@@ -1219,6 +1392,7 @@ function render() {
 	if (state.page === "insights") return renderInsights();
 	if (!d) return;
 	syncRequests(d);
+	fillPicks(d);
 	$("base").value = state.diff;
 	fillSettings(d);
 	if (!d.readOnly) fillChoices(d);
@@ -1264,6 +1438,7 @@ async function load() {
 		const sent = dataQuery();
 		const d = await api("data", params(sent));
 		labels = d.labels;
+		placed = new Map(d.requests.map((request, i) => [request.n, d.places[i]]));
 		// The first load tells the view defaults of the settings: the page starts from them.
 		if (!state.started) {
 			state.started = true;
@@ -1344,6 +1519,10 @@ async function openSession(file, title) {
 	state.view = null;
 	state.openItems.clear();
 	state.run = null;
+	state.openRuns.clear();
+	state.outputs.clear();
+	setLens({});
+	$("pick").value = "";
 	state.task = null;
 	state.then = null;
 	state.tool = null;
@@ -1419,8 +1598,21 @@ const actions = {
 		location.hash = el.dataset.page === "insights" ? "#insights" : "";
 	},
 	request: (el) => selectRequest(Number(el.dataset.n)),
+	/** Opens a request that the picker of the Context Browser found. */
+	goto(el) {
+		$("pick").value = "";
+		selectRequest(Number(el.dataset.n));
+	},
 	/** Goes to the card, or to the part of a card, that a figure belongs to. */
-	go: (el) => $(el.dataset.to)?.scrollIntoView({ behavior: "smooth" }),
+	go(el) {
+		const { to, key, value, lens, name } = el.dataset;
+		// A figure about a part of a card sets the filter of that card.
+		if (key) state[key] = value;
+		if (lens) setLens(JSON.parse(lens));
+		if (name && name !== state.tool) actions.tool(el);
+		render();
+		$(to)?.scrollIntoView({ behavior: "smooth" });
+	},
 	step(el) {
 		const numbers = (state.data?.requests ?? []).map((request) => request.n);
 		const next = (state.request == null ? numbers.length : numbers.indexOf(state.request)) + Number(el.dataset.by);
@@ -1475,10 +1667,29 @@ const actions = {
 		const run = el.dataset.to === "slowest" ? slowest(commands) : failed[(failed.indexOf(state.run) + 1) % failed.length];
 		if (!commands[run]) return;
 		state.run = run;
-		// A run that the chips filter out is not in the list.
-		if (state.commandStatus && commandStatus(commands[run]) !== state.commandStatus) state.commandStatus = "";
+		// A run that the lens filters out is not in the list.
+		if (!commandRows(commands, state.lens).includes(run)) setLens({ slowest: state.lens.slowest });
 		render();
 		document.querySelector("#commands .hit")?.scrollIntoView({ block: "center" });
+	},
+	/** Sets parts of the lens of Command Executions, or the whole lens. */
+	lens(el) {
+		setLens({ ...(el.dataset.whole ? {} : state.lens), ...JSON.parse(el.dataset.lens) });
+		render();
+	},
+	/** Shows the whole command of a run and its output. The same run again hides them. */
+	async output(el) {
+		const i = Number(el.dataset.i);
+		toggle(state.openRuns, i);
+		if (!state.openRuns.has(i) || state.outputs.get(i)?.text != null) return;
+		let output;
+		try {
+			output = await api("output", params({ i }));
+		} catch (error) {
+			output = { error: error.message };
+		}
+		state.outputs.set(i, output);
+		render();
 	},
 	earliest() {
 		state.earliest = !state.earliest;
@@ -1524,6 +1735,8 @@ const actions = {
 	blocker(el) {
 		state.task = el.dataset.id;
 		const item = state.data.board.flatMap((group) => group.items).find((each) => each.id === state.task);
+		// A task that is not about the picked agent is not on its board.
+		if (narrowed() && !narrowed().board.some((group) => group.items.some((each) => each.id === state.task))) state.agent = null;
 		if (state.taskState && item?.state !== state.taskState) state.taskState = "";
 		render();
 		document.querySelector("#board .hit")?.scrollIntoView({ block: "center" });
@@ -1645,11 +1858,24 @@ addEventListener("hashchange", () => {
 	else render();
 });
 $("request").addEventListener("change", (event) => selectRequest(event.target.value ? Number(event.target.value) : null));
-for (const id of ["order", "filter", "search", "group", "fleet-search", "file-filter", "command-filter", "board-search"]) $(id).addEventListener("input", render);
+for (const id of ["pick", "order", "filter", "search", "group", "fleet-search", "file-filter", "board-search"]) $(id).addEventListener("input", render);
+// Enter in the picker opens the first request that it found.
+$("pick").addEventListener("keydown", (event) => {
+	if (event.key === "Enter") $("picks").querySelector("[data-act]")?.click();
+});
+$("command-filter").addEventListener("input", (event) => {
+	state.lens = { ...state.lens, text: event.target.value.trim() };
+	render();
+});
 // The find box of an opened item: the item is drawn again with the matches marked. Enter goes to the next match, with Shift to the one before.
 document.addEventListener("input", (event) => {
 	const i = event.target.dataset.find;
 	if (i != null) setViewer(Number(i), () => ({ find: event.target.value, at: 0 }));
+	// The search box of the tools that a request declared.
+	if (event.target.dataset.decls != null) {
+		state.declFind = event.target.value;
+		render();
+	}
 });
 document.addEventListener("keydown", (event) => {
 	const i = event.target.dataset.find;

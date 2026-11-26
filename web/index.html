@@ -45,6 +45,7 @@
 				<button data-act="step" data-by="-1" title="Previous request">‹</button>
 				<select id="request"></select>
 				<button data-act="step" data-by="1" title="Next request">›</button>
+				<input id="pick" type="search" placeholder="Go to: 12, 3.2 or text" title="A request number (12), a coordinate (3.2: input 3, step 2; 3: its first step), or text of a human input. Enter opens the first match">
 				<select id="order">
 					<option value="context">By category, in reading order</option>
 					<option value="size">By category, largest first</option>
@@ -57,6 +58,7 @@
 				</select>
 				<input id="filter" type="search" placeholder="Filter items">
 			</div>
+			<div id="picks"></div>
 			<div class="body"></div>
 		</section>
 		<section class="card" id="trend">
@@ -161,7 +163,7 @@
 			<div class="body"></div>
 		</section>
 		<section class="card" id="i-days">
-			<h2>Tokens by day</h2>
+			<h2>Activity by day</h2>
 			<div class="body"></div>
 		</section>
 		<section class="card" id="i-composition">

@@ -101,7 +101,7 @@ export interface RequestRec {
 	/** Composition by category and duration, when pi-context recorded the turn in the session. */
 	sums?: Record<Category, number>;
 	ms?: number;
-	/** Wall time of the turn: the request and the tools it ran. From the same record. */
+	/** Wall time of the turn: the request and the tools it ran, without the time that tools waited for an answer of the user. From the same record. */
 	activeMs?: number;
 	/** Time from the start of the request to the first token of the reply, when pi-context timed the stream. */
 	ttft?: number;
@@ -120,9 +120,9 @@ export interface InputRec {
 	sent: number;
 	output: number;
 	cost: number;
-	/** Time from the input to the last message it caused. */
+	/** Time from the input to the last message it caused, without `waitMs`. */
 	ms: number;
-	/** The part of `ms` that tools spent waiting for an answer of the user. Undefined when no tool asked. */
+	/** Time that tools spent waiting for an answer of the user. Undefined when no tool asked. */
 	waitMs?: number;
 }
 
@@ -138,6 +138,8 @@ export interface EventRec {
 	delta?: number;
 	/** For a compaction: the messages that its summary replaced. */
 	replaced?: number;
+	/** For a compaction: the estimated tokens of those messages. */
+	removed?: number;
 }
 
 /** The kinds of file operations. A search counts on each file it found, or on the searched path. */
@@ -182,6 +184,14 @@ export interface CommandRec {
 	program: string;
 	/** Every program that the command runs, in order. See {@link programsOf}. */
 	programs: string[];
+	/** Exit code, when the command ended with one that is not 0. */
+	exit?: number;
+	/** Set when the command did not end by itself: it ran into its timeout, or it was aborted. */
+	stopped?: "timeout" | "aborted";
+	/** Whether pi cut the output for the model. */
+	truncated?: boolean;
+	/** Lines that the command printed. */
+	lines?: number;
 	/** Requests made before the command ran: the number of the request that ran it, for a command of the model. */
 	request: number;
 	/** Tool call whose result tells the outcome. For a nested call, the call that made it. Undefined for a command of the user. */
@@ -330,6 +340,8 @@ export interface Analysis {
 	billed: Record<Category, number>;
 	/** Requests that `billed` covers. */
 	billedRequests: number;
+	/** The tool declarations that pi-context recorded, oldest first: name to size in characters, and who provides each tool. */
+	declarations: { time: number; declared: Record<string, number>; sources: Record<string, string> }[];
 	/** Estimated time at which the prompt cache of the last request expires. Undefined when the model does not cache. */
 	cacheUntil?: number;
 }
@@ -378,6 +390,8 @@ export interface ViewData {
 	rates?: Record<string, Rates>;
 	/** The description and the parameters of a tool that pi knows now. */
 	toolDoc?: (name: string) => ToolDoc | undefined;
+	/** The whole result of the tool call `id`, as the session holds it. */
+	resultText?: (id: string) => string | undefined;
 	/** Rebuilds the composition of a request that has no snapshot. */
 	reconstruct: (request: RequestRec) => Row[];
 }
@@ -399,6 +413,20 @@ export function contentText(content: unknown): string {
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content.map((block) => (block?.type === "image" ? "[image]" : (block?.text ?? ""))).join(" ");
+}
+
+/** Characters of a message: its text and images, its reasoning, and the arguments of its tool calls. */
+function messageChars(message: any): number {
+	let chars = contentChars(message?.content);
+	if (!Array.isArray(message?.content)) return chars;
+	for (const block of message.content) chars += (block?.thinking?.length ?? 0) + (block?.type === "toolCall" ? JSON.stringify(block.arguments ?? {}).length : 0);
+	return chars;
+}
+
+/** The text of the result of the tool call `id` among the entries. */
+export function resultText(entries: any[], id: string): string | undefined {
+	const entry = entries.findLast((each) => each.type === "message" && each.message?.role === "toolResult" && each.message.toolCallId === id);
+	return entry && contentText(entry.message.content);
 }
 
 export function argPath(args: any): string | undefined {
@@ -938,6 +966,10 @@ const WRAPPERS = new Map<string, RegExp>([
 	["exec", /^-a$/],
 	["nohup", /^$/],
 	["command", /^$/],
+	["stdbuf", /^-[ioe]$/],
+	["caffeinate", /^-[tw]$/],
+	["noglob", /^$/],
+	["nocorrect", /^$/],
 ]);
 /** Shell words that a command can follow, and words that start a part without a command. */
 const SHELL_PREFIXES = new Set(["if", "then", "else", "elif", "while", "until", "do", "!", "{"]);
@@ -1161,6 +1193,56 @@ export function attentionOf(commands: CommandRec[]): Attention {
 /** Whether the run took ten seconds or more. */
 export const isSlow = (command: CommandRec): boolean => (command.ms ?? 0) >= 10_000;
 
+/** Which commands to list, and in which order. */
+export interface CommandLens {
+	status?: CommandStatus;
+	/** Only the slow commands. See {@link isSlow}. */
+	slow?: boolean;
+	/** Only the commands that run the program. */
+	program?: string;
+	/** Only the commands that contain the text, in any case. */
+	text?: string;
+	/** The slowest first, instead of the order of the session. A command without a time comes last. */
+	slowest?: boolean;
+}
+
+/** Indexes of the commands that the lens lets through, in its order. */
+export function commandRows(commands: CommandRec[], lens: CommandLens = {}): number[] {
+	const text = lens.text?.toLowerCase();
+	const rows = commands
+		.map((_, index) => index)
+		.filter((index) => {
+			const command = commands[index];
+			if (lens.status && commandStatus(command) !== lens.status) return false;
+			if (lens.slow && !isSlow(command)) return false;
+			if (lens.program && !command.programs.includes(lens.program)) return false;
+			return !text || command.command.toLowerCase().includes(text);
+		});
+	return lens.slowest ? rows.sort((a, b) => (commands[b].ms ?? -1) - (commands[a].ms ?? -1)) : rows;
+}
+
+/** The lens that shows what an entry of the attention list is about. Undefined when the list has no such entry. */
+export function attentionLens(attention: Attention, entry: keyof Attention): CommandLens | undefined {
+	if (entry === "slowest") return attention.slowest === undefined ? undefined : { slowest: true };
+	if (entry === "failing") return attention.failing && { status: "failed", program: attention.failing.program };
+	return attention.repeated && { text: attention.repeated.command };
+}
+
+const COMMAND_END = /(?:^|\n\n)Command (exited with code (\d+)|timed out after [\s\S]*|aborted|terminated without an exit code)$/;
+
+/** What the result of pi's bash tool tells about the end of the command, and the lines that the command printed. */
+function commandEnd(text: string, details?: any): Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines"> {
+	const end: Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines"> = {};
+	const status = COMMAND_END.exec(text);
+	if (status?.[2]) end.exit = Number(status[2]);
+	else if (status?.[1].startsWith("timed out")) end.stopped = "timeout";
+	else if (status?.[1] === "aborted") end.stopped = "aborted";
+	const output = (status ? text.slice(0, status.index) : text).trimEnd();
+	if (details?.truncation?.truncated) end.truncated = true;
+	end.lines = end.truncated && typeof details.truncation.totalLines === "number" ? details.truncation.totalLines : output ? output.split("\n").length : 0;
+	return end;
+}
+
 /** The lines of a command, and whether it holds a heredoc or a script given to an interpreter on the command line. */
 export function commandShape(text: string): { lines: number; heredoc: boolean; inline: boolean } {
 	return {
@@ -1200,6 +1282,27 @@ export function familyTotals(totals: Totals, agents: AgentRec[]) {
 export function placeOf(analysis: Analysis, index: number): { input: number; step: number; steps: number } | undefined {
 	const input = analysis.inputs.find((each) => each.first >= 0 && index >= each.first && index < each.first + each.requests);
 	return input && { input: input.n, step: index - input.first + 1, steps: input.requests };
+}
+
+/** The place of every request. See {@link placeOf}. */
+export const places = (analysis: Analysis) => analysis.requests.map((_, index) => placeOf(analysis, index));
+
+/** A tool that a request declared: the estimated tokens of its schema, who provides it, and how often the request called it. */
+export interface DeclaredTool {
+	name: string;
+	tokens: number;
+	source: string;
+	calls: number;
+}
+
+/** The tools that the request at `index` declared, the largest schema first. Empty when pi-context recorded no declarations for it. */
+export function toolsAt(analysis: Analysis, index: number): DeclaredTool[] {
+	const request = analysis.requests[index];
+	const record = request && analysis.declarations.findLast((each) => each.time <= request.time);
+	if (!record) return [];
+	return Object.entries(record.declared)
+		.map(([name, chars]) => ({ name, tokens: estimate(chars), source: record.sources[name] ?? toolSource(name), calls: request.calls.filter((call) => call === name).length }))
+		.sort((a, b) => b.tokens - a.tokens || a.name.localeCompare(b.name));
 }
 
 /** One parameter of a tool. */
@@ -1268,6 +1371,7 @@ export function analyze(entries: any[]): Analysis {
 		unresolvedEdits: 0,
 		totals: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 },
 		timing: { activeMs: 0, modelMs: 0, toolMs: 0, ttftMs: 0, streamMs: 0, streamed: 0, streamOutput: 0, spans: { reasoning: [0, 0], toolCalls: [0, 0], answers: [0, 0] } },
+		declarations: [],
 		billed: emptySums(),
 		billedRequests: 0,
 	};
@@ -1296,21 +1400,28 @@ export function analyze(entries: any[]): Analysis {
 		file[op.op]++;
 		file.ops.push(op);
 	};
-	const declarations: { time: number; names: Set<string> }[] = [];
+	const { declarations } = analysis;
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== TURN_ENTRY || !entry.data) continue;
 		const turn: TurnData = entry.data;
 		turns.set(turn.time, turn);
 		for (const [id, path] of Object.entries(turn.paths ?? {})) paths.set(id, path);
 		for (const [id, change] of Object.entries(turn.lines ?? {})) lines.set(id, change);
-		if (turn.declared) declarations.push({ time: turn.time, names: new Set(Object.keys(turn.declared)) });
+		if (turn.declared) declarations.push({ time: turn.time, declared: turn.declared, sources: turn.sources ?? {} });
 		analysis.timing.activeMs += turn.activeMs ?? 0;
 		analysis.timing.modelMs += turn.ms ?? 0;
 		analysis.timing.toolMs += turn.toolMs ?? 0;
 	}
 	declarations.sort((x, y) => x.time - y.time);
+	// A record without sources keeps those of the record before.
+	declarations.forEach((record, i) => {
+		if (i > 0 && Object.keys(record.sources).length === 0) record.sources = declarations[i - 1].sources;
+	});
 	/** Whether the request made at `time` declared the tool. Undefined before the first recorded declarations. */
-	const declaredThen = (name: string, time: number) => declarations.findLast((record) => record.time <= time)?.names.has(name);
+	const declaredThen = (name: string, time: number) => {
+		const then = declarations.findLast((record) => record.time <= time)?.declared;
+		return then && Object.hasOwn(then, name);
+	};
 	const tool = (name: string) => {
 		let rec = tools.get(name);
 		if (!rec) {
@@ -1360,15 +1471,27 @@ export function analyze(entries: any[]): Analysis {
 		analysis.events.push(rec);
 		return rec;
 	};
-	/** Ids of the messages that the context holds in full: those since the last compaction, and those it kept. */
+	/** Sets the time that a tool waited for an answer of the user apart from the work of the turn. */
+	const waited = (ms: number) => {
+		if (!input) return;
+		input.waitMs = (input.waitMs ?? 0) + ms;
+		const request = analysis.requests.at(-1);
+		if (request?.activeMs === undefined) return;
+		const part = Math.min(ms, request.activeMs);
+		request.activeMs -= part;
+		analysis.timing.activeMs -= part;
+		analysis.timing.toolMs = Math.max(0, analysis.timing.toolMs - part);
+	};
+	/** Ids of the messages that the context holds in full: those since the last compaction, and those it kept; and the characters of each. */
 	const live: string[] = [];
+	const liveChars: number[] = [];
 	/** Counts a tool call. A call nested in the result of another one comes with its status and the id of that other call. */
 	const recordCall = (call: { id: string; name: string; arguments?: any; durationMs?: number }, time: number, nestedStatus?: string, outer?: string) => {
 		analysis.toolCalls++;
 		if (input) input.toolCalls++;
 		const workflow = workflowEvent(call);
 		if (workflow) event(workflow[0], workflow[1]);
-		if (input && isQuestion(call.name) && typeof call.durationMs === "number") input.waitMs = (input.waitMs ?? 0) + call.durationMs;
+		if (isQuestion(call.name) && typeof call.durationMs === "number") waited(call.durationMs);
 		const rec = tool(call.name);
 		rec.last = time;
 		if (nestedStatus) {
@@ -1423,6 +1546,7 @@ export function analyze(entries: any[]): Analysis {
 			const kept = live.indexOf(entry.firstKeptEntryId);
 			rec.replaced = kept < 0 ? live.length : kept;
 			live.splice(0, rec.replaced);
+			rec.removed = estimate(liveChars.splice(0, rec.replaced).reduce((sum, chars) => sum + chars, 0));
 			compacted = typeof entry.tokensBefore === "number" ? { event: rec, before: entry.tokensBefore } : undefined;
 			// The compacted context is new to the cache; the next request is not a miss.
 			cached = undefined;
@@ -1464,6 +1588,7 @@ export function analyze(entries: any[]): Analysis {
 		}
 		if (entry.type !== "message") continue;
 		live.push(entry.id);
+		liveChars.push(messageChars(entry.message));
 
 		const m = entry.message;
 		const time = m.timestamp ?? entryTime;
@@ -1479,7 +1604,7 @@ export function analyze(entries: any[]): Analysis {
 			input = inputAt(time, preview(skill ? `/skill:${skill.name} ${skill.rest}` : contentText(m.content)));
 		} else if (input && (m.role === "assistant" || m.role === "toolResult")) input.ms = Math.max(input.ms, (entryTime || time) - input.time);
 		if (m.role === "bashExecution") {
-			analysis.commands.push({ time, command: m.command, program: programOf(m.command ?? ""), programs: programsOf(m.command ?? ""), request: analysis.requests.length, ok: m.exitCode === 0 });
+			analysis.commands.push({ time, command: m.command, program: programOf(m.command ?? ""), programs: programsOf(m.command ?? ""), request: analysis.requests.length, ok: m.exitCode === 0, ...(m.exitCode ? { exit: m.exitCode } : {}) });
 			if (!m.excludeFromContext) add("bash", (m.command?.length ?? 0) + (m.output?.length ?? 0));
 		} else if (m.role === "toolResult") {
 			const rec = tool(m.toolName);
@@ -1491,7 +1616,7 @@ export function analyze(entries: any[]): Analysis {
 				rec.errors++;
 			}
 			addUsage(analysis.totals, m.usage);
-			if (input && isQuestion(m.toolName) && typeof m.durationMs === "number") input.waitMs = (input.waitMs ?? 0) + m.durationMs;
+			if (isQuestion(m.toolName) && typeof m.durationMs === "number") waited(m.durationMs);
 			const done = opsById.get(m.toolCallId);
 			const op = done?.op;
 			if (op && m.isError) {
@@ -1516,6 +1641,7 @@ export function analyze(entries: any[]): Analysis {
 			const command = commandsById.get(m.toolCallId);
 			if (command) {
 				command.ok = !m.isError;
+				Object.assign(command, commandEnd(contentText(m.content), m.details));
 				if (typeof m.durationMs === "number") command.ms = m.durationMs;
 			}
 			const skill = skillsById.get(m.toolCallId);
@@ -1617,6 +1743,7 @@ export function analyze(entries: any[]): Analysis {
 			}
 		}
 	}
+	for (const each of analysis.inputs) each.ms = Math.max(0, each.ms - (each.waitMs ?? 0));
 	analysis.files = [...files.values()];
 	for (const file of analysis.files) {
 		for (const op of file.ops) {

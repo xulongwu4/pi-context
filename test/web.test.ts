@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { analyze, rowsOf, type ViewData } from "../src/analyze.ts";
+import { analyze, resultText, rowsOf, type ViewData } from "../src/analyze.ts";
 import type { SessionSummary } from "../src/insights.ts";
 import { type Outcome, startWeb } from "../src/web.ts";
 
@@ -31,6 +31,7 @@ const view = (other?: string): ViewData => ({
 	running: false,
 	rates: { m1: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } },
 	toolDoc: (name) => (name === "bash" ? { description: "Runs a command.", params: [{ name: "command", type: "string", required: true, description: "" }] } : undefined),
+	resultText: (id) => resultText(entries, id),
 	other,
 	// The context of a request: the messages before its answer.
 	reconstruct: (request) => rowsOf(messages.slice(0, request.n === 1 ? 1 : 3), undefined, [], true),
@@ -54,6 +55,7 @@ const summary: SessionSummary = {
 	composition: {},
 	activity: { [Math.floor(Date.now() / 3_600_000)]: [1, 1, 900, 250, 50] },
 	context: 150,
+	model: "m1",
 	profile: [40, 0, 110],
 	lastUsed: { tools: { bash: Date.now() - 1500 }, programs: {}, skills: {} },
 	file: "/sessions/s1.jsonl",
@@ -72,6 +74,8 @@ const server = await startWeb({
 	openSession: (_file, title) => view(title),
 	setDropped: (ids, on) => void dropped.push([ids, on]),
 	cwd: "/work/proj",
+	sessionId: () => "s1",
+	windowOf: (model) => (model === "m1" ? 1000 : undefined),
 	title: () => "Current one",
 	changeSetting(setting, value): Outcome {
 		settings.push([setting, value]);
@@ -258,6 +262,21 @@ test("web serves the totals with subagents, the place of a request, tool documen
 	expect((await get("files", { n: 1 })).body).toEqual({ files: [] });
 	expect((await get("agent", { id: "none" })).status).toBe(400);
 	expect((await get("chain", { id: "1" })).body).toEqual({ ids: [] });
+});
+
+test("web serves the places of all requests, the lenses of the attention list, the tools of a request, the output of a command and what a session card needs", async () => {
+	const body = (await get("data")).body;
+	expect(body.places).toEqual([
+		{ input: 1, step: 1, steps: 2 },
+		{ input: 1, step: 2, steps: 2 },
+	]);
+	expect(body.lenses).toEqual({});
+	expect(body.commands[0].lines).toBe(2);
+	// The fixture has no record of the declarations.
+	expect((await get("request", { n: 1 })).body.tools).toEqual([]);
+	expect((await get("output", { i: 0 })).body).toEqual({ text: "a.txt\nb.txt" });
+	expect((await get("output", { i: 5 })).status).toBe(400);
+	expect((await get("insights", { days: 7 })).body.sessions[0]).toMatchObject({ model: "m1", window: 1000, current: true });
 });
 
 test("web takes a range of days for Insights only when it ends after its first day", async () => {

@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import {
 	analyze,
+	attentionLens,
 	attentionOf,
+	commandRows,
 	commandShape,
 	familyTotals,
 	fileRows,
@@ -10,14 +12,16 @@ import {
 	MARK_KINDS,
 	paramsOf,
 	placeOf,
+	places,
 	programRanks,
 	programsOf,
 	tokensPerSecond,
+	toolsAt,
 	trendBars,
 	TURN_ENTRY,
 } from "../src/analyze.ts";
 import { CHOICES, choiceOf, setChoice } from "../src/config.ts";
-import { agentDetail, boardOf, chainOf, fleetSummary, readiness, type FleetEvent, type TaskRec } from "../src/fleet.ts";
+import { agentDetail, boardOf, chainOf, fleetSummary, narrow, readiness, type FleetEvent, type TaskRec } from "../src/fleet.ts";
 import { fmtDay } from "../src/format.ts";
 import { aggregate, skillSource, summarize } from "../src/insights.ts";
 import { StreamClock } from "../src/stream.ts";
@@ -105,7 +109,7 @@ test("analyze sets the time that an input waited for the user apart", () => {
 		result("b", "bash", 61_000, { durationMs: 700 }),
 		assistant(62_000, 20),
 	]);
-	expect(a.inputs.map((i) => [i.ms, i.waitMs])).toEqual([[61_000, 50_000]]);
+	expect(a.inputs.map((i) => [i.ms, i.waitMs])).toEqual([[11_000, 50_000]]);
 });
 
 test("StreamClock times the first token and the blocks of a reply", () => {
@@ -310,4 +314,135 @@ test("the trend fit and the file order by lines are view defaults", () => {
 	expect(choiceOf(config, "fit")).toBe("200");
 	expect(setChoice(config, "fit", "50")).toBe(false);
 	expect(CHOICES.files.values).toContain("lines");
+});
+
+test("analyze takes the wait for the user out of the durations of the turn", () => {
+	const a = analyze([
+		user(1000),
+		turn(2000, 900, { activeMs: 59_500, toolMs: 58_000 }),
+		assistant(2000, 10, [call("q", "ask_user_question", { questions: [{ question: "Which?" }] }), call("b", "bash", { command: "ls" })]),
+		result("q", "ask_user_question", 60_000, { durationMs: 50_000 }),
+		result("b", "bash", 61_000, { durationMs: 700 }),
+		turn(62_000, 400),
+		assistant(62_000, 20),
+	]);
+	expect(a.requests.map((r) => r.activeMs)).toEqual([9500, 400]);
+	expect([a.timing.activeMs, a.timing.toolMs, a.timing.modelMs]).toEqual([9900, 8000, 1300]);
+	// A wait that is longer than the recorded turn leaves no negative time.
+	const b = analyze([user(1), turn(2, 100, { activeMs: 300, toolMs: 200 }), assistant(2, 10, [call("q", "questionnaire")]), result("q", "questionnaire", 900, { durationMs: 800 })]);
+	expect([b.requests[0].activeMs, b.timing.activeMs, b.timing.toolMs, b.inputs[0].ms]).toEqual([0, 0, 0, 99]);
+});
+
+test("programsOf skips the wrappers stdbuf, caffeinate, noglob and nocorrect", () => {
+	expect(programsOf("stdbuf -oL make | noglob rg x; caffeinate -t 60 nocorrect npm i")).toEqual(["make", "rg", "npm"]);
+	expect(programsOf("stdbuf -o L -e 0 ./run.sh")).toEqual(["run.sh"]);
+});
+
+test("analyze reads how a command ended and how much it printed", () => {
+	const bash = (id: string) => call(id, "bash", { command: "cmd " + id });
+	const text = (value: string) => [{ type: "text", text: value }];
+	const a = analyze([
+		user(1),
+		assistant(2, 10, ["b1", "b2", "b3", "b4", "b5", "b6"].map(bash)),
+		result("b1", "bash", 3, { content: text("out\nmore\n\nCommand exited with code 2"), isError: true }),
+		result("b2", "bash", 4, { content: text("x\n\nCommand timed out after 30 seconds"), isError: true }),
+		result("b3", "bash", 5, { content: text("Command aborted"), isError: true }),
+		result("b4", "bash", 6, { content: text("l1\nl2\n\n[Showing lines 4999-5000 of 5000. Full output: /tmp/x]"), details: { truncation: { truncated: true, totalLines: 5000 } } }),
+		result("b5", "bash", 7, { content: text("a\nb\nc\n") }),
+		result("b6", "bash", 8, { content: text("") }),
+		{ type: "message", id: "u", timestamp: new Date(9).toISOString(), message: { role: "bashExecution", command: "false", output: "", exitCode: 1, timestamp: 9 } },
+	]);
+	expect(a.commands.map((c) => [c.ok, c.exit, c.stopped, c.truncated, c.lines])).toEqual([
+		[false, 2, undefined, undefined, 2],
+		[false, undefined, "timeout", undefined, 1],
+		[false, undefined, "aborted", undefined, 0],
+		[true, undefined, undefined, true, 5000],
+		[true, undefined, undefined, undefined, 3],
+		[true, undefined, undefined, undefined, 0],
+		[false, 1, undefined, undefined, undefined],
+	]);
+});
+
+test("commandRows filters and orders the commands, and attentionLens turns an attention entry into a filter", () => {
+	const commands = [
+		{ time: 1, command: "git status", program: "git", programs: ["git"], request: 1, ms: 200, ok: true },
+		{ time: 2, command: "npm test | tee log", program: "npm", programs: ["npm", "tee"], request: 1, ms: 12_000, ok: false },
+		{ time: 3, command: "npm test | tee log", program: "npm", programs: ["npm", "tee"], request: 2, ms: 30_000, ok: false },
+		{ time: 4, command: "ls", program: "ls", programs: ["ls"], request: 2 },
+	];
+	expect(commandRows(commands)).toEqual([0, 1, 2, 3]);
+	expect(commandRows(commands, { slow: true })).toEqual([1, 2]);
+	expect(commandRows(commands, { status: "failed", program: "tee" })).toEqual([1, 2]);
+	expect(commandRows(commands, { status: "unknown" })).toEqual([3]);
+	expect(commandRows(commands, { text: "GIT" })).toEqual([0]);
+	// The slowest first; a command without a time comes last.
+	expect(commandRows(commands, { slowest: true })).toEqual([2, 1, 0, 3]);
+	const attention = attentionOf(commands);
+	expect(attentionLens(attention, "slowest")).toEqual({ slowest: true });
+	expect(attentionLens(attention, "failing")).toEqual({ status: "failed", program: "npm" });
+	expect(attentionLens(attention, "repeated")).toEqual({ text: "npm test | tee log" });
+	expect(attentionLens({}, "failing")).toBeUndefined();
+});
+
+test("places gives the place of every request", () => {
+	const a = analyze([user(1), assistant(2, 10), assistant(3, 20), user(4), assistant(5, 30)]);
+	expect(places(a)).toEqual([0, 1, 2].map((i) => placeOf(a, i)));
+	expect(places(a)[1]).toEqual({ input: 1, step: 2, steps: 2 });
+});
+
+test("toolsAt lists the tools that a request declared, with their calls in that request", () => {
+	const a = analyze([
+		user(1),
+		assistant(2, 10),
+		turn(3, 100, { declared: { read: 400, bash: 800 }, sources: { read: "pi", bash: "cli" } }),
+		assistant(3, 10, [call("a", "bash", { command: "ls" }), call("b", "bash", { command: "ls" })]),
+		turn(5, 100, { declared: { read: 400, mcp__x__y: 40 } }),
+		assistant(5, 10, [call("c", "read", { path: "/a" })]),
+	]);
+	// Nothing is recorded for the first request.
+	expect(toolsAt(a, 0)).toEqual([]);
+	expect(toolsAt(a, 1)).toEqual([
+		{ name: "bash", tokens: 200, source: "cli", calls: 2 },
+		{ name: "read", tokens: 100, source: "pi", calls: 0 },
+	]);
+	// The record without sources keeps the sources of the record before; a tool they do not name gets the source that its name tells.
+	expect(toolsAt(a, 2)).toEqual([
+		{ name: "read", tokens: 100, source: "pi", calls: 1 },
+		{ name: "mcp__x__y", tokens: 10, source: "mcp:x", calls: 0 },
+	]);
+});
+
+test("analyze estimates the tokens of the messages that a compaction replaced", () => {
+	const entries = [user(1, "x".repeat(400)), assistant(2, 10, [{ type: "thinking", thinking: "t".repeat(40) }, call("a", "read", { path: "/abc" })]), user(3, "y".repeat(800)), assistant(4, 20), user(5), assistant(6, 30)];
+	const a = analyze([...entries, { type: "compaction", timestamp: new Date(7).toISOString(), tokensBefore: 900, firstKeptEntryId: entries[4].id }]);
+	// 400 + (40 + the 15 characters of the arguments) + 800 + 2 characters.
+	expect(a.events.find((e) => e.kind === "compaction")?.removed).toBe(Math.ceil(1257 / 4));
+});
+
+test("narrow keeps the events, the tasks and the delegation of one agent", () => {
+	const agents: any[] = [
+		{ id: "a1", type: "Explore", description: "find it", status: "completed" },
+		{ id: "a2", type: "Explore", description: "other", status: "running" },
+	];
+	const tasks: TaskRec[] = [
+		{ id: "1", subject: "mine", status: "pending", owner: "a1", blocks: [], blockedBy: [] },
+		{ id: "2", subject: "of the type", status: "pending", owner: "Explore", blocks: [], blockedBy: [] },
+		{ id: "3", subject: "free", status: "pending", blocks: [], blockedBy: [] },
+	];
+	const timeline: FleetEvent[] = [
+		{ time: 1, kind: "delegation", agent: "a1", title: "find it" },
+		{ time: 2, kind: "delegation", agent: "a2", title: "other" },
+		{ time: 3, kind: "task", title: "free" },
+		{ time: 4, kind: "completion", agent: "a1", title: "done" },
+	];
+	const narrowed = narrow(agents[0], timeline, boardOf(tasks, agents));
+	expect(narrowed.timeline.map((e) => e.time)).toEqual([1, 4]);
+	expect(narrowed.board.map((group) => [group.owner, group.items.map((item) => item.id)])).toEqual([
+		["a1", ["1"]],
+		["Explore", ["2", "a1"]],
+	]);
+});
+
+test("summarize keeps the model of the last request", () => {
+	expect(summarize([{ type: "session", id: "s", cwd: "/p", timestamp: new Date(1).toISOString() }, user(1), assistant(2, 10)]).model).toBe("m1");
 });

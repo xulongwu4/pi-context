@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
+	attentionLens,
 	attentionOf,
 	baselineOf,
 	briefOf,
@@ -15,6 +16,7 @@ import {
 	LABELS,
 	MARK_KINDS,
 	placeOf,
+	places,
 	programRanks,
 	type RequestRec,
 	replyCounts,
@@ -26,12 +28,13 @@ import {
 	textOf,
 	tokensPerSecond,
 	toolRows,
+	toolsAt,
 	trendBars,
 	type ViewData,
 } from "./analyze.ts";
 import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
 import { viewJson } from "./export.ts";
-import { agentDetail, boardOf, chainOf, fleetSummary } from "./fleet.ts";
+import { agentDetail, boardOf, chainOf, fleetSummary, narrow } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
 import { aggregate, type SessionSort } from "./insights.ts";
 import type { OverlayHost } from "./overlay.ts";
@@ -42,7 +45,7 @@ export interface Outcome {
 	level: "info" | "error";
 }
 
-export interface WebHost extends Pick<OverlayHost, "collect" | "isLive" | "loadSummaries" | "openSession" | "setDropped" | "cwd"> {
+export interface WebHost extends Pick<OverlayHost, "collect" | "isLive" | "loadSummaries" | "openSession" | "setDropped" | "cwd" | "sessionId" | "windowOf"> {
 	/** Title of the current session. */
 	title(): string;
 	changeSetting(setting: string, value: string): Outcome;
@@ -161,6 +164,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			const file = query.get("session");
 			const { data, version: collected } = view(file, true);
 			const board = boardOf(data.tasks, data.agents);
+			const attention = attentionOf(data.analysis.commands);
 			return {
 				...viewJson(data),
 				trend: trendBars(data.analysis, query.get("turn") === "1", query.get("delta") === "1"),
@@ -178,7 +182,10 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				board,
 				fleet: fleetSummary(data.agents, data.timeline, board),
 				family: familyTotals(data.analysis.totals, data.agents),
-				attention: attentionOf(data.analysis.commands),
+				attention,
+				// What each entry of the attention list filters the commands by.
+				lenses: { slowest: attentionLens(attention, "slowest"), failing: attentionLens(attention, "failing"), repeated: attentionLens(attention, "repeated") },
+				places: places(data.analysis),
 				programs: programRanks(data.analysis.commands),
 				tps: tokensPerSecond(data.analysis.timing),
 				rates: data.rates ?? {},
@@ -210,6 +217,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				brief: briefOf(v.data.analysis, index, query.get("turn") === "1"),
 				replies: replyCounts(rows),
 				place: placeOf(v.data.analysis, index),
+				tools: toolsAt(v.data.analysis, index),
 			};
 		},
 		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. A tool result comes with its call. */
@@ -225,6 +233,14 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			const row = (request.rows ?? full)[index];
 			return described(row, row && textOf(row, index, full), full);
 		},
+		/** The whole output of command `i`, as the session holds it. */
+		output(query) {
+			const { data } = view(query.get("session"));
+			const id = data.analysis.commands[Number(query.get("i"))]?.id;
+			const text = id === undefined ? undefined : data.resultText?.(id);
+			if (text === undefined) throw new Error("The session holds no output of this command.");
+			return { text };
+		},
 		/** The description and the parameters of tool `name`, when pi knows the tool now. */
 		tool(query) {
 			const doc = view(query.get("session")).data.toolDoc?.(query.get("name") ?? "");
@@ -236,12 +252,13 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 			const v = view(query.get("session"));
 			return { files: filesUpTo(v.data.analysis.files, indexOf(v, query.get("n")) + 1) };
 		},
-		/** What subagent `id` was asked, what it answered, its tasks and its last events. */
+		/** What subagent `id` was asked, what it answered, its tasks and its last events; and the timeline and the board with only what is about it. */
 		agent(query) {
 			const { data } = view(query.get("session"));
 			const agent = data.agents.find((each) => each.id === query.get("id"));
 			if (!agent) throw new Error("There is no such subagent.");
-			return agentDetail(agent, data.timeline, boardOf(data.tasks, data.agents));
+			const board = boardOf(data.tasks, data.agents);
+			return { ...agentDetail(agent, data.timeline, board), ...narrow(agent, data.timeline, board) };
 		},
 		/** The tasks that task `id` waits for, directly or through other tasks. */
 		chain(query) {
@@ -264,7 +281,11 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				uses: kind && name ? { kind, name } : undefined,
 			};
 			const insights = aggregate(await host.loadSummaries(days, () => {}), Date.now(), days, filter);
-			const sessions = insights.sessions.map(({ models, tools, programs, skills, composition, activity, lastUsed, ...session }) => session);
+			const sessions = insights.sessions.map(({ models, tools, programs, skills, composition, activity, lastUsed, ...session }) => ({
+				...session,
+				window: host.windowOf(session.model),
+				current: session.id === host.sessionId(),
+			}));
 			for (const session of sessions) if (session.file) known.set(session.file, session.name || session.cwd);
 			return { ...insights, days: all ? "all" : days, sessions };
 		},

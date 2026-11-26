@@ -5,7 +5,7 @@ import { fmtDay } from "./format.ts";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-const CACHE_VERSION = 5;
+const CACHE_VERSION = 6;
 const TOP = 10;
 /** Days that the list of days covers at most: 53 weeks. */
 const MAX_DAYS = 371;
@@ -48,8 +48,9 @@ export interface SessionSummary {
 	 * The tool calls count in the hour of the human input that caused them.
 	 */
 	activity: Record<string, [number, number, number, number, number]>;
-	/** Prompt tokens of the last request. */
+	/** Prompt tokens of the last request, and its model. */
 	context: number;
+	model: string;
 	/** Estimated tokens of the last recorded request, in the order of CATEGORIES. */
 	profile?: number[];
 	/** Start of the last human input. */
@@ -173,6 +174,7 @@ export function summarize(entries: any[]): SessionSummary {
 		composition: {},
 		activity: {},
 		context: 0,
+		model: "",
 		lastUser: analysis.inputs.findLast((input) => input.preview)?.preview ?? "",
 		skillInfo: {},
 		lastUsed: { tools: {}, programs: {}, skills: {} },
@@ -200,6 +202,7 @@ export function summarize(entries: any[]): SessionSummary {
 		hour[3] += request.context;
 		hour[4] += request.cacheRead;
 		summary.context = request.context;
+		summary.model = request.model;
 		if (request.sums && estimated > 0) summary.profile = CATEGORIES.map((cat) => request.sums?.[cat] ?? 0);
 	}
 	for (const input of analysis.inputs) {

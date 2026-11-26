@@ -29,6 +29,7 @@ import {
 	type Row,
 	rowsOf,
 	scaleOf,
+	resultText,
 	schemasOf,
 	sumByCategory,
 	sumTokens,
@@ -329,6 +330,7 @@ export default function (pi: ExtensionAPI) {
 			parentSession: ctx.sessionManager.getHeader()?.parentSession,
 			rates: ratesOf(ctx, analysis),
 			toolDoc,
+			resultText: (id) => resultText(branch, id),
 			reconstruct: (request) =>
 				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
 		};
@@ -369,6 +371,7 @@ export default function (pi: ExtensionAPI) {
 			parentSession: header?.parentSession,
 			other: title,
 			timeline: timelineOf(branch, analysis.agents),
+			resultText: (id) => resultText(branch, id),
 			tasks: header?.cwd && header?.id ? readTasks(taskFile(header.cwd, header.id, getAgentDir())) : [],
 			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true, sources) : []),
 		};
@@ -809,6 +812,8 @@ export default function (pi: ExtensionAPI) {
 				openSession: collectFile,
 				setDropped,
 				cwd: ctx.cwd,
+				sessionId: () => ctx.sessionManager.getSessionId(),
+				windowOf: (model) => windowOf(ctx, model),
 				configPath,
 			};
 			if (sub === "web") {

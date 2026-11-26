@@ -211,6 +211,17 @@ export function agentDetail(agent: AgentRec, timeline: FleetEvent[], board: Boar
 	};
 }
 
+/** The timeline and the board of one agent: its events, the tasks that it or its type owns, and its own delegation. */
+export function narrow(agent: AgentRec, timeline: FleetEvent[], board: Board): { timeline: FleetEvent[]; board: Board } {
+	return {
+		timeline: timeline.filter((event) => event.agent === agent.id),
+		board: board
+			.filter((group) => group.owner === agent.id || group.owner === agent.type)
+			.map((group) => ({ owner: group.owner, items: group.items.filter((item) => !item.agent || item.agent === agent.id) }))
+			.filter((group) => group.items.length > 0),
+	};
+}
+
 /** Ids of the tasks that must finish before the task `id`: its blockers, then theirs, the nearest first. */
 export function chainOf(tasks: TaskRec[], id: string): string[] {
 	const byId = new Map(tasks.map((task) => [task.id, task]));
