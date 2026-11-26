@@ -18,6 +18,8 @@ const INSIGHT_CARDS = ["i-kpi", "i-days", "i-week", "i-heat", "i-composition", "
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 /** Most rows a table shows, and most removed items the browser lists. */
 const MAX_LIST = 200;
+/** A category of the Context Browser with more items than this has its own filter box. */
+const CAT_FIND_FROM = 8;
 /** Most item contents kept after they were opened. */
 const MAX_TEXTS = 50;
 const SESSIONS_STEP = 60;
@@ -111,6 +113,8 @@ const state = {
 	/** Whether the page took the view defaults of the settings. */
 	started: false,
 	openCats: new Set(),
+	/** Category to the text that its filter box in the Context Browser holds. */
+	catFind: {},
 	openItems: new Set(),
 	/** Paths of the files whose operations File Activity lists. */
 	openFiles: new Set(),
@@ -1028,10 +1032,17 @@ function browserCard(d) {
 		const list = [["All", view.rows.length, ""], ["Thinking", replies.reasoning, "reasoning"], ["Tool calls", replies.toolCalls, "toolCalls"], ["Answers", replies.answers, "answers"]];
 		head.push(`<div class="controls">${chips("reply", list)}</div>`);
 	}
-	const passes = (row) => (!kind || row.cat === kind) && (!needle || `${row.label} ${row.preview}`.toLowerCase().includes(needle));
+	const holds = (row, text) => `${row.label} ${row.preview}`.toLowerCase().includes(text);
 	// The list of what the request added and changed leaves the other items out.
 	const changes = order === "added";
-	const items = view.rows.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" })).filter(({ row, mark }) => passes(row) && (!changes || mark));
+	const grouped = order !== "flat" && !changes;
+	// A filter shows what it found.
+	const openOf = (cat) => (needle || kind ? true : state.openCats.has(cat));
+	// The filter box of a category keeps items of an open category, in the lists by category.
+	const findOf = (cat) => (grouped && openOf(cat) ? (state.catFind[cat] ?? "").trim().toLowerCase() : "");
+	const within = (row) => (!kind || row.cat === kind) && (!needle || holds(row, needle));
+	const passes = (row) => within(row) && (!findOf(row.cat) || holds(row, findOf(row.cat)));
+	const items = view.rows.map((row, i) => ({ row, i, mark: view.marks?.[i] ?? "" })).filter(({ row, mark }) => within(row) && (!changes || mark));
 	const all = totalOf(sumBy(view.rows));
 	const canDrop = !request && !d.readOnly;
 	// One band for each item, in reading order. Its width is the share of the item.
@@ -1058,17 +1069,25 @@ function browserCard(d) {
 		return head.join("") + (list || `<p class="muted">${none}</p>`) + removed;
 	}
 	const groups = CATS.map((cat) => {
-		const own = items.filter((item) => item.row.cat === cat);
-		if (own.length === 0) return "";
+		const whole = items.filter((item) => item.row.cat === cat);
+		if (whole.length === 0) return "";
+		const find = findOf(cat);
+		const own = find ? whole.filter((item) => holds(item.row, find)) : whole;
 		if (bySize) own.sort((a, b) => b.row.tokens - a.row.tokens);
 		const tokens = own.reduce((sum, item) => sum + item.row.tokens, 0);
-		// A filter shows what it found.
-		const open = needle || kind ? true : state.openCats.has(cat);
+		const open = openOf(cat);
 		const delta = badge(cat);
-		const title = `<div class="cat" data-act="cat" data-cat="${cat}"><span>${open ? "▾" : "▸"}</span><i class="dot" style="background:${COLORS[cat]}"></i><b>${esc(labels[cat])} <small>${own.length} items</small></b>${delta}<span class="tok">≈${tok(tokens * view.factor)}</span><span class="share">${pct(tokens, all)}</span></div>`;
+		const count = find ? `${own.length} of ${whole.length} items` : `${own.length} items`;
+		// A box that holds text stays, so that the text can be cleared.
+		const box =
+			whole.length > CAT_FIND_FROM || state.catFind[cat]
+				? `<div class="catfind"><input type="search" data-cat-find="${cat}" data-focus="cat-${cat}" placeholder="Filter ${esc(labels[cat].toLowerCase())}" value="${esc(state.catFind[cat] ?? "")}"></div>`
+				: "";
+		const none = own.length === 0 ? `<p class="muted">Nothing matches.</p>` : "";
+		const title = `<div class="cat" data-act="cat" data-cat="${cat}"><span>${open ? "▾" : "▸"}</span><i class="dot" style="background:${COLORS[cat]}"></i><b>${esc(labels[cat])} <small>${count}</small></b>${delta}<span class="tok">≈${tok(tokens * view.factor)}</span><span class="share">${pct(tokens, all)}</span></div>`;
 		// The tool declarations list the tools that the request declared, when pi-context recorded them.
 		const declared = cat === "tools" && view.tools?.length ? declaredHtml(view) : "";
-		return open ? title + own.map((item) => itemHtml(item, view.factor, canDrop)).join("") + declared : title;
+		return open ? title + box + own.map((item) => itemHtml(item, view.factor, canDrop)).join("") + none + declared : title;
 	});
 	return head.join("") + (groups.join("") || `<p class="muted">Nothing matches.</p>`) + removed;
 }
@@ -2129,6 +2148,9 @@ const actions = {
 		const row = (state.request == null ? state.data.current : state.view?.rows)?.[i];
 		if (!row) return;
 		state.openCats.add(row.cat);
+		// The filter box of the category must not hide the item.
+		const find = (state.catFind[row.cat] ?? "").trim().toLowerCase();
+		if (find && !`${row.label} ${row.preview}`.toLowerCase().includes(find)) delete state.catFind[row.cat];
 		if (state.openItems.has(keyOf(row))) render();
 		else openItem(i);
 		document.querySelector(`#browser .item[data-i="${i}"]`)?.scrollIntoView({ block: "nearest" });
@@ -2244,6 +2266,11 @@ document.addEventListener("input", (event) => {
 	// The search box of the tools that a request declared.
 	if (event.target.dataset.decls != null) {
 		state.declFind = event.target.value;
+		render();
+	}
+	// The filter box of a category of the Context Browser.
+	if (event.target.dataset.catFind != null) {
+		state.catFind[event.target.dataset.catFind] = event.target.value;
 		render();
 	}
 	// The search box of the programs of Command Executions.

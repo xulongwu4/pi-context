@@ -124,6 +124,8 @@ a { color: var(--accent); cursor: pointer; }
 .cat:hover, .item:hover { background: var(--bg); }
 .cat b { flex: 1; }
 .item { padding-left: 22px; font-size: 13px; }
+.catfind { display: flex; padding: 4px 6px 4px 22px; border-bottom: 1px solid var(--line); }
+.catfind input { flex: 1; min-width: 0; }
 .item.dropped .pv { text-decoration: line-through; }
 .item .mark { flex: 0 0 10px; font-weight: 700; color: var(--good); }
 .item .lbl { flex: 0 0 auto; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

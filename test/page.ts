@@ -428,9 +428,10 @@ export async function openPage(url: string) {
 			el(target).value = value;
 			await send(target, { type: "input" });
 		},
-		/** Chooses an option of a select. */
+		/** Chooses an option of a select, which tells it as a browser does: with an input event, then a change event. */
 		async choose(target: string | El, value: string) {
 			el(target).value = value;
+			await send(target, { type: "input" });
 			await send(target, { type: "change" });
 		},
 		key: (target: string | El, key: string, init: Record<string, any> = {}) => send(target, { type: "keydown", key, ...init }),

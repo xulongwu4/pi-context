@@ -210,3 +210,55 @@ test("a bar whose items are in doubt is hatched, and not with Changes", async ()
 	expect(doubted()).toEqual([false, false, false]);
 	expect(page.one("#trend .body").textContent).not.toContain("A hatched bar");
 });
+
+test("a category with many items has a filter box of its own, which leaves the other categories alone", async () => {
+	const calls = Array.from({ length: 10 }, (_, i) => call(`c${i}`, "bash", { command: `cat file-${i}.txt` }));
+	const told = [
+		{ role: "user", content: "read the files", timestamp: 1000 },
+		assistant(2000, 100, calls),
+		...calls.map((one, i) => result(3000 + i, one.id, "bash", `content of file ${i}`)),
+		assistant(4000, 400, [{ type: "text", text: "Done." }]),
+	];
+	const page = await open(told);
+	const cat = (name: string) => page.all("#browser .cat").find((title) => title.textContent.includes(name))!;
+	const labels = (label: string) => page.texts("#browser .item .lbl").filter((text) => text === label).length;
+	const box = () => page.one(`#browser [data-cat-find="${cat("Tool calls").dataset.cat}"]`);
+	expect(page.all("#browser .catfind")).toHaveLength(0);
+	await page.click(cat("User messages"));
+	await page.click(cat("Tool calls"));
+	await page.click(cat("Tool results"));
+	// The user message is alone in its category: no box.
+	expect(page.all("#browser .catfind")).toHaveLength(2);
+	expect([labels("user"), labels("call bash"), labels("result bash")]).toEqual([1, 10, 10]);
+
+	await page.type(box(), "file-7");
+	expect([labels("user"), labels("call bash"), labels("result bash")]).toEqual([1, 1, 10]);
+	expect(cat("Tool calls").querySelector("small")!.textContent).toBe("1 of 10 items");
+	expect(cat("Tool results").querySelector("small")!.textContent).toBe("10 items");
+	expect(box().value).toBe("file-7");
+	expect(page.document.activeElement).toBe(box());
+	// The strip dims the items that the box leaves out.
+	expect(page.all("#browser .strip .off")).toHaveLength(9);
+
+	await page.type(box(), "no such file");
+	expect(labels("call bash")).toBe(0);
+	expect(page.one("#browser").textContent).toContain("Nothing matches.");
+	expect(cat("Tool calls").querySelector("small")!.textContent).toBe("0 of 10 items");
+
+	// A band shows its item, also when the box leaves the item out: the box is cleared.
+	await page.click('#browser [data-act="band"][data-i="3"]');
+	expect(box().value).toBe("");
+	expect(labels("call bash")).toBe(10);
+	expect(page.document.shown?.querySelector(".pv")?.textContent).toContain("file-2");
+
+	// A closed category and the one list of all items take no box.
+	await page.type(box(), "file-7");
+	await page.click(cat("Tool calls"));
+	expect(cat("Tool calls").querySelector("small")!.textContent).toBe("10 items");
+	expect(page.all("#browser .strip .off")).toHaveLength(0);
+	await page.click(cat("Tool calls"));
+	expect(labels("call bash")).toBe(1);
+	await page.choose("#order", "flat");
+	expect(page.all("#browser .catfind")).toHaveLength(0);
+	expect(labels("call bash")).toBe(10);
+});
