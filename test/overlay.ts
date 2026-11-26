@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
-import { analyze, resultText, rowsOf, type ViewData } from "../src/analyze.ts";
+import type { ViewData } from "../src/analyze.ts";
 import type { OverlayHost, SettingRequest, Tab } from "../src/overlay.ts";
 
 const TUI_PACKAGE = "@earendil-works/pi-tui";
@@ -32,38 +32,7 @@ export const { visibleWidth } = tui;
 /** The keys of a terminal, as the terminal sends them. */
 export const KEYS = { up: "\x1b[A", down: "\x1b[B", right: "\x1b[C", left: "\x1b[D", enter: "\r", escape: "\x1b", tab: "\t", backspace: "\x7f" } as const;
 
-const usage = (input: number, output: number) => ({ input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output, cost: { total: 0.01 } });
-export const assistant = (timestamp: number, input: number, content: any[]) => ({ role: "assistant", model: "m1", stopReason: "stop", timestamp, usage: usage(input, 10), content });
-export const call = (id: string, name: string, args: object) => ({ type: "toolCall", id, name, arguments: args });
-export const result = (timestamp: number, id: string, name: string, text: string, isError = false) => ({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError, timestamp });
-
-/** The dashboard data of a session that told `messages`, with nothing recorded by pi-context. `extra` replaces fields. */
-export function viewOf(messages: any[], extra: Partial<ViewData> = {}): ViewData {
-	const entries = messages.map((message, i) => ({ type: "message", id: `e${i}`, parentId: i ? `e${i - 1}` : null, timestamp: new Date(message.timestamp).toISOString(), message }));
-	const analysis = analyze(entries);
-	return {
-		analysis,
-		current: rowsOf(messages, undefined, [], true),
-		usage: { tokens: analysis.requests.at(-1)?.context ?? 0, contextWindow: 1000, percent: 16 },
-		model: "m1",
-		declared: [],
-		schemas: {},
-		sources: {},
-		factor: 1,
-		hints: [],
-		dropped: [],
-		config: { budget: 5 },
-		agents: [],
-		timeline: [],
-		tasks: [],
-		running: false,
-		rates: {},
-		toolDoc: () => undefined,
-		resultText: (id) => resultText(entries, id),
-		reconstruct: () => [],
-		...extra,
-	};
-}
+export { assistant, call, result, viewOf } from "./session.ts";
 
 /**
  * An overlay over `data` in a terminal of `rows` rows and `width` columns, without a terminal: the keys go in, and the screen comes out as text.

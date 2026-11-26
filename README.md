@@ -183,3 +183,5 @@ bun test
 ```
 
 The tests of the overlay (`test/overlay.test.ts`) drive it without a terminal: `test/overlay.ts` sends keys and gives the screen back as text. They draw with the `@earendil-works/pi-tui` of the `pi` on the `PATH`, unless the packages of this repo are installed.
+
+The tests of the web page (`test/page.test.ts`) run `web/app.js` whole against a real server, without a browser: `test/page.ts` holds the small DOM that the page needs, and clicks, types and points as a reader does. That DOM lays nothing out, so a test gives the sizes that the page measures, and it knows only the selectors that the page and the tests use. How the page looks is not tested.
