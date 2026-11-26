@@ -56,8 +56,9 @@ const state = {
 	/**
 	 * Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width, the bars scaled to the tallest bar in view.
 	 * `last` is the number of bars that the trend shows, the last ones, until `whole` is set. 0: every bar.
+	 * `dna`: a bar shows one band for each item in place of one for each category.
 	 */
-	trend: { byTurn: false, delta: false, fit: false, adaptive: false, last: 0, whole: false },
+	trend: { byTurn: false, delta: false, fit: false, adaptive: false, dna: false, last: 0, whole: false },
 	/** Current Context shows a treemap in place of the bar. */
 	treemap: false,
 	/** Order of the tools: calls, schema or name. */
@@ -485,8 +486,24 @@ function trendCard(d) {
 	// The view default can keep the trend to its last bars.
 	const hidden = last && !whole ? Math.max(0, all.length - last) : 0;
 	const bars = all.slice(hidden);
+	// DNA: the items of the bars, once the server told them for the bars on show.
+	const known = state.trend.dna && dna.key === JSON.stringify(dnaQuery());
+	const strandOf = (bar) => {
+		const request = d.requests[bar.index];
+		const strand = known ? dna.bars.get(request.n) : undefined;
+		if (strand?.time !== request.time || !strand.runs.length) return undefined;
+		if (!delta) return strand;
+		// With changes, the items have to explain the change of the size that the provider reported.
+		// Those of a rebuilt request may not: they do not show what an extension took out of the context.
+		const net = bandsOf(strand, 1).total - bandsOf(strand, -1).total;
+		strand.factor = net ? bar.value / net : 0;
+		return strand.factor >= MIN_FACTOR && strand.factor <= MAX_FACTOR ? strand : undefined;
+	};
 	// What a bar adds above the base line, and what it takes away below the line.
 	const sides = (bar) => {
+		// The items tell more change than the categories: an item that came counts also when another one of its category left.
+		const strand = delta ? strandOf(bar) : undefined;
+		if (strand) return [1, -1].map((side) => bandsOf(strand, side).total * strand.factor);
 		const values = bar.parts ? CATS.map((cat) => bar.parts[cat]) : [bar.value];
 		return [values.reduce((sum, value) => sum + Math.max(0, value), 0), values.reduce((sum, value) => sum - Math.min(0, value), 0)];
 	};
@@ -508,8 +525,10 @@ function trendCard(d) {
 			bar.parts
 				? CATS.filter((cat) => sign * bar.parts[cat] > 0).map((cat) => `<i style="flex:${sign * bar.parts[cat]};background:${COLORS[cat]}"></i>`).join("")
 				: `<i style="flex:1;background:#9ca3af"></i>`;
+		// The bands of a DNA bar are drawn when the bar comes into view: see paintDna().
+		const strand = strandOf(bar);
 		const half = (size, most, sign) =>
-			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack" style="flex:0 0 calc(${(size / most) * 100}% * var(--zoom, 1))">${stack(sign)}</div>` : ""}</div>`;
+			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack${strand ? ` dna" data-act="strand" data-side="${sign}` : ""}" style="flex:0 0 calc(${(size / most) * 100}% * var(--zoom, 1))">${strand ? "" : stack(sign)}</div>` : ""}</div>`;
 		const tip = [
 			input ? `input #${input.n} · ${input.requests} requests · ${input.preview}` : "",
 			`${coord(request.n)} · ${clock(request.time)} · ${request.model}`,
@@ -519,9 +538,11 @@ function trendCard(d) {
 			request.ttft == null ? "" : `first token after ${secs(request.ttft)}`,
 			marks.length ? `marks: ${marks.map((kind) => MARKS[kind]?.[1] ?? kind).join(", ")}` : "",
 			miss ? "cache miss: " + missText(miss) : "",
+			strand?.rebuilt ? "items rebuilt from the session" : "",
 		];
 		const on = covered.some((r) => r.n === state.request);
-		return `<div class="col${on ? " on" : ""}" data-up="${more}" data-down="${less}" data-act="request" data-n="${request.n}" title="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
+		// A DNA bar tells of its request in the tip of its bands.
+		return `<div class="col${on ? " on" : ""}" data-up="${more}" data-down="${less}" data-act="request" data-n="${request.n}" ${strand ? "data-tip" : "title"}="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
 	};
 	// The selected request: what the provider reported, and the estimates of pi-context with the categories.
 	const picked = d.requests.find((request) => request.n === state.request);
@@ -541,7 +562,13 @@ function trendCard(d) {
 	const glyphs = seen.length ? ` Marks: ${seen.join(", ")}. A bar shows the first of its marks; its tooltip lists all.` : "";
 	const some = hidden ? `The last ${bars.length} of ${all.length} bars.` : `All ${all.length} bars.`;
 	const cut = last && all.length > last ? `<p class="muted">${some} <a data-act="bars">${hidden ? "Show all" : `Show the last ${last}`}</a></p>` : "";
-	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${zoomed ? " Adaptive: the tallest bar in view fills the chart, and the axis tells its size." : ""}${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
+	const banded = bars.map(strandOf).filter(Boolean);
+	const strands = state.trend.dna
+		? known
+			? ` DNA: one band for each item, in the order the model reads the items, the first one at the bottom. Point at a band to read its item and to light the item in every bar; click the band to show the item in the Context Browser.${delta ? " With Changes, the bands above the line are the items that came or grew, and those below it the items that left or shrank. A bar whose items do not explain its change shows without bands." : ""}${banded.some((strand) => strand.rebuilt) ? " The items of a request that pi-context did not record are rebuilt from the session: they do not show what extensions changed in the context." : ""}${banded.length ? "" : " The items of these requests are not known."}`
+			: " DNA: reading the items of the bars…"
+		: "";
+	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${strands}${zoomed ? " Adaptive: the tallest bar in view fills the chart, and the axis tells its size." : ""}${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
 	const axis = `<div class="axis${longest ? " timed" : ""}"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
 	// What the selected request did. Each line opens what it tells of in the Context Browser.
 	const brief = state.view?.brief;
@@ -562,11 +589,11 @@ function zoomTrend() {
 	cols.onscroll ??= () => requestAnimationFrame(zoomTrend);
 	const up = Number(cols.dataset.up);
 	const down = Number(cols.dataset.down);
+	// The bars have one width, so the scroll position tells which of them are in view.
+	const width = cols.scrollWidth / Math.max(1, cols.children.length);
+	const seen = [...cols.children].slice(Math.floor(cols.scrollLeft / width), Math.ceil((cols.scrollLeft + cols.clientWidth) / width));
 	let zoom = 1;
-	if (cols.classList.contains("adaptive") && cols.children.length > 0) {
-		// The bars have one width, so the scroll position tells which of them are in view.
-		const width = cols.scrollWidth / cols.children.length;
-		const seen = [...cols.children].slice(Math.floor(cols.scrollLeft / width), Math.ceil((cols.scrollLeft + cols.clientWidth) / width));
+	if (cols.classList.contains("adaptive") && seen.length > 0) {
 		const tallest = (side) => Math.max(0, ...seen.map((col) => Number(col.dataset[side])));
 		// Both sides of the base line keep one scale: the side that has less room sets it.
 		const rooms = [[up, tallest("up")], [down, tallest("down")]].filter(([, most]) => most > 0).map(([whole, most]) => whole / most);
@@ -576,6 +603,175 @@ function zoomTrend() {
 	const [top, bottom] = cols.previousElementSibling.children;
 	top.textContent = (top.textContent.startsWith("+") ? "+" : "") + tok(up / zoom);
 	if (down) bottom.textContent = "−" + tok(down / zoom);
+	paintDna(seen);
+}
+
+/**
+ * DNA trend: the items of the session as the server numbers them, and the items of each bar by the number of its request.
+ * `key` tells the bars that were asked for, `stamp` counts the answers, `lit` is the item that the pointer is at.
+ */
+const dna = { id: "", items: [], bars: new Map(), key: "", loading: false, again: false, stamp: 0, lit: null };
+/** Two shades of each category: items that follow each other differ. */
+const SHADES = Object.fromEntries(CATS.map((cat) => [cat, [COLORS[cat], `color-mix(in srgb, ${COLORS[cat]} 66%, #000)`]]));
+/** Covers the items that are not lit. */
+const DIM = "color-mix(in srgb, var(--card) 76%, transparent)";
+/** The bars that the DNA trend shows. */
+const dnaQuery = () => params({ turn: state.trend.byTurn ? 1 : 0, delta: state.trend.delta ? 1 : 0, last: state.trend.whole ? 0 : state.trend.last });
+/** An item that changes its size and stays one item, as the system prompt does, is named by its first size. */
+const lineOf = (item) => dna.items[item]?.[4] ?? item;
+
+/** Loads the items of the bars on show. The server sends only the items that the page does not have. A call during a load makes one more load follow. */
+async function loadDna() {
+	if (!state.trend.dna || !state.data) return;
+	if (dna.loading) {
+		dna.again = true;
+		return;
+	}
+	dna.loading = true;
+	try {
+		const query = dnaQuery();
+		const got = await api("dna", { ...query, id: dna.id, items: dna.items.length });
+		dna.items.length = got.from;
+		for (const item of got.items) dna.items.push(item);
+		dna.id = got.id;
+		dna.bars = new Map(got.bars.map((bar) => [bar.n, bar]));
+		dna.key = JSON.stringify(query);
+		dna.stamp++;
+	} catch (error) {
+		setError(error.message);
+	}
+	dna.loading = false;
+	render();
+	if (dna.again) {
+		dna.again = false;
+		loadDna();
+	}
+}
+
+/** With changes, a bar shows its items when its estimated change, times a factor in this range, is the change that the provider reported. */
+const MIN_FACTOR = 0.25;
+const MAX_FACTOR = 2.5;
+
+const strandBands = new WeakMap();
+/**
+ * The bands of one side of a DNA bar: the item of each band, and the tokens that the bar holds up to the end of the band.
+ * Above the line they are the items of the request. With changes, they are the items that came or grew, and below the line those that left or shrank.
+ */
+function bandsOf(strand, side) {
+	let sides = strandBands.get(strand);
+	if (!sides) strandBands.set(strand, (sides = {}));
+	if (sides[side]) return sides[side];
+	const bands = { items: [], ends: [], total: 0 };
+	const add = (item, tokens) => {
+		bands.items.push(item);
+		bands.ends.push((bands.total += tokens));
+	};
+	const changes = strand.up && (side > 0 ? strand.up : strand.down);
+	if (changes) for (let i = 0; i < changes.length; i += 2) add(changes[i], changes[i + 1]);
+	else if (!strand.up && side > 0) {
+		for (let r = 0; r < strand.runs.length; r += 2) {
+			for (let item = strand.runs[r]; item < strand.runs[r] + strand.runs[r + 1]; item++) add(item, dna.items[item]?.[1] ?? 0);
+		}
+	}
+	return (sides[side] = bands);
+}
+
+/** The bands as a background of `res` steps. A band of less than one step shows when it crosses a step. */
+function gradientOf(bands, res, toward) {
+	const stops = [];
+	let at = 0;
+	for (let i = 0; i < bands.items.length; i++) {
+		const end = Math.round((bands.ends[i] / bands.total) * res);
+		if (end === at) continue;
+		const item = bands.items[i];
+		const shade = SHADES[dna.items[item]?.[0]]?.[item & 1] ?? "#9ca3af";
+		const last = stops.at(-1);
+		if (last?.[0] === shade) last[2] = end;
+		else stops.push([shade, at, end]);
+		at = end;
+	}
+	const part = (step) => +((step / res) * 100).toFixed(2) + "%";
+	return `linear-gradient(${toward}, ${stops.map(([shade, from, to]) => `${shade} ${part(from)} ${part(to)}`).join(", ")})`;
+}
+
+/** A cover that leaves the lit item of the bands in sight. */
+function windowOf(bands, res, toward) {
+	bands.at ??= new Map(bands.items.map((item, i) => [lineOf(item), i]));
+	const i = bands.at.get(dna.lit);
+	if (i === undefined) return `linear-gradient(${DIM}, ${DIM})`;
+	const start = bands.ends[i - 1] ?? 0;
+	// A small item keeps two steps, so that it stays in sight.
+	const size = Math.min(100, Math.max(((bands.ends[i] - start) / bands.total) * 100, 200 / res));
+	const from = Math.min(100 - size, (start / bands.total) * 100);
+	return `linear-gradient(${toward}, ${DIM} 0 ${from}%, transparent ${from}% ${from + size}%, ${DIM} ${from + size}% 100%)`;
+}
+
+/** Draws the bands of the DNA bars in view. A bar that was drawn at its height is left alone. */
+function paintDna(seen) {
+	for (const col of seen) {
+		const strand = dna.bars.get(Number(col.dataset.n));
+		for (const stack of strand ? col.querySelectorAll(".stack.dna") : []) {
+			const res = Math.min(512, Math.max(1, Math.round(stack.clientHeight * (devicePixelRatio || 1))));
+			const key = `${dna.stamp}:${res}:${dna.lit ?? ""}`;
+			if (stack.dataset.done === key) continue;
+			stack.dataset.done = key;
+			const side = Number(stack.dataset.side);
+			const toward = side > 0 ? "to top" : "to bottom";
+			const bands = bandsOf(strand, side);
+			if (bands.drawn?.[0] !== res) bands.drawn = [res, gradientOf(bands, res, toward)];
+			stack.style.backgroundImage = dna.lit == null ? bands.drawn[1] : `${windowOf(bands, res, toward)}, ${bands.drawn[1]}`;
+		}
+	}
+}
+
+/** The band of a DNA bar at the height `y` of the window: its place among the bands, its item, and its tokens. */
+function bandAt(stack, y) {
+	const strand = dna.bars.get(Number(stack.closest(".col").dataset.n));
+	if (!strand) return undefined;
+	const side = Number(stack.dataset.side);
+	const bands = bandsOf(strand, side);
+	const box = stack.getBoundingClientRect();
+	const at = Math.max(0, (side > 0 ? box.bottom - y : y - box.top) / box.height) * bands.total;
+	let low = 0;
+	let high = bands.ends.length - 1;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (bands.ends[middle] > at) high = middle;
+		else low = middle + 1;
+	}
+	return { strand, side, index: low, item: bands.items[low], tokens: bands.ends[low] - (bands.ends[low - 1] ?? 0) };
+}
+
+const tip = document.body.appendChild(Object.assign(document.createElement("div"), { id: "tip", hidden: true }));
+
+function hideTip() {
+	tip.hidden = true;
+	if (dna.lit == null) return;
+	dna.lit = null;
+	zoomTrend();
+}
+
+/** Tells the item of the band that the pointer is at, and lights the item in every bar. */
+function showTip(stack, event) {
+	const band = bandAt(stack, event.clientY);
+	const item = band && dna.items[band.item];
+	if (!item) return hideTip();
+	const [cat, tokens, label, preview] = item;
+	const whole = "≈" + tok(tokens * band.strand.scale);
+	const size = !band.strand.up
+		? `${whole} tokens`
+		: band.tokens === tokens
+			? `${band.side > 0 ? "came" : "left"}: ${whole} tokens`
+			: `${band.side > 0 ? "grew" : "shrank"} by ≈${tok(band.tokens * band.strand.factor)} to ${whole} tokens`;
+	tip.innerHTML = `<b>${esc(label)}</b> <span class="muted">${esc(labels[cat] ?? cat)} · ${size}</span>${preview ? `<div>${esc(preview)}</div>` : ""}<div class="muted">${esc(stack.closest(".col").dataset.tip ?? "")}</div>`;
+	tip.hidden = false;
+	const box = tip.getBoundingClientRect();
+	tip.style.left = Math.max(4, Math.min(event.clientX + 14, innerWidth - box.width - 8)) + "px";
+	tip.style.top = (event.clientY + 18 + box.height > innerHeight ? Math.max(4, event.clientY - box.height - 10) : event.clientY + 18) + "px";
+	const line = lineOf(band.item);
+	if (dna.lit === line) return;
+	dna.lit = line;
+	zoomTrend();
 }
 
 /** Number of the first request that carried the row: the first one made after the message of the row was created. */
@@ -1521,6 +1717,7 @@ async function load() {
 		if (state.request != null && state.view?.time !== request?.time) selectRequest(request?.n ?? null);
 		// The picked agent may have gone on since the last load.
 		if (state.agent) loadAgent();
+		loadDna();
 	} catch (error) {
 		setError(error.message);
 		// A saved session that cannot be opened gives way to the current one.
@@ -1687,6 +1884,10 @@ const actions = {
 		state.trend[key] = !state.trend[key];
 		// The server makes the bars; the width is a matter of the page.
 		if (key === "fit" || key === "adaptive") return render();
+		if (key === "dna") {
+			loadDna();
+			return render();
+		}
 		// The lines under the chart tell of a request or of a human input: load() reads the request again.
 		if (key === "byTurn") state.view = null;
 		load();
@@ -1694,7 +1895,20 @@ const actions = {
 	/** Shows every bar of the trend, or again only the last ones that the view default allows. */
 	bars() {
 		state.trend.whole = !state.trend.whole;
+		loadDna();
 		render();
+	},
+	/** Opens the request of a DNA bar, and shows the item of the band that was clicked. */
+	async strand(el, event) {
+		const band = bandAt(el, event.clientY);
+		const item = band && dna.items[band.item];
+		await selectRequest(Number(el.closest(".col").dataset.n));
+		const rows = state.view?.rows;
+		if (!item || !rows) return;
+		const same = (row) => row?.cat === item[0] && row.tokens === item[1] && row.label === item[2] && row.preview.startsWith(item[3]);
+		// Without changes, the bands stand in the order of the rows. An item that left the context has no row.
+		const i = !band.strand.up && same(rows[band.index]) ? band.index : rows.findIndex(same);
+		if (i >= 0) actions.band({ dataset: { i } });
 	},
 	treemap() {
 		state.treemap = !state.treemap;
@@ -1917,6 +2131,20 @@ document.addEventListener("click", (event) => {
 	if (el) actions[el.dataset.act]?.(el, event);
 });
 addEventListener("resize", zoomTrend);
+let pointed;
+// The tip of a DNA bar follows the pointer, at most once for each frame.
+document.addEventListener("mousemove", (event) => {
+	const waiting = pointed;
+	pointed = event;
+	if (waiting) return;
+	requestAnimationFrame(() => {
+		const at = pointed;
+		pointed = undefined;
+		const stack = at.target.closest?.(".stack.dna");
+		if (stack) showTip(stack, at);
+		else hideTip();
+	});
+});
 addEventListener("hashchange", () => {
 	state.page = location.hash === "#insights" ? "insights" : "context";
 	if (state.page === "insights" && !state.insights) loadInsights();

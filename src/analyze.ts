@@ -401,6 +401,15 @@ export interface ViewData {
 	resultText?: (id: string) => string | undefined;
 	/** Rebuilds the composition of a request that has no snapshot. */
 	reconstruct: (request: RequestRec) => Row[];
+	/** What {@link reconstruct} rebuilds a request from. With it, the items of many requests are read without rebuilding each request whole. */
+	source?: RowSource;
+}
+
+export interface RowSource {
+	/** The messages that the session tells for the request. */
+	messages(request: RequestRec): any[];
+	/** The rows of messages, without their content. For system messages alone: the system prompt, the skill catalog and the tool schemas. */
+	rows(messages: any[]): Row[];
 }
 
 const CHARS_PER_TOKEN = 4;

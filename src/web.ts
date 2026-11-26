@@ -35,6 +35,7 @@ import {
 	type ViewData,
 } from "./analyze.ts";
 import { CHOICE_SETTINGS, CHOICES, choiceOf, DEFAULT_WARN_PERCENT } from "./config.ts";
+import { Dna } from "./dna.ts";
 import { viewJson } from "./export.ts";
 import { agentDetail, boardOf, chainOf, fleetSummary, narrow } from "./fleet.ts";
 import { footerItems } from "./footer.ts";
@@ -73,6 +74,8 @@ const NOTIFY_MS = 2000;
 const MAX_BODY = 1_000_000;
 /** Requests whose rebuilt context is kept, so that opening items of a request does not rebuild it each time. */
 const MAX_REBUILT = 4;
+/** Sessions whose items for the DNA trend are kept. */
+const MAX_DNA = 2;
 const SORTS: SessionSort[] = ["recent", "cost", "tokens", "context"];
 const USE_KINDS = ["tools", "programs", "skills"] as const;
 
@@ -125,7 +128,19 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 	let current: View | undefined;
 	let other: { file: string; view: View } | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	/** The items of the sessions that showed the DNA trend, by session. */
+	const strands = new Map<string, Dna>();
 
+	/** The items of the session of `file`, or of the current session. They outlive the views: a request is read once. */
+	function dnaOf(file: string | null): Dna {
+		const key = file ?? `id:${host.sessionId()}`;
+		const dna = strands.get(key) ?? new Dna();
+		// The session asked for last is kept longest.
+		strands.delete(key);
+		strands.set(key, dna);
+		if (strands.size > MAX_DNA) strands.delete(strands.keys().next().value as string);
+		return dna;
+	}
 	/** The current session, or a saved one. A saved session is read again when `fresh` is set. */
 	function view(file: string | null, fresh = false): View {
 		if (!file) {
@@ -222,6 +237,23 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				place: placeOf(v.data.analysis, index),
 				tools: toolsAt(v.data.analysis, index),
 			};
+		},
+		/**
+		 * The items of the bars of the trend, for its DNA mode: the bars are those of `data`, with `last` only the last ones.
+		 * The items are numbered, and a page that has the first `items` of numbering `id` gets only the rest.
+		 */
+		async dna(query) {
+			const file = query.get("session");
+			const { data } = view(file);
+			const { requests } = data.analysis;
+			const all = trendBars(data.analysis, query.get("turn") === "1", false).map((bar) => requests[bar.index]);
+			const last = Math.max(0, Math.round(Number(query.get("last")) || 0));
+			const hidden = last ? Math.max(0, all.length - last) : 0;
+			const dna = dnaOf(file);
+			const bars = await dna.bars(all.slice(hidden), data.source, query.get("delta") === "1", all[hidden - 1]);
+			const had = Math.round(Number(query.get("items")) || 0);
+			const from = query.get("id") === dna.id && had > 0 && had <= dna.items.length ? had : 0;
+			return { id: dna.id, from, items: dna.items.slice(from), bars };
 		},
 		/** The whole content of item `i` of request `n`, or of the current context as of version `v`: its text, and its images with their data. A tool result comes with its call. */
 		text(query) {

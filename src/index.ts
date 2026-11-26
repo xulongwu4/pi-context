@@ -333,6 +333,10 @@ export default function (pi: ExtensionAPI) {
 			resultText: (id) => resultText(branch, id),
 			reconstruct: (request) =>
 				request.parentId ? rowsFor(buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages, ctx, true) : [],
+			source: {
+				messages: (request) => (request.parentId ? buildSessionProjection(ctx.sessionManager.getEntries(), request.parentId).messages : []),
+				rows: (messages) => rowsFor(messages, ctx),
+			},
 		};
 	}
 
@@ -374,6 +378,10 @@ export default function (pi: ExtensionAPI) {
 			resultText: (id) => resultText(branch, id),
 			tasks: header?.cwd && header?.id ? readTasks(taskFile(header.cwd, header.id, getAgentDir())) : [],
 			reconstruct: (request) => (request.parentId ? rowsOf(buildSessionProjection(entries, request.parentId).messages, then, [], true, sources) : []),
+			source: {
+				messages: (request) => (request.parentId ? buildSessionProjection(entries, request.parentId).messages : []),
+				rows: (messages) => rowsOf(messages, then, [], false, sources),
+			},
 		};
 	}
 

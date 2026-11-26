@@ -1,6 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { analyze, resultText, rowsOf, type ViewData } from "../src/analyze.ts";
 import type { SessionSummary } from "../src/insights.ts";
+import { listOf } from "../src/dna.ts";
 import { type Outcome, startWeb } from "../src/web.ts";
 
 const usage = (input: number, output: number) => ({ input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output, cost: { total: 0.01 } });
@@ -35,6 +36,7 @@ const view = (other?: string): ViewData => ({
 	other,
 	// The context of a request: the messages before its answer.
 	reconstruct: (request) => rowsOf(messages.slice(0, request.n === 1 ? 1 : 3), undefined, [], true),
+	source: { messages: (request) => messages.slice(0, request.n === 1 ? 1 : 3), rows: (list) => rowsOf(list) },
 });
 
 const summary: SessionSummary = {
@@ -295,6 +297,30 @@ test("web tells an open page that the session changed", async () => {
 	while (!seen.includes("data: change")) seen += decoder.decode((await reader.read()).value);
 	expect(seen.match(/data: change/g)?.length).toBe(1);
 	await reader.cancel();
+});
+
+test("web gives the items of the bars of the trend, and only the new items to a page that has the others", async () => {
+	const all = await get("dna");
+	expect(all.status).toBe(200);
+	expect(all.body.from).toBe(0);
+	expect(all.body.bars.map((bar: any) => bar.n)).toEqual([1, 2]);
+	const rows = rowsOf(messages.slice(0, 3));
+	expect(listOf(all.body.bars[1].runs).map((item) => all.body.items[item].slice(0, 3))).toEqual(rows.map((row) => [row.cat, row.tokens, row.label]));
+	expect(all.body.bars[1].scale).toBeCloseTo(150 / rows.reduce((total, row) => total + row.tokens, 0), 6);
+	expect(all.body.bars[1].up).toBeUndefined();
+	expect(all.body.bars.map((bar: any) => bar.rebuilt)).toEqual([true, true]);
+	// The page has all the items. Of the last bar alone, the changes are those since the bar before it.
+	const next = await get("dna", { id: all.body.id, items: all.body.items.length, delta: 1, last: 1 });
+	expect(next.body).toMatchObject({ id: all.body.id, from: all.body.items.length, items: [] });
+	expect(next.body.bars.map((bar: any) => bar.n)).toEqual([2]);
+	expect(next.body.bars[0].up.length / 2).toBe(rows.length - 1);
+	expect(next.body.bars[0].down).toEqual([]);
+	// A page with items of another numbering gets them all.
+	const other = await get("dna", { id: "other", items: 2 });
+	expect(other.body.from).toBe(0);
+	expect(other.body.items).toEqual(all.body.items);
+	// By user input, the bar is the last request of the input.
+	expect((await get("dna", { turn: 1 })).body.bars.map((bar: any) => bar.n)).toEqual([2]);
 });
 
 test("web gives the images of an item with their data, the rows without it, and the file operations by kind", async () => {
