@@ -114,7 +114,7 @@ const state = {
 	openItems: new Set(),
 	/** Paths of the files whose operations File Activity lists. */
 	openFiles: new Set(),
-	/** The opened items as { text, call, images, json }; `call` describes the call of a tool result, `images` are the images of the message with their data, `json` is the text as formatted JSON when it is JSON. */
+	/** The opened items as { text, call, images, value, json }; `call` describes the call of a tool result, `images` are the images of the message with their data, `value` is the value of the text when it is JSON and `json` that value as formatted JSON. */
 	texts: new Map(),
 	/** How the content of an opened item shows, by the key of the item: { mode, find, at }. */
 	viewers: new Map(),
@@ -786,14 +786,58 @@ const placePairs = (request, place) => [
 /** The row of item `i` of the context that the browser shows. */
 const shownRow = (i) => (state.request == null ? state.data.current : state.view?.rows)?.[i];
 
-/** The text as formatted JSON, when it is a JSON object or array. */
-function prettyJson(text) {
+/** The value of the text, when the text is a JSON object or array. */
+function jsonOf(text) {
 	if (!/^\s*[[{]/.test(text ?? "")) return undefined;
 	try {
-		return JSON.stringify(JSON.parse(text), null, 2);
+		return JSON.parse(text);
 	} catch {
 		return undefined;
 	}
+}
+
+/** How deep a JSON tree opens at first: the value and what it holds. */
+const TREE_DEPTH = 2;
+/** The lines after which a JSON tree opens no value by itself. */
+const TREE_LINES = 2000;
+
+/** The path of a value in a JSON value as a property path: `a.b[0]["odd key"]`. A number is a place in an array. */
+const pathText = (path) =>
+	path.map((key, i) => (typeof key === "number" ? `[${key}]` : /^[A-Za-z_$][\w$]*$/.test(key) ? (i ? "." : "") + key : `[${JSON.stringify(key)}]`)).join("");
+
+/**
+ * A JSON value as a tree, one line for each value: an object or an array opens and closes, and every line copies its value and its path.
+ * `nodes` has the values that the reader opened or closed, by path; the others are open down to TREE_DEPTH, or all with `all`, up to TREE_LINES lines.
+ */
+function jsonTree(i, root, nodes, mark, all) {
+	const lines = [];
+	let cut = false;
+	const walk = (value, path) => {
+		const depth = path.length;
+		const key = path.at(-1);
+		const id = esc(JSON.stringify(path));
+		const name = !depth ? "" : typeof key === "number" ? `<span class="muted">${key}</span>: ` : `<span class="jk">${mark(key)}</span>: `;
+		const copy = (what, tip) => `<button data-act="jcopy" data-i="${i}" data-path="${id}" data-what="${what}" title="${tip}">${what}</button>`;
+		const tools = `<span class="jt">${copy("value", "Copy the value")}${depth ? copy("path", "Copy the property path") : ""}</span>`;
+		const pad = `style="padding-left:${depth * 14}px"`;
+		if (value === null || typeof value !== "object") {
+			const kind = typeof value === "string" ? "str" : typeof value === "number" ? "num" : "lit";
+			lines.push(`<div class="jl" ${pad}><span class="tw"></span>${name}<span class="${kind}">${mark(JSON.stringify(value))}</span>${tools}</div>`);
+			return;
+		}
+		const list = Array.isArray(value);
+		const size = list ? value.length : Object.keys(value).length;
+		const wanted = nodes[JSON.stringify(path)] ?? (depth < TREE_DEPTH || all);
+		const open = size > 0 && wanted && (nodes[JSON.stringify(path)] || lines.length < TREE_LINES);
+		if (size && wanted && !open) cut = true;
+		const act = size ? ` data-act="node" data-i="${i}" data-path="${id}" data-open="${open ? 1 : 0}"` : "";
+		const count = `${size} ${list ? (size === 1 ? "item" : "items") : size === 1 ? "property" : "properties"}`;
+		lines.push(`<div class="jl${size ? " fold" : ""}" ${pad}${act}><span class="tw">${size ? (open ? "▾" : "▸") : ""}</span>${name}<span class="muted" title="${count}">${list ? `[${size}]` : `{${size}}`}</span>${tools}</div>`);
+		if (open) for (const [child, each] of list ? value.entries() : Object.entries(value)) walk(each, [...path, child]);
+	};
+	walk(root, []);
+	const note = cut ? `<div class="jl muted">The tree opened its first ${TREE_LINES} lines. The values after them are closed${all ? ", and the find box does not see them: Text shows all" : ""}.</div>` : "";
+	return `<div class="tree" data-tree="${i}">${lines.join("")}${note}</div>`;
 }
 
 /**
@@ -864,15 +908,15 @@ function markdown(text, mark) {
 }
 
 /**
- * The content of the opened item `i`: as text, as Markdown, or as formatted JSON when it is JSON; with a button that copies it,
+ * The content of the opened item `i`: as text, as Markdown, or as a tree when it is JSON; with a button that copies it,
  * and a find box whose matches are marked. `entry` is what state.texts has for the item.
  */
 function viewer(key, i, entry) {
-	const { mode, find = "", at = 0 } = state.viewers.get(key) ?? {};
+	const { mode, find = "", at = 0, nodes = {} } = state.viewers.get(key) ?? {};
 	const modes = [["text", "Text"], ["markdown", "Markdown"], ...(entry.json ? [["json", "JSON"]] : [])];
 	const picked = modes.some(([value]) => value === mode) ? mode : "text";
-	const shown = picked === "json" ? entry.json : entry.text;
-	const draw = (mark) => (picked === "markdown" ? `<div class="md">${markdown(shown, mark)}</div>` : `<pre>${mark(shown)}</pre>`);
+	const draw = (mark) =>
+		picked === "markdown" ? `<div class="md">${markdown(entry.text, mark)}</div>` : picked === "json" ? jsonTree(i, entry.value, nodes, mark, Boolean(find)) : `<pre>${mark(entry.text)}</pre>`;
 	const found = finder(find);
 	// The first pass counts the matches: a step past the last match goes to the first.
 	if (find) draw(found.mark);
@@ -1762,7 +1806,8 @@ async function openItem(i) {
 	if (state.texts.has(key)) return;
 	try {
 		const { text, call, images } = await api("text", params(live ? { i, v: state.data.version } : { i, n: state.request }));
-		state.texts.set(key, { call, images, json: prettyJson(text), text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
+		const value = jsonOf(text);
+		state.texts.set(key, { call, images, value, json: value && JSON.stringify(value, null, 2), text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
 		if (state.texts.size > MAX_TEXTS) state.texts.delete(state.texts.keys().next().value);
 	} catch {
 		// The context changed after the page loaded it.
@@ -1847,6 +1892,19 @@ function setViewer(i, change) {
 	render();
 	// The current match of the find box comes into view.
 	document.querySelector(`#browser [data-find="${i}"]`)?.parentElement.nextElementSibling.querySelector("mark.at")?.scrollIntoView({ block: "nearest" });
+}
+/** Copies text for the button `el`, which says so for a moment. */
+async function copyText(el, text) {
+	const label = el.textContent;
+	try {
+		await navigator.clipboard.writeText(text);
+		el.textContent = "Copied";
+		setTimeout(() => {
+			el.textContent = label;
+		}, 1500);
+	} catch {
+		setError("The browser did not allow the copy.");
+	}
 }
 function toggle(set, value) {
 	if (!set.delete(value)) set.add(value);
@@ -2032,20 +2090,29 @@ const actions = {
 	/** Goes to the next or the previous match of the find box of an opened item. */
 	find: (el) => setViewer(Number(el.dataset.i), (viewer) => ({ at: (viewer.at ?? 0) + Number(el.dataset.by) })),
 	/** Copies the content of an opened item as it shows: the text, or the formatted JSON. */
-	async copy(el) {
+	copy(el) {
 		const row = shownRow(Number(el.dataset.i));
 		const entry = row && state.texts.get(keyOf(row));
 		if (!entry) return;
 		const json = state.viewers.get(keyOf(row))?.mode === "json" && entry.json;
-		try {
-			await navigator.clipboard.writeText(json || entry.text);
-			el.textContent = "Copied";
-			setTimeout(() => {
-				el.textContent = "Copy";
-			}, 1500);
-		} catch {
-			setError("The browser did not allow the copy.");
-		}
+		return copyText(el, json || entry.text);
+	},
+	/** Opens or closes a value of the JSON tree of an opened item. The tree stays where it was scrolled to. */
+	node(el) {
+		const i = Number(el.dataset.i);
+		const tree = () => document.querySelector(`#browser [data-tree="${i}"]`);
+		const top = tree()?.scrollTop;
+		setViewer(i, (viewer) => ({ nodes: { ...viewer.nodes, [el.dataset.path]: el.dataset.open !== "1" } }));
+		if (top != null && tree()) tree().scrollTop = top;
+	},
+	/** Copies a value of the JSON tree of an opened item, or its property path. A string is copied as its text, any other value as formatted JSON. */
+	jcopy(el) {
+		const row = shownRow(Number(el.dataset.i));
+		const entry = row && state.texts.get(keyOf(row));
+		if (!entry) return;
+		const path = JSON.parse(el.dataset.path);
+		const value = path.reduce((at, key) => at?.[key], entry.value);
+		return copyText(el, el.dataset.what === "path" ? pathText(path) : typeof value === "string" ? value : JSON.stringify(value, null, 2));
 	},
 	/** Shows the item of a band of the strip: opens its category and its content, and scrolls to it. */
 	band(el) {
@@ -2163,7 +2230,8 @@ $("command-filter").addEventListener("input", (event) => {
 // The find box of an opened item: the item is drawn again with the matches marked. Enter goes to the next match, with Shift to the one before.
 document.addEventListener("input", (event) => {
 	const i = event.target.dataset.find;
-	if (i != null) setViewer(Number(i), () => ({ find: event.target.value, at: 0 }));
+	// In a JSON tree, a find opens every value, also the ones that the reader closed.
+	if (i != null) setViewer(Number(i), () => ({ find: event.target.value, at: 0, nodes: {} }));
 	// The search box of the tools that a request declared.
 	if (event.target.dataset.decls != null) {
 		state.declFind = event.target.value;
