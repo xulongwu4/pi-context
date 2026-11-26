@@ -181,3 +181,5 @@ The page needs no build step: `web/` holds one HTML file, one style sheet and on
 ```sh
 bun test
 ```
+
+The tests of the overlay (`test/overlay.test.ts`) drive it without a terminal: `test/overlay.ts` sends keys and gives the screen back as text. They draw with the `@earendil-works/pi-tui` of the `pi` on the `PATH`, unless the packages of this repo are installed.
