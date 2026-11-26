@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import type { Config } from "./config.ts";
 import type { FleetEvent, TaskRec } from "./fleet.ts";
 import { fmtTokens } from "./format.ts";
@@ -46,6 +47,8 @@ export interface Row {
 	call?: string;
 	/** Set for a tool result that is an error. */
 	error?: boolean;
+	/** The images of the message, in order. */
+	images?: ImageRec[];
 }
 
 /** How the rows of a request differ from those of the request before it. */
@@ -192,6 +195,10 @@ export interface CommandRec {
 	truncated?: boolean;
 	/** Lines that the command printed. */
 	lines?: number;
+	/** Characters of the output that the session holds. */
+	chars?: number;
+	/** Seconds that the call allowed the command to run, when it set a timeout. */
+	timeout?: number;
 	/** Requests made before the command ran: the number of the request that ran it, for a command of the model. */
 	request: number;
 	/** Tool call whose result tells the outcome. For a nested call, the call that made it. Undefined for a command of the user. */
@@ -397,15 +404,100 @@ export interface ViewData {
 }
 
 const CHARS_PER_TOKEN = 4;
-const IMAGE_CHARS = 4800;
+/** Tokens of an image whose pixels are not known. */
+const IMAGE_TOKENS = 1200;
+/** The longer side that an image keeps, the pixels of one token, and the most tokens of an image: the rule that Anthropic publishes. */
+const IMAGE_SIDE = 1568;
+const IMAGE_PIXELS = 750;
+const IMAGE_MOST = 1600;
+/** Characters of the base64 text that are read to find the pixels of an image: a JPEG can carry metadata before them. */
+const IMAGE_HEAD = 87_384;
 
 export const estimate = (chars: number) => Math.ceil(chars / CHARS_PER_TOKEN);
+
+/** An image of a message. */
+export interface ImageRec {
+	/** Media type, as the session names it. */
+	type: string;
+	/** Size of the stored image in bytes. */
+	bytes: number;
+	/** Pixels, when the start of the image tells them. */
+	width?: number;
+	height?: number;
+	/** Estimated tokens. See {@link imageTokens}. */
+	tokens: number;
+	/** The image as base64. Only rows built for inspection carry it. */
+	data?: string;
+}
+
+/** Width and height of a PNG, GIF, WebP or JPEG image in pixels, from the start of its base64 text. Undefined when the start does not tell them. */
+export function imageSize(data: string): [width: number, height: number] | undefined {
+	const bytes = Buffer.from(data.slice(0, IMAGE_HEAD), "base64");
+	const ascii = (at: number, length: number) => bytes.toString("latin1", at, at + length);
+	if (bytes.length >= 24 && bytes.readUInt32BE(0) === 0x89504e47) return [bytes.readUInt32BE(16), bytes.readUInt32BE(20)];
+	if (bytes.length >= 10 && ascii(0, 3) === "GIF") return [bytes.readUInt16LE(6), bytes.readUInt16LE(8)];
+	if (bytes.length >= 30 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
+		const kind = ascii(12, 4);
+		if (kind === "VP8 ") return [bytes.readUInt16LE(26) & 0x3fff, bytes.readUInt16LE(28) & 0x3fff];
+		if (kind === "VP8X") return [bytes.readUIntLE(24, 3) + 1, bytes.readUIntLE(27, 3) + 1];
+		if (kind !== "VP8L") return undefined;
+		const bits = bytes.readUInt32LE(21);
+		return [(bits & 0x3fff) + 1, ((bits >>> 14) & 0x3fff) + 1];
+	}
+	if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
+	// A JPEG is a list of segments. The frame segment tells the pixels: its height, then its width.
+	for (let at = 2; at + 9 <= bytes.length && bytes[at] === 0xff; ) {
+		const marker = bytes[at + 1];
+		if (marker === 0xff) at++;
+		else if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return [bytes.readUInt16BE(at + 7), bytes.readUInt16BE(at + 5)];
+		else at += marker === 0x01 || (marker >= 0xd0 && marker <= 0xd9) ? 2 : 2 + bytes.readUInt16BE(at + 2);
+	}
+	return undefined;
+}
+
+/**
+ * Estimated tokens of an image of that many pixels: one token for 750 pixels, after the image is reduced to 1568 pixels on its longer side, and 1600 at most.
+ * Without the pixels, 1200.
+ */
+export function imageTokens(width?: number, height?: number): number {
+	if (!width || !height) return IMAGE_TOKENS;
+	const scale = Math.min(1, IMAGE_SIDE / Math.max(width, height));
+	return Math.min(IMAGE_MOST, Math.max(1, Math.ceil((width * scale * (height * scale)) / IMAGE_PIXELS)));
+}
+
+/** What was measured of each image block. A block is measured once: a request carries the images of all requests before it. */
+const measured = new WeakMap<object, ImageRec>();
+
+function imageOf(block: any): ImageRec {
+	let image = measured.get(block);
+	if (!image) {
+		const data: string = typeof block.data === "string" ? block.data : "";
+		const [width, height] = imageSize(data) ?? [];
+		const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+		image = { type: typeof block.mimeType === "string" ? block.mimeType : "image", bytes: Math.max(0, Math.floor((data.length * 3) / 4) - padding), tokens: imageTokens(width, height) };
+		if (width && height) Object.assign(image, { width, height });
+		measured.set(block, image);
+	}
+	return image;
+}
+
+/** The images of a message content, in order. With `full`, each carries its data. */
+export function imagesOf(content: unknown, full = false): ImageRec[] {
+	if (!Array.isArray(content)) return [];
+	return content.filter((block) => block?.type === "image").map((block) => (full ? { ...imageOf(block), data: block.data } : imageOf(block)));
+}
+
+/** One line about an image: its type, its pixels, its stored size and its estimated tokens, scaled by `factor`. */
+export function imageText(image: ImageRec, factor = 1): string {
+	const size = image.bytes >= 1e6 ? `${(image.bytes / 1e6).toFixed(1)} MB` : image.bytes >= 1e3 ? `${(image.bytes / 1e3).toFixed(1)} kB` : `${image.bytes} B`;
+	return [image.type, image.width ? `${image.width}×${image.height} px` : "", size, `≈${fmtTokens(image.tokens * factor)} tokens`].filter(Boolean).join(" · ");
+}
 
 export function contentChars(content: unknown): number {
 	if (typeof content === "string") return content.length;
 	if (!Array.isArray(content)) return 0;
 	let chars = 0;
-	for (const block of content) chars += block?.type === "image" ? IMAGE_CHARS : (block?.text?.length ?? 0);
+	for (const block of content) chars += block?.type === "image" ? imageOf(block).tokens * CHARS_PER_TOKEN : (block?.text?.length ?? 0);
 	return chars;
 }
 
@@ -583,6 +675,11 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 	// System messages replay in order: later ones append text, and replace or remove sections.
 	const sections = new Map<string, string>();
 	const skillCalls = new Set<string>();
+	/** Gives the row the images of its message. */
+	const picture = (row: Row | undefined, content: unknown) => {
+		const images = row ? imagesOf(content, full) : [];
+		if (row && images.length > 0) row.images = images;
+	};
 	let systemChars = 0;
 	let systemText = "";
 	let headAt = -1;
@@ -601,7 +698,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 			case "user": {
 				const skill = skillBlock(contentText(m.content));
 				if (skill) push("skills", skill.block.length, `skill ${skill.name}`, skill.block);
-				push("user", contentChars(m.content) - (skill?.block.length ?? 0), "user", skill ? skill.rest : contentText(m.content));
+				picture(push("user", contentChars(m.content) - (skill?.block.length ?? 0), "user", skill ? skill.rest : contentText(m.content)), m.content);
 				break;
 			}
 			case "assistant": {
@@ -633,6 +730,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 					m.toolCallId,
 				);
 				if (row && m.isError) row.error = true;
+				picture(row, m.content);
 				break;
 			}
 			case "bashExecution":
@@ -641,7 +739,7 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
 				}
 				break;
 			case "custom":
-				push("injected", contentChars(m.content), m.customType ?? "custom", contentText(m.content));
+				picture(push("injected", contentChars(m.content), m.customType ?? "custom", contentText(m.content)), m.content);
 				break;
 			case "branchSummary":
 			case "compactionSummary":
@@ -696,11 +794,19 @@ export function rowsOf(messages: any[], declared?: Record<string, number>, hidde
  * The whole content of a row. A row of a recorded request carries none;
  * its content is that of the same item among `rebuilt`, the rows of the request rebuilt from the session.
  */
-export function textOf(row: Row, index: number, rebuilt: Row[]): string | undefined {
-	if (row.text !== undefined) return row.text;
+export const textOf = (row: Row, index: number, rebuilt: Row[]): string | undefined => fullOf(row, index, rebuilt)?.text;
+
+/** The row that carries the whole content of `row`: the row itself, or the same item among `rebuilt`. */
+export function fullOf(row: Row, index: number, rebuilt: Row[]): Row | undefined {
+	if (row.text !== undefined) return row;
 	const same = (other?: Row) => other?.cat === row.cat && other.label === row.label && other.preview === row.preview;
 	const fixed = row.cat === "system" || row.cat === "tools";
-	return (same(rebuilt[index]) ? rebuilt[index] : (rebuilt.find(same) ?? (fixed ? rebuilt.find((other) => other.cat === row.cat) : undefined)))?.text;
+	return same(rebuilt[index]) ? rebuilt[index] : (rebuilt.find(same) ?? (fixed ? rebuilt.find((other) => other.cat === row.cat) : undefined));
+}
+
+/** A row without its content: its text and the data of its images. */
+export function bare({ text, images, ...row }: Row): Row {
+	return images ? { ...row, images: images.map(({ data, ...image }) => image) } : row;
 }
 
 /** The parts of the replies of the model, as categories. */
@@ -1064,17 +1170,27 @@ export function searchHits(toolName: string, text: string, base = "."): Map<stri
 	return hits;
 }
 
+/** The operations on the files, summed by kind. */
+export function fileTotals(files: FileRec[]): Record<FileKind, number> {
+	const totals: Record<FileKind, number> = { reads: 0, writes: 0, edits: 0, searches: 0, images: 0 };
+	for (const file of files) for (const kind of FILE_KINDS) totals[kind] += file[kind];
+	return totals;
+}
+
 /** Orders of the file list: {@link fileRows}. */
-export const FILE_ORDERS = ["ops", "recent", "name", "lines"] as const;
+export const FILE_ORDERS = ["ops", "recent", "name", "file", "lines"] as const;
 export type FileOrder = (typeof FILE_ORDERS)[number];
 
-/** The files with the most operations first, the last used first, by path, or with the most changed lines first. With `kind`, only the files with such operations. */
+/** The files with the most operations first, the last used first, by path, by file name, or with the most changed lines first. With `kind`, only the files with such operations. */
 export function fileRows(files: FileRec[], order: FileOrder = "ops", kind?: FileKind): FileRec[] {
 	const rows = kind ? files.filter((file) => file[kind] > 0) : [...files];
 	const ops = (file: FileRec) => FILE_KINDS.reduce((sum, each) => sum + file[each], 0);
 	const last = (file: FileRec) => file.ops.reduce((time, op) => Math.max(time, op.time), 0);
 	if (order === "lines") return rows.sort((a, b) => b.added + b.removed - (a.added + a.removed));
 	if (order === "name") return rows.sort((a, b) => a.path.localeCompare(b.path));
+	// Files of the same name in several directories come together.
+	const name = (file: FileRec) => file.path.slice(file.path.lastIndexOf("/") + 1);
+	if (order === "file") return rows.sort((a, b) => name(a).localeCompare(name(b)) || a.path.localeCompare(b.path));
 	if (order === "recent") return rows.sort((a, b) => last(b) - last(a));
 	return rows.sort((a, b) => ops(b) - ops(a));
 }
@@ -1230,14 +1346,15 @@ export function attentionLens(attention: Attention, entry: keyof Attention): Com
 
 const COMMAND_END = /(?:^|\n\n)Command (exited with code (\d+)|timed out after [\s\S]*|aborted|terminated without an exit code)$/;
 
-/** What the result of pi's bash tool tells about the end of the command, and the lines that the command printed. */
-function commandEnd(text: string, details?: any): Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines"> {
-	const end: Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines"> = {};
+/** What the result of pi's bash tool tells about the end of the command, and the lines and the characters that the command printed. */
+function commandEnd(text: string, details?: any): Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines" | "chars"> {
+	const end: Pick<CommandRec, "exit" | "stopped" | "truncated" | "lines" | "chars"> = {};
 	const status = COMMAND_END.exec(text);
 	if (status?.[2]) end.exit = Number(status[2]);
 	else if (status?.[1].startsWith("timed out")) end.stopped = "timeout";
 	else if (status?.[1] === "aborted") end.stopped = "aborted";
 	const output = (status ? text.slice(0, status.index) : text).trimEnd();
+	end.chars = output.length;
 	if (details?.truncation?.truncated) end.truncated = true;
 	end.lines = end.truncated && typeof details.truncation.totalLines === "number" ? details.truncation.totalLines : output ? output.split("\n").length : 0;
 	return end;
@@ -1530,6 +1647,7 @@ export function analyze(entries: any[]): Analysis {
 				id: outer ?? call.id,
 			};
 			if (typeof call.durationMs === "number") command.ms = call.durationMs;
+			if (typeof call.arguments.timeout === "number" && call.arguments.timeout > 0) command.timeout = call.arguments.timeout;
 			commandsById.set(call.id, command);
 			analysis.commands.push(command);
 		}

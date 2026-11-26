@@ -32,7 +32,9 @@ import {
 	type FileRec,
 	familyTotals,
 	fileRows,
+	fileTotals,
 	filesUpTo,
+	imageText,
 	injectors,
 	introducedAt,
 	isSlow,
@@ -110,7 +112,9 @@ const REFRESH_MS = 1000;
 const FILTERED: Tab[] = ["Current", "Browser", "Files", "Commands", "Tools", "Fleet", "Insights"];
 /** Names of the kinds of reply that the Browser tab can list alone. */
 const REPLY_NAMES: Record<ReplyKind, string> = { reasoning: "thinking", toolCalls: "tool calls", answers: "answers" };
-const FILE_ORDER_NAMES: Record<FileOrder, string> = { ops: "most operations first", recent: "last used first", name: "by path", lines: "most changed lines first" };
+const FILE_ORDER_NAMES: Record<FileOrder, string> = { ops: "most operations first", recent: "last used first", name: "by path", file: "by file name", lines: "most changed lines first" };
+/** Names of the kinds of file operation in the Stats tab. */
+const IO_NAMES: Record<FileKind, string> = { reads: "File reads", writes: "Writes", edits: "Edits", searches: "Searches", images: "Image reads" };
 /** Marks of the Trend tab with their names in the legend: what happened since the bar before, and what sets the bar apart. */
 const TREND_MARKS: Record<MarkKind, [mark: string, name: string]> = {
 	compaction: ["✂", "compaction"],
@@ -219,8 +223,10 @@ const fmtShort = (ms: number) => (ms < 10_000 ? `${(ms / 1000).toFixed(1)}s` : f
 const commandBadges = (command: CommandRec): string[] => [
 	...(command.exit === undefined ? [] : [`exit ${command.exit}`]),
 	...(command.stopped ? [command.stopped === "timeout" ? "timed out" : "aborted"] : []),
+	...(command.timeout === undefined ? [] : [`timeout ${command.timeout}s`]),
 	...(command.truncated ? ["output truncated"] : []),
 	...(command.lines === undefined ? [] : [`${command.lines} ${command.lines === 1 ? "line" : "lines"}`]),
+	...(command.chars ? [`${fmtTokens(command.chars)} characters`] : []),
 ];
 
 /** Whether two lenses list the same commands in the same order. */
@@ -306,6 +312,8 @@ export class ContextOverlay {
 	private latestFirst = false;
 	/** The state of the tasks that the Fleet tab lists. Empty: every state. */
 	private taskState: TaskState | "" = "";
+	/** The Agents view of the Fleet tab lists only the subagents that run. */
+	private runningOnly = false;
 	/** Id of the agent that the timeline and the tasks of the Fleet tab are narrowed to. */
 	private only?: string;
 	/** Compositions rebuilt from the session, by request number. */
@@ -465,6 +473,10 @@ export class ContextOverlay {
 			this.scroll = 0;
 		} else if (key === "o" && this.name === "Fleet" && this.fleetView === 1) this.latestFirst = !this.latestFirst;
 		else if (key === "k" && this.name === "Fleet" && this.fleetView === 2) this.taskState = this.next(TASK_STATES, this.taskState);
+		else if (key === "k" && this.name === "Fleet" && this.fleetView === 0) {
+			this.runningOnly = !this.runningOnly;
+			this.item = 0;
+		}
 		else if (key === "n" && this.name === "Fleet") this.toAgent();
 		else if (key === "o" && this.name === "Current") {
 			this.ordered = !this.ordered;
@@ -547,7 +559,7 @@ export class ContextOverlay {
 			Commands: `↑/↓ select  enter detail  b result  / filter  k status  l ${this.lens.slow ? "all" : "slow only"}  o ${this.lens.slowest ? "newest" : "slowest"} first  a attention  f next failed  s slowest`,
 			Tools: "↑/↓ select  enter description  / filter  s sort",
 			Fleet: [
-				"↑/↓ select  enter open  v timeline",
+				`↑/↓ select  enter open  k ${this.runningOnly ? "every agent" : "running only"}  v timeline`,
 				`↑/↓ select  enter inspect  o ${this.latestFirst ? "earliest" : "latest"} first  / filter  v tasks`,
 				"↑/↓ select  enter inspect  k state  v agents",
 			][this.fleetView] + `  n ${this.only ? "every agent" : "only this agent"}`,
@@ -854,6 +866,15 @@ export class ContextOverlay {
 		return `#${n}${place ? ` ${place.input}.${place.step}` : ""}`;
 	}
 
+	/** A line of the Stats tab: the file operations of the session by kind, and the loads of skills. No line when there are none. */
+	private inOut(): string[] {
+		const { files, skills } = this.data.analysis;
+		const totals = fileTotals(files);
+		const pairs: [string, number][] = [...FILE_KINDS.map((kind): [string, number] => [IO_NAMES[kind], totals[kind]]), ["Skill loads", skills.reduce((sum, skill) => sum + skill.loads, 0)]];
+		const some = pairs.filter(([, count]) => count > 0);
+		return some.length ? [this.pairs(some)] : [];
+	}
+
 	/** Shows the selected command of the Commands tab in the inspector: how it ended, and its output when the session holds it. */
 	private openCommand(): void {
 		const command = this.commandList[this.item];
@@ -983,9 +1004,11 @@ export class ContextOverlay {
 		const head = call
 			? `Tool: ${call.tool}\nStatus: ${call.status}\nLines: ${call.lines}\n\n${call.args === undefined ? "" : `Arguments:\n${call.args}\n\n`}Result:\n`
 			: "";
+		// A terminal shows no image: one line tells what the session holds of each.
+		const images = (row.images ?? []).map((image, i) => `Image ${i + 1}: ${imageText(image)}\n`).join("");
 		this.inspect = {
 			title: `${LABELS[row.cat]} · ${row.label}${text === undefined ? "" : ` · ${fmtTokens(text.length)} characters`}`,
-			text: head + (text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)`),
+			text: (images && `${images}\n`) + head + (text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)`),
 			back: this.scroll,
 		};
 		this.scroll = 0;
@@ -1129,6 +1152,7 @@ export class ContextOverlay {
 				["Tool calls", `${analysis.toolCalls} (${analysis.toolErrors} errors)`],
 				["Cost", fmtCost(totals.cost)],
 			]),
+			...this.inOut(),
 			...(agents.length
 				? this.wrap([
 						pair(`With ${agents.length} ${agents.length === 1 ? "subagent" : "subagents"}`, sized(family)),
@@ -1854,10 +1878,11 @@ export class ContextOverlay {
 		if (view === "Timeline") this.timeline(lines, part.timeline);
 		else if (view === "Tasks") this.board(lines, only);
 		else {
-			lines.push("", this.head(`Subagents (${agents.length})`));
-			if (agents.length === 0) lines.push("  None on this branch.");
-			this.item = Math.min(this.item, Math.max(0, agents.length - 1));
-			agents.forEach((agent, i) => {
+			const listed = this.runningOnly ? agents.filter((agent) => agent.status === "running") : agents;
+			lines.push("", this.head(this.runningOnly ? `Running subagents (${listed.length} of ${agents.length})` : `Subagents (${agents.length})`));
+			if (listed.length === 0) lines.push(agents.length ? "  No subagent runs now." : "  None on this branch.");
+			this.item = Math.min(this.item, Math.max(0, listed.length - 1));
+			listed.forEach((agent, i) => {
 				this.picks.push({ line: lines.length, file: agent.sessionFile, title: `${agent.type}: ${agent.description}`, agent: agent.id });
 				const block = this.agentLines(agent, i === this.item);
 				if (i === this.item) span = block.length - 1;

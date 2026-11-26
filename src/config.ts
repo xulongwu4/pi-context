@@ -19,7 +19,7 @@ export interface Config {
 	trendMode?: "total" | "change";
 	trendFit?: "off" | "100" | "200" | "300";
 	toolOrder?: "calls" | "schema" | "name";
-	fileOrder?: "ops" | "recent" | "name" | "lines";
+	fileOrder?: "ops" | "recent" | "name" | "file" | "lines";
 	diffBase?: "request" | "input";
 }
 
@@ -38,7 +38,7 @@ export const CHOICES = {
 	mode: { key: "trendMode", label: "Trend values", values: ["total", "change"], help: "The Context Trend shows the size of the context, or its change since the bar before." },
 	fit: { key: "trendFit", label: "Trend fit", values: ["off", "100", "200", "300"], help: "The page shows the Context Trend whole, or only its last 100, 200 or 300 bars when it opens." },
 	tools: { key: "toolOrder", label: "Tool order", values: ["calls", "schema", "name"], help: "Order of the tool list." },
-	files: { key: "fileOrder", label: "File order", values: ["ops", "recent", "name", "lines"], help: "Order of the file list: most operations first, last used first, by path, or most changed lines first." },
+	files: { key: "fileOrder", label: "File order", values: ["ops", "recent", "name", "file", "lines"], help: "Order of the file list: most operations first, last used first, by path, by file name, or most changed lines first." },
 	diff: {
 		key: "diffBase",
 		label: "Diff baseline",

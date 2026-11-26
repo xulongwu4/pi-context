@@ -1,4 +1,4 @@
-import { cacheStats, CATEGORIES, type Category, familyTotals, LABELS, scaleOf, sumByCategory, tokensPerSecond, undeclared, type ViewData } from "./analyze.ts";
+import { bare, cacheStats, CATEGORIES, type Category, familyTotals, LABELS, scaleOf, sumByCategory, tokensPerSecond, undeclared, type ViewData } from "./analyze.ts";
 import { fmtCost, fmtDay, fmtDuration, fmtPercent, fmtTime, fmtTokens } from "./format.ts";
 import { hintTotal } from "./hints.ts";
 import type { Insights } from "./insights.ts";
@@ -243,7 +243,6 @@ export function exportMarkdown(data: ViewData, insights: Insights): string {
 /** The dashboard data as plain values, without the content of the items. */
 export function viewJson(data: ViewData) {
 	const { analysis } = data;
-	const item = ({ text, ...row }: ViewData["current"][number]) => row;
 	return {
 		model: data.model,
 		usage: data.usage,
@@ -254,9 +253,9 @@ export function viewJson(data: ViewData) {
 		...analysis,
 		requests: analysis.requests.map(({ rows, ...request }) => request),
 		cache: cacheStats(analysis),
-		current: data.current.map(item),
+		current: data.current.map(bare),
 		hints: data.hints,
-		dropped: data.dropped.map(item),
+		dropped: data.dropped.map(bare),
 		agents: data.agents,
 		reserve: data.reserve,
 		timeline: data.timeline,

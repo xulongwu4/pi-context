@@ -64,7 +64,7 @@ const summary: SessionSummary = {
 const dropped: [string[], boolean][] = [];
 const settings: [string, string][] = [];
 let collected = 0;
-const server = await startWeb({
+const host: Parameters<typeof startWeb>[0] = {
 	collect() {
 		collected++;
 		return view();
@@ -81,7 +81,8 @@ const server = await startWeb({
 		settings.push([setting, value]);
 		return { message: "Saved.", level: "info" };
 	},
-});
+};
+const server = await startWeb(host);
 afterAll(() => server.close());
 
 const token = new URL(server.url).searchParams.get("t") ?? "";
@@ -294,4 +295,34 @@ test("web tells an open page that the session changed", async () => {
 	while (!seen.includes("data: change")) seen += decoder.decode((await reader.read()).value);
 	expect(seen.match(/data: change/g)?.length).toBe(1);
 	await reader.cancel();
+});
+
+test("web gives the images of an item with their data, the rows without it, and the file operations by kind", async () => {
+	const bytes = Buffer.alloc(33);
+	bytes.writeUInt32BE(0x89504e47, 0);
+	bytes.writeUInt32BE(640, 16);
+	bytes.writeUInt32BE(480, 20);
+	const image = { type: "image", data: bytes.toString("base64"), mimeType: "image/png" };
+	const shown = [
+		{ role: "user", content: [{ type: "text", text: "what is this" }, image], timestamp: 1000 },
+		assistant(2000, 500, [{ type: "toolCall", id: "r1", name: "read", arguments: { path: "/work/notes.md" } }]),
+		{ role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "text", text: "notes" }], isError: false, timestamp: 3000 },
+	];
+	const log = shown.map((message, i) => ({ type: "message", id: `i${i}`, parentId: i ? `i${i - 1}` : null, timestamp: new Date(message.timestamp).toISOString(), message }));
+	const data: ViewData = { ...view(), analysis: analyze(log), current: rowsOf(shown, undefined, [], true), reconstruct: () => rowsOf(shown.slice(0, 1), undefined, [], true) };
+	const other = await startWeb({ ...host, collect: () => data });
+	try {
+		const key = new URL(other.url).searchParams.get("t") ?? "";
+		const read = async (name: string, query: Record<string, string | number> = {}) =>
+			(await (await fetch(new URL(`api/${name}?${new URLSearchParams({ t: key, ...query } as Record<string, string>)}`, other.url))).json()) as any;
+		const about = { type: "image/png", bytes: 33, width: 640, height: 480, tokens: 410 };
+		const page = await read("data");
+		expect(page.current[0].images).toEqual([about]);
+		expect(page.fileOps).toEqual({ reads: 1, writes: 0, edits: 0, searches: 0, images: 0 });
+		expect((await read("request", { n: 1 })).rows[0].images).toEqual([about]);
+		expect((await read("text", { n: 1, i: 0 })).images).toEqual([{ ...about, data: image.data }]);
+		expect((await read("text", { v: page.version, i: 0 })).images).toEqual([{ ...about, data: image.data }]);
+	} finally {
+		other.close();
+	}
 });

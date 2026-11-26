@@ -110,6 +110,7 @@ a { color: var(--accent); cursor: pointer; }
 .cols.fit .col { flex: 1 1 0; min-width: 0; max-width: none; }
 .col u { flex: 0 0 10px; margin-top: 2px; background: linear-gradient(var(--muted), var(--muted)) no-repeat center bottom / 100% var(--h); }
 .axis.timed { padding-bottom: 12px; }
+.cols.adaptive .half { overflow: hidden; }
 .brief { margin-top: 8px; }
 .brief div { display: flex; gap: 8px; padding: 1px 6px; cursor: pointer; }
 .brief div:hover { background: var(--bg); }
@@ -134,6 +135,9 @@ a { color: var(--accent); cursor: pointer; }
 .viewer { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px 0 22px; background: var(--bg); }
 .viewer button, .viewer input { padding: 0 7px; font-size: 12px; }
 .viewer input { flex: 0 1 160px; min-width: 0; }
+.shots { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 10px 0 22px; background: var(--bg); }
+.shot { margin: 0; padding: 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); font-size: 12px; color: var(--muted); }
+.shot img { display: block; max-width: 240px; max-height: 180px; margin-bottom: 4px; }
 mark { background: #fde047; color: #000; }
 mark.at { background: #f97316; }
 .md { padding: 8px 10px 8px 22px; max-height: 360px; overflow: auto; overflow-wrap: anywhere; background: var(--bg); border-bottom: 1px solid var(--line); }

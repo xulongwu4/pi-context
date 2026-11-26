@@ -6,6 +6,7 @@ import type { AddressInfo } from "node:net";
 import {
 	attentionLens,
 	attentionOf,
+	bare,
 	baselineOf,
 	briefOf,
 	callOf,
@@ -13,6 +14,8 @@ import {
 	diffRows,
 	familyTotals,
 	filesUpTo,
+	fileTotals,
+	fullOf,
 	LABELS,
 	MARK_KINDS,
 	placeOf,
@@ -25,7 +28,6 @@ import {
 	schemaSources,
 	sumTokens,
 	TOOL_ORDERS,
-	textOf,
 	tokensPerSecond,
 	toolRows,
 	toolsAt,
@@ -83,7 +85,6 @@ interface View {
 	rebuilt: Map<number, Row[]>;
 }
 
-const strip = ({ text, ...row }: Row) => row;
 
 function send(res: ServerResponse, status: number, value: unknown): void {
 	res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" }).end(JSON.stringify(value ?? {}));
@@ -154,10 +155,11 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 		return index;
 	}
 
-	/** The content of an item. A tool result comes with what {@link callView} tells about its call. */
-	function described(row: Row | undefined, text: string | undefined, rows: Row[]) {
-		if (!row?.id || text === undefined) return { text };
-		return { text, call: callView(row, text, callOf(row, rows)?.text) };
+	/** The content of an item, from the row that carries it: its text and its images. A tool result comes with what {@link callView} tells about its call. */
+	function described(row: Row | undefined, rows: Row[]) {
+		const { text, images } = row ?? {};
+		if (!row?.id || text === undefined) return { text, images };
+		return { text, images, call: callView(row, text, callOf(row, rows)?.text) };
 	}
 	const get: Record<string, Route> = {
 		data(query) {
@@ -187,6 +189,7 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				lenses: { slowest: attentionLens(attention, "slowest"), failing: attentionLens(attention, "failing"), repeated: attentionLens(attention, "repeated") },
 				places: places(data.analysis),
 				programs: programRanks(data.analysis.commands),
+				fileOps: fileTotals(data.analysis.files),
 				tps: tokensPerSecond(data.analysis.timing),
 				rates: data.rates ?? {},
 				markKinds: MARK_KINDS,
@@ -208,10 +211,10 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				time: request.time,
 				rebuilt: !request.rows,
 				factor: scaleOf(sumTokens(rows), request.context),
-				rows: rows.map(strip),
+				rows: rows.map(bare),
 				since: previous?.n,
 				marks: diff?.marks,
-				removed: diff?.removed.map(strip),
+				removed: diff?.removed.map(bare),
 				delta: diff?.delta,
 				items: diff?.items,
 				brief: briefOf(v.data.analysis, index, query.get("turn") === "1"),
@@ -220,18 +223,18 @@ export async function startWeb(host: WebHost): Promise<WebServer> {
 				tools: toolsAt(v.data.analysis, index),
 			};
 		},
-		/** The whole content of item `i` of request `n`, or of the current context as of version `v`. A tool result comes with its call. */
+		/** The whole content of item `i` of request `n`, or of the current context as of version `v`: its text, and its images with their data. A tool result comes with its call. */
 		text(query) {
 			const v = view(query.get("session"));
 			const index = Number(query.get("i"));
 			if (!query.has("n")) {
 				if (Number(query.get("v")) !== v.version) throw new Error("The context has changed.");
-				return described(v.data.current[index], v.data.current[index]?.text, v.data.current);
+				return described(v.data.current[index], v.data.current);
 			}
 			const request = v.data.analysis.requests[indexOf(v, query.get("n"))];
 			const full = rebuilt(v, request);
 			const row = (request.rows ?? full)[index];
-			return described(row, row && textOf(row, index, full), full);
+			return described(row && fullOf(row, index, full), full);
 		},
 		/** The whole output of command `i`, as the session holds it. */
 		output(query) {

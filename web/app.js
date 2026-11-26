@@ -54,10 +54,10 @@ const state = {
 	/** What the server said about that request. */
 	view: null,
 	/**
-	 * Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width.
+	 * Context Trend: one bar for each human input, a bar as the change since the bar before, the whole session in the width, the bars scaled to the tallest bar in view.
 	 * `last` is the number of bars that the trend shows, the last ones, until `whole` is set. 0: every bar.
 	 */
-	trend: { byTurn: false, delta: false, fit: false, last: 0, whole: false },
+	trend: { byTurn: false, delta: false, fit: false, adaptive: false, last: 0, whole: false },
 	/** Current Context shows a treemap in place of the bar. */
 	treemap: false,
 	/** Order of the tools: calls, schema or name. */
@@ -92,6 +92,10 @@ const state = {
 	agentInfo: null,
 	/** The kind of event that Collaboration Timeline lists. Empty: every kind. */
 	fleetKind: "",
+	/** Agents shows every subagent, or with "running" only those that run. */
+	agentState: "",
+	/** What the search box of the programs of Command Executions holds. */
+	programFind: "",
 	/** The part of the replies that the Context Browser keeps: reasoning, toolCalls or answers. Empty: every item. */
 	reply: "",
 	/** Collaboration Timeline: the earliest event first, and the events whose body is open. */
@@ -109,7 +113,7 @@ const state = {
 	openItems: new Set(),
 	/** Paths of the files whose operations File Activity lists. */
 	openFiles: new Set(),
-	/** The opened items as { text, call, json }; `call` describes the call of a tool result, `json` is the text as formatted JSON when it is JSON. */
+	/** The opened items as { text, call, images, json }; `call` describes the call of a tool result, `images` are the images of the message with their data, `json` is the text as formatted JSON when it is JSON. */
 	texts: new Map(),
 	/** How the content of an opened item shows, by the key of the item: { mode, find, at }. */
 	viewers: new Map(),
@@ -336,6 +340,7 @@ function statsCard(d) {
 	const { own, agents } = d.family;
 	const family = (text) => (agents.count ? `${text} with ${agents.count === 1 ? "the subagent" : `${agents.count} subagents`}` : "");
 	const timing = d.timing;
+	const loads = d.skills.reduce((sum, skill) => sum + skill.loads, 0);
 	const top = tiles([
 		[d.userInputs, "Human inputs", "", "turns"],
 		[d.requests.length, "Requests", "", "trend"],
@@ -346,6 +351,7 @@ function statsCard(d) {
 		[d.events.length, "Context events", `${compactions} compactions`, "events", compactions ? `data-key="kind" data-value="compaction"` : ""],
 		...(d.commands.length ? [[d.commands.length, "Commands", `${failed} failed`, "commands", failed ? lensData({ status: "failed" }) : ""]] : []),
 		...(d.files.length ? [[d.files.length, "Files", `${edited} edited`, "files", edited ? `data-key="fileKind" data-value="edits"` : ""]] : []),
+		...(loads ? [[loads, "Skill loads", `${d.skills.length} ${d.skills.length === 1 ? "skill" : "skills"}`, "tools"]] : []),
 		...(agents.count ? [[agents.count, "Subagents", `${d.fleet.running} running`, "agents"]] : []),
 		// The reply streams that pi-context timed.
 		...(timing.streamed ? [[secs(timing.ttftMs / timing.streamed), "To the first token", `average of ${timing.streamed} requests`, "timing"]] : []),
@@ -357,10 +363,15 @@ function statsCard(d) {
 	const rates = Object.entries(d.rates).map(rate);
 	const prices = rates.length ? `<div class="pills"><span class="muted">Prices per million tokens</span>${rates.join("")}</div>` : "";
 	const link = (to, text) => `<a data-act="go" data-to="${to}" title="Go to the card">${text}</a>`;
+	// What went in, and what the agent did with the files: each figure goes to the list that it counts.
+	const figure = (label, count, attrs, tip) => `<button class="pill" data-act="go" ${attrs} title="${tip}">${label} <b>${count}</b></button>`;
+	const ops = FILE_KINDS.filter(([kind]) => d.fileOps[kind] > 0).map(([kind, label]) => figure(label, d.fileOps[kind], `data-to="files" data-key="fileKind" data-value="${kind}"`, "List the files with such operations"));
+	const inOut = `<div class="pills"><span class="muted">Input / Output</span>${figure("Human inputs", d.userInputs, `data-to="browser" data-cat="user"`, "Open the user messages in the Context Browser")}${ops.join("")}</div>`;
 	return (
 		top +
 		pills(link("tools", "Tools"), d.tools.map((tool) => [tool.name, tool.calls + tool.nested]), 8, (name) => `data-act="go" data-to="tools" data-name="${esc(name)}" title="Show the tool in its card"`) +
 		pills(link("commands", "Programs"), d.programs.map((program) => [program.program, program.uses]), 8, (name) => `data-act="go" data-to="commands" ${lensData({ program: name })} title="List the runs of the program"`) +
+		inOut +
 		prices
 	);
 }
@@ -468,7 +479,9 @@ function currentCard(d) {
 function trendCard(d) {
 	const all = d.trend;
 	if (all.length === 0) return `<p class="muted">No requests yet.</p>`;
-	const { byTurn, delta, fit, last, whole } = state.trend;
+	const { byTurn, delta, fit, adaptive, last, whole } = state.trend;
+	// A trend that fits the width has every bar in view.
+	const zoomed = adaptive && !fit;
 	// The view default can keep the trend to its last bars.
 	const hidden = last && !whole ? Math.max(0, all.length - last) : 0;
 	const bars = all.slice(hidden);
@@ -496,7 +509,7 @@ function trendCard(d) {
 				? CATS.filter((cat) => sign * bar.parts[cat] > 0).map((cat) => `<i style="flex:${sign * bar.parts[cat]};background:${COLORS[cat]}"></i>`).join("")
 				: `<i style="flex:1;background:#9ca3af"></i>`;
 		const half = (size, most, sign) =>
-			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack" style="flex:0 0 ${(size / most) * 100}%">${stack(sign)}</div>` : ""}</div>`;
+			`<div class="half" style="flex:${most}">${size > 0 ? `<div class="stack" style="flex:0 0 calc(${(size / most) * 100}% * var(--zoom, 1))">${stack(sign)}</div>` : ""}</div>`;
 		const tip = [
 			input ? `input #${input.n} · ${input.requests} requests · ${input.preview}` : "",
 			`${coord(request.n)} · ${clock(request.time)} · ${request.model}`,
@@ -508,7 +521,7 @@ function trendCard(d) {
 			miss ? "cache miss: " + missText(miss) : "",
 		];
 		const on = covered.some((r) => r.n === state.request);
-		return `<div class="col${on ? " on" : ""}" data-act="request" data-n="${request.n}" title="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
+		return `<div class="col${on ? " on" : ""}" data-up="${more}" data-down="${less}" data-act="request" data-n="${request.n}" title="${esc(tip.filter(Boolean).join("\n"))}"><b>${mark ?? (miss ? "!" : "")}</b>${half(more, up, 1)}${down ? half(less, down, -1) : ""}${longest ? `<u style="--h:${((bar.ms ?? 0) / longest) * 100}%"></u>` : ""}</div>`;
 	};
 	// The selected request: what the provider reported, and the estimates of pi-context with the categories.
 	const picked = d.requests.find((request) => request.n === state.request);
@@ -528,7 +541,7 @@ function trendCard(d) {
 	const glyphs = seen.length ? ` Marks: ${seen.join(", ")}. A bar shows the first of its marks; its tooltip lists all.` : "";
 	const some = hidden ? `The last ${bars.length} of ${all.length} bars.` : `All ${all.length} bars.`;
 	const cut = last && all.length > last ? `<p class="muted">${some} <a data-act="bars">${hidden ? "Show all" : `Show the last ${last}`}</a></p>` : "";
-	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
+	const note = `${what} Click a bar to open the request in the Context Browser. Grey: not recorded by pi-context.${zoomed ? " Adaptive: the tallest bar in view fills the chart, and the axis tells its size." : ""}${glyphs}${longest ? ` The strip under a bar is its duration: the longest took ${dur(longest)}.` : ""}${picked?.sums ? ` ≈ figures: the estimated composition of request ${coord(picked.n)}.` : ""}`;
 	const axis = `<div class="axis${longest ? " timed" : ""}"><span>${delta ? "+" : ""}${tok(up)}</span><span>${down ? "−" + tok(down) : 0}</span></div>`;
 	// What the selected request did. Each line opens what it tells of in the Context Browser.
 	const brief = state.view?.brief;
@@ -536,7 +549,33 @@ function trendCard(d) {
 	const told = brief
 		? `<div class="brief">${line("User", brief.user, brief.first == null ? "" : `data-act="request" data-n="${d.requests[brief.first]?.n}"`, "Open the first request of the human input")}${line("In", brief.added, `data-act="added"`, "Show the first item added since the request before")}${line("Out", brief.reply, `data-act="reply"`, "Show the answer in the context of the next request")}</div>`
 		: "";
-	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}" data-keep="trend">${bars.map(column).join("")}</div></div>${cut}${told}${where.length ? pairs(where) : ""}${reported}<div class="pills">${key}</div><p class="muted">${note}</p>`;
+	return `<div class="trend">${axis}<div class="cols${fit ? " fit" : ""}${zoomed ? " adaptive" : ""}" data-up="${up}" data-down="${down}" data-keep="trend">${bars.map(column).join("")}</div></div>${cut}${told}${where.length ? pairs(where) : ""}${reported}<div class="pills">${key}</div><p class="muted">${note}</p>`;
+}
+
+/**
+ * Adaptive trend: scales the bars so that the tallest bar in view fills the chart, and writes that size on the axis.
+ * It runs when the chart is drawn, when it scrolls and when the window changes its size.
+ */
+function zoomTrend() {
+	const cols = document.querySelector("#trend .cols");
+	if (!cols) return;
+	cols.onscroll ??= () => requestAnimationFrame(zoomTrend);
+	const up = Number(cols.dataset.up);
+	const down = Number(cols.dataset.down);
+	let zoom = 1;
+	if (cols.classList.contains("adaptive") && cols.children.length > 0) {
+		// The bars have one width, so the scroll position tells which of them are in view.
+		const width = cols.scrollWidth / cols.children.length;
+		const seen = [...cols.children].slice(Math.floor(cols.scrollLeft / width), Math.ceil((cols.scrollLeft + cols.clientWidth) / width));
+		const tallest = (side) => Math.max(0, ...seen.map((col) => Number(col.dataset[side])));
+		// Both sides of the base line keep one scale: the side that has less room sets it.
+		const rooms = [[up, tallest("up")], [down, tallest("down")]].filter(([, most]) => most > 0).map(([whole, most]) => whole / most);
+		if (rooms.length > 0) zoom = Math.max(1, Math.min(...rooms));
+	}
+	cols.style.setProperty("--zoom", zoom);
+	const [top, bottom] = cols.previousElementSibling.children;
+	top.textContent = (top.textContent.startsWith("+") ? "+" : "") + tok(up / zoom);
+	if (down) bottom.textContent = "−" + tok(down / zoom);
 }
 
 /** Number of the first request that carried the row: the first one made after the message of the row was created. */
@@ -650,6 +689,15 @@ function viewer(key, i, entry) {
 	const box = `<input type="search" data-find="${i}" data-focus="find${i}" placeholder="Find" value="${esc(find)}">${step(-1, "‹", "Previous match")}${step(1, "›", "Next match")}${matches}`;
 	return `<div class="viewer">${buttons.join("")}<button data-act="copy" data-i="${i}" title="Copy what is shown">Copy</button>${box}</div>${draw(found.mark)}`;
 }
+/** One card for an image of a message: the picture, when the server sent its data, and the type, the pixels, the stored size and the estimated tokens. */
+function shot(image, factor) {
+	const size = image.bytes >= 1e6 ? (image.bytes / 1e6).toFixed(1) + " MB" : image.bytes >= 1e3 ? (image.bytes / 1e3).toFixed(1) + " kB" : image.bytes + " B";
+	// Only the media type of an image may be part of the address of the picture.
+	const picture = image.data && /^image\/[\w.+-]+$/.test(image.type) ? `<img src="data:${image.type};base64,${esc(image.data)}" alt="">` : "";
+	const facts = [image.type, image.width ? `${image.width}×${image.height} px` : "", size, `≈${tok(image.tokens * factor)} tokens`];
+	return `<figure class="shot">${picture}<figcaption>${esc(facts.filter(Boolean).join(" · "))}</figcaption></figure>`;
+}
+
 /** One item of the context. With `flat`, the item is in a list of all categories and shows its category. */
 function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const key = keyOf(row);
@@ -658,7 +706,8 @@ function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const from = firstRequest(row);
 	const first = from == null ? "" : `<span class="from" title="Request ${coord(from)} was the first to carry this item">@${from}</span>`;
 	const category = flat ? `<i class="dot" style="background:${COLORS[row.cat]}" title="${esc(labels[row.cat])}"></i>` : "";
-	const line = `<div class="item${row.dropped ? " dropped" : ""}${flat ? " flat" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="pos" title="Position in the prompt">#${i + 1}</span>${category}<span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${first}${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
+	const pictures = row.images?.length ? `<span class="pill" title="Images of the message">${row.images.length} ${row.images.length === 1 ? "image" : "images"}</span>` : "";
+	const line = `<div class="item${row.dropped ? " dropped" : ""}${flat ? " flat" : ""}" data-act="item" data-i="${i}"><span class="mark">${mark}</span><span class="pos" title="Position in the prompt">#${i + 1}</span>${category}<span class="lbl">${esc(row.label)}</span><span class="pv">${esc(row.preview)}</span>${pictures}${first}${button}<span class="tok">≈${tok(row.tokens * factor)}</span></div>`;
 	if (!open) return line;
 	const entry = state.texts.get(key);
 	const call = entry?.call;
@@ -666,7 +715,9 @@ function itemHtml({ row, i, mark }, factor, canDrop, flat) {
 	const badge = call?.status === "error" ? `<span class="bad">error</span>` : `<span class="good">OK</span>`;
 	const about = call ? `<div class="call"><b>${esc(call.tool)}</b>${badge}<span class="muted">${call.lines} ${call.lines === 1 ? "line" : "lines"}</span></div>` : "";
 	const args = call?.args == null ? "" : `<small class="cap">Arguments</small><pre>${esc(call.args)}</pre><small class="cap">Result</small>`;
-	return `${line}${about}${args}${entry ? viewer(key, i, entry) : "<pre>Loading…</pre>"}`;
+	// The images of the message. The server sends the pictures with the content of the item.
+	const shots = (entry?.images ?? row.images ?? []).map((image) => shot(image, factor)).join("");
+	return `${line}${shots && `<div class="shots">${shots}</div>`}${about}${args}${entry ? viewer(key, i, entry) : "<pre>Loading…</pre>"}`;
 }
 
 /** The tools that the request of the browser declared, one row for each: the name, who provides it, the calls of the request, the size of the schema. A row opens what pi knows about the tool. */
@@ -846,7 +897,8 @@ function filesCard(d) {
 	const last = (file) => file.ops.reduce((time, op) => Math.max(time, op.time), 0);
 	const names = Object.fromEntries(FILE_KINDS.map(([kind, , name]) => [kind, name]));
 	// The orders of fileRows() of src/analyze.ts.
-	const orders = { ops: (a, b) => ops(b) - ops(a), recent: (a, b) => last(b) - last(a), name: (a, b) => a.path.localeCompare(b.path), lines: (a, b) => b.added + b.removed - (a.added + a.removed) };
+	const base = (file) => file.path.slice(file.path.lastIndexOf("/") + 1);
+	const orders = { ops: (a, b) => ops(b) - ops(a), recent: (a, b) => last(b) - last(a), name: (a, b) => a.path.localeCompare(b.path), file: (a, b) => base(a).localeCompare(base(b)) || a.path.localeCompare(b.path), lines: (a, b) => b.added + b.removed - (a.added + a.removed) };
 	const kind = state.fileKind;
 	// With "As of the request", the files as they were after the request of the Context Browser.
 	const then = state.asOf && state.then?.n === state.request ? state.then.files : undefined;
@@ -903,8 +955,10 @@ function commandsCard(d) {
 		const badges = [
 			command.exit == null ? "" : `<span class="pill bad">exit ${command.exit}</span>`,
 			command.stopped ? `<span class="pill bad">${STOPS[command.stopped]}</span>` : "",
+			command.timeout == null ? "" : `<span class="pill" title="The time that the call allowed the command to run">timeout ${command.timeout}s</span>`,
 			command.truncated ? `<span class="pill warn" title="pi cut the output for the model">output truncated</span>` : "",
 			command.lines == null ? "" : `<span class="pill">${command.lines} ${command.lines === 1 ? "line" : "lines"} of output</span>`,
+			command.chars ? `<span class="pill">${tok(command.chars)} characters</span>` : "",
 		].join("");
 		const shown = !output
 			? `<pre>Loading…</pre>`
@@ -962,9 +1016,14 @@ function commandsCard(d) {
 		repeated ? entry("repeated", "List the runs of the command", `${clip(repeated.command, "mono")} ran ${repeated.count} times`) : "",
 	].filter(Boolean);
 	const attention = look.length ? `<div class="pills"><span class="warn">Worth a look</span>${look.join("")}</div>` : "";
-	const ranks = pills(title, d.programs.map((program) => [program.program, program.uses]), 8, (name) => `data-act="lens" ${lensData({ program: name === lens.program ? "" : name })} title="List only the runs of the program"`);
+	// The programs whose name holds the text of the search box. The box shows when one row cannot hold the programs.
+	const find = state.programFind.trim().toLowerCase();
+	const programs = d.programs.filter((program) => !find || program.program.toLowerCase().includes(find));
+	const box = d.programs.length > 8 ? `<div class="controls"><input type="search" data-programs data-focus="programs" placeholder="Filter programs" value="${esc(state.programFind)}"></div>` : "";
+	const ranks = pills(title, programs.map((program) => [program.program, program.uses]), find ? 40 : 8, (name) => `data-act="lens" ${lensData({ program: name === lens.program ? "" : name })} title="List only the runs of the program"`);
 	return (
-		ranks +
+		box +
+		(ranks || (find ? `<p class="muted">${title}. No program matches.</p>` : "")) +
 		attention +
 		`<div class="controls">${statuses}${slow}${order}${jumps}${active}</div>` +
 		newer +
@@ -1064,8 +1123,11 @@ function agentsCard(d) {
 		const error = agent.error ? `<p class="bad">${esc(agent.error)}</p>` : "";
 		return `<div class="agent" style="margin-left:${(agent.depth ?? level) * 20}px"><div class="between" data-act="agent" data-id="${esc(agent.id)}" title="Show the prompt, the reply, the tasks and the last events of the agent, and only its events and tasks in the timeline and on the board"><b>${agent.id === state.agent ? "▾" : "▸"} ${esc(agent.type)}</b><span class="${statusCss(agent.status)}">${esc(agent.status)}</span></div><div>${esc(agent.description)}</div><small class="mono">${esc(agent.model ?? "")}</small>${bar ? `<div class="bar">${bar}</div>` : ""}${pairs(facts)}${error}${detail(agent)}</div>`;
 	};
-	const pill = agentPill(d);
-	return `${summary}${pill && `<p>${pill}</p>`}<div class="agents">${under(undefined, 0).map(card).join("")}</div>`;
+	// The chips keep every agent, or only those that run.
+	const states = chips("agentState", [["All", d.agents.length, ""], ["Running", d.fleet.running, "running"]]);
+	const shown = under(undefined, 0).filter(([agent]) => !state.agentState || agent.status === state.agentState);
+	const list = shown.length ? `<div class="agents">${shown.map(card).join("")}</div>` : `<p class="muted">No subagent runs now.</p>`;
+	return `${summary}<div class="controls">${states}${agentPill(d)}</div>${list}`;
 }
 
 /** Identifies an event of the timeline, so that it stays open when the data is loaded again. */
@@ -1403,6 +1465,7 @@ function render() {
 	paint("current", currentCard(d));
 	for (const button of document.querySelectorAll("[data-act=trend]")) button.classList.toggle("on", state.trend[button.dataset.key]);
 	paint("trend", trendCard(d));
+	zoomTrend();
 	paint("browser", browserCard(d));
 	paint("hints", hintsCard(d));
 	paint("turns", turnsCard(d));
@@ -1501,8 +1564,8 @@ async function openItem(i) {
 	render();
 	if (state.texts.has(key)) return;
 	try {
-		const { text, call } = await api("text", params(live ? { i, v: state.data.version } : { i, n: state.request }));
-		state.texts.set(key, { call, json: prettyJson(text), text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
+		const { text, call, images } = await api("text", params(live ? { i, v: state.data.version } : { i, n: state.request }));
+		state.texts.set(key, { call, images, json: prettyJson(text), text: text ?? `${row.preview}\n\n(Only this preview is available. The item was not found in the saved session.)` });
 		if (state.texts.size > MAX_TEXTS) state.texts.delete(state.texts.keys().next().value);
 	} catch {
 		// The context changed after the page loaded it.
@@ -1605,9 +1668,10 @@ const actions = {
 	},
 	/** Goes to the card, or to the part of a card, that a figure belongs to. */
 	go(el) {
-		const { to, key, value, lens, name } = el.dataset;
-		// A figure about a part of a card sets the filter of that card.
+		const { to, key, value, lens, name, cat } = el.dataset;
+		// A figure about a part of a card sets the filter of that card, or opens that part.
 		if (key) state[key] = value;
+		if (cat) state.openCats.add(cat);
 		if (lens) setLens(JSON.parse(lens));
 		if (name && name !== state.tool) actions.tool(el);
 		render();
@@ -1622,7 +1686,7 @@ const actions = {
 		const key = el.dataset.key;
 		state.trend[key] = !state.trend[key];
 		// The server makes the bars; the width is a matter of the page.
-		if (key === "fit") return render();
+		if (key === "fit" || key === "adaptive") return render();
 		// The lines under the chart tell of a request or of a human input: load() reads the request again.
 		if (key === "byTurn") state.view = null;
 		load();
@@ -1852,6 +1916,7 @@ document.addEventListener("click", (event) => {
 	const el = event.target.closest("[data-act]");
 	if (el) actions[el.dataset.act]?.(el, event);
 });
+addEventListener("resize", zoomTrend);
 addEventListener("hashchange", () => {
 	state.page = location.hash === "#insights" ? "insights" : "context";
 	if (state.page === "insights" && !state.insights) loadInsights();
@@ -1874,6 +1939,11 @@ document.addEventListener("input", (event) => {
 	// The search box of the tools that a request declared.
 	if (event.target.dataset.decls != null) {
 		state.declFind = event.target.value;
+		render();
+	}
+	// The search box of the programs of Command Executions.
+	if (event.target.dataset.programs != null) {
+		state.programFind = event.target.value;
 		render();
 	}
 });

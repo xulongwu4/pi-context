@@ -3,11 +3,17 @@ import {
 	analyze,
 	attentionLens,
 	attentionOf,
+	bare,
 	commandRows,
 	commandShape,
 	familyTotals,
 	fileRows,
 	filesUpTo,
+	fileTotals,
+	fullOf,
+	imageSize,
+	imageText,
+	imageTokens,
 	isSlow,
 	MARK_KINDS,
 	paramsOf,
@@ -15,6 +21,7 @@ import {
 	places,
 	programRanks,
 	programsOf,
+	rowsOf,
 	tokensPerSecond,
 	toolsAt,
 	trendBars,
@@ -445,4 +452,72 @@ test("narrow keeps the events, the tasks and the delegation of one agent", () =>
 
 test("summarize keeps the model of the last request", () => {
 	expect(summarize([{ type: "session", id: "s", cwd: "/p", timestamp: new Date(1).toISOString() }, user(1), assistant(2, 10)]).model).toBe("m1");
+});
+
+/** The start of a PNG image of that many pixels, as base64. */
+const png = (width: number, height: number) => {
+	const bytes = Buffer.alloc(33);
+	bytes.writeUInt32BE(0x89504e47, 0);
+	bytes.writeUInt32BE(0x0d0a1a0a, 4);
+	bytes.writeUInt32BE(13, 8);
+	bytes.write("IHDR", 12, "latin1");
+	bytes.writeUInt32BE(width, 16);
+	bytes.writeUInt32BE(height, 20);
+	return bytes.toString("base64");
+};
+
+test("imageSize reads the pixels of PNG, GIF, JPEG and WebP images, and imageTokens estimates from them", () => {
+	const bytes = (...parts: (string | number[])[]) => Buffer.concat(parts.map((part) => (typeof part === "string" ? Buffer.from(part, "latin1") : Buffer.from(part)))).toString("base64");
+	expect(imageSize(png(800, 600))).toEqual([800, 600]);
+	expect(imageSize(bytes("GIF89a", [0x40, 0x01, 0xf0, 0x00]))).toEqual([320, 240]);
+	// A JPEG: an application segment of 16 bytes, then the frame segment, which has the height before the width.
+	expect(imageSize(bytes([0xff, 0xd8, 0xff, 0xe0, 0, 16], new Array(14).fill(0), [0xff, 0xc0, 0, 17, 8, 0x02, 0x58, 0x03, 0x20, 3]))).toEqual([800, 600]);
+	expect(imageSize(bytes("RIFF", [0, 0, 0, 0], "WEBPVP8X", [10, 0, 0, 0, 0, 0, 0, 0], [0x1f, 0x03, 0], [0x57, 0x02, 0]))).toEqual([800, 600]);
+	expect(imageSize("x")).toBeUndefined();
+	expect(imageSize(bytes("plain text, no image at all"))).toBeUndefined();
+	expect(imageTokens(800, 600)).toBe(640);
+	// Reduced to 1568 pixels on the longer side, and then held to the most tokens of an image.
+	expect(imageTokens(3136, 1568)).toBe(1600);
+	expect(imageTokens(10, 10)).toBe(1);
+	expect(imageTokens()).toBe(1200);
+});
+
+test("rowsOf gives a row the images of its message and counts them by their pixels, and bare leaves their data out", () => {
+	const data = png(800, 600);
+	const messages = [
+		{ role: "user", content: [{ type: "text", text: "look" }, { type: "image", data, mimeType: "image/png" }], timestamp: 1 },
+		{ role: "toolResult", toolCallId: "r1", toolName: "read", content: [{ type: "image", data: "x", mimeType: "image/jpeg" }], isError: false, timestamp: 2 },
+	];
+	const [seen, read] = rowsOf(messages);
+	expect(seen.images).toEqual([{ type: "image/png", bytes: 33, width: 800, height: 600, tokens: 640 }]);
+	// 640 tokens for the image and 1 for the four characters.
+	expect(seen.tokens).toBe(641);
+	// An image whose pixels are not known counts as 1200 tokens.
+	expect(read.images).toEqual([{ type: "image/jpeg", bytes: 0, tokens: 1200 }]);
+	expect(read.tokens).toBe(1200);
+	const full = rowsOf(messages, undefined, [], true);
+	expect(full[0].images?.[0].data).toBe(data);
+	expect(bare(full[0])).toEqual(seen);
+	expect(fullOf(seen, 0, full)).toBe(full[0]);
+	expect(imageText(seen.images![0])).toBe("image/png · 800×600 px · 33 B · ≈640 tokens");
+	expect(imageText({ type: "image/jpeg", bytes: 2_500_000, tokens: 1200 }, 2)).toBe("image/jpeg · 2.5 MB · ≈2.4k tokens");
+});
+
+test("analyze keeps the timeout that a command was given and the characters that it printed", () => {
+	const a = analyze([
+		user(1),
+		assistant(2, 10, [call("b1", "bash", { command: "sleep 1", timeout: 30 }), call("b2", "bash", { command: "ls" })]),
+		result("b1", "bash", 3),
+		result("b2", "bash", 4, { content: [{ type: "text", text: "a.txt\nb.txt\n\nCommand exited with code 2" }], isError: true }),
+	]);
+	expect(a.commands.map((c) => [c.timeout, c.chars, c.lines, c.exit])).toEqual([[30, 4, 1, undefined], [undefined, 11, 2, 2]]);
+});
+
+test("fileRows orders the files by file name, and fileTotals sums the operations by kind", () => {
+	const file = (path: string, more: any = {}): any => ({ path, reads: 0, writes: 0, edits: 0, searches: 0, images: 0, added: 0, removed: 0, ops: [], ...more });
+	const files = [file("/b/zeta.ts", { reads: 2 }), file("/z/alpha.ts", { edits: 1, reads: 1 }), file("/a/zeta.ts", { searches: 3, images: 1 })];
+	expect(fileRows(files, "file").map((f) => f.path)).toEqual(["/z/alpha.ts", "/a/zeta.ts", "/b/zeta.ts"]);
+	expect(fileRows(files, "name").map((f) => f.path)).toEqual(["/a/zeta.ts", "/b/zeta.ts", "/z/alpha.ts"]);
+	expect(fileTotals(files)).toEqual({ reads: 3, writes: 0, edits: 1, searches: 3, images: 1 });
+	expect(setChoice({}, "files", "file")).toBe(true);
 });
